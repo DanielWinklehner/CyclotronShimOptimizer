@@ -1,4 +1,4 @@
-A python program built on top of Radia that builds a cyclotron model based on the IsoDAR HCHC-XX design. 
+A python program built on top of [Radia](https://github.com/ochubar/Radia) that builds a cyclotron model based on the [IsoDAR HCHC-XX](https://link.springer.com/article/10.1140/epjs/s11734-025-01983-4) design. 
 It can :
 - calculate the field,
 - export the pole as VBA macro to build a CAD model in Inventor
