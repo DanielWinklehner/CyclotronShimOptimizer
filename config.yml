@@ -78,7 +78,7 @@ top_shim:
   # Best so far:
 #  top_offsets_mm: [ 7.76, 5.0, 6.02, 7.1, 9.16, 9.69, 10.54, 13.95,
 #                    14.83,17.0, 17.0, 17.0, 17.0, 17.0, 17.0 ]
-  top_offsets_mm: [7.511,5.0,6.231,7.765,9.859,9.871,11.736,14.237,14.21,17.0,17.0,17.0,17.0,17.0,17.0]
+  top_offsets_mm: [7.511, 5.0, 6.231, 7.765, 9.859, 9.871, 11.736, 14.237, 14.21, 17.0, 17.0, 17.0, 17.0, 17.0, 17.0 ]
   segmentation: [3, 1, 1]  # Number of [r, theta, z] subdivisions (note that arc approximation already segments in theta)
 # --- #
 
@@ -112,9 +112,7 @@ optimization:
   regularization_weight: 0.0  # Penalty for jagged shim shapes
   random_init: false
   # Optimizer choice
-  # nelder-mead: Faster, fewer function calls, simpler
-  # bayesian: More sophisticated, better for complex landscapes, more evaluations - currently not implemented
-  # expert: experimental algo that mimicks a human designer - currently not implemented
+  # nelder-mead, more to come?
   optimizer: 'nelder-mead'
 
 # Visualization
