@@ -78,7 +78,7 @@ top_shim:
   # Best so far:
 #  top_offsets_mm: [ 7.76, 5.0, 6.02, 7.1, 9.16, 9.69, 10.54, 13.95,
 #                    14.83,17.0, 17.0, 17.0, 17.0, 17.0, 17.0 ]
-  top_offsets_mm: [7.511, 5.0, 6.231, 7.765, 9.859, 9.871, 11.736, 14.237, 14.21, 17.0, 17.0, 17.0, 17.0, 17.0, 17.0 ]
+  top_offsets_mm: [7.511, 5.0, 6.231, 7.765, 9.859, 9.871, 11.736, 14.1, 14.5, 16.9, 17.0, 17.0, 17.0, 17.0, 17.0 ]
   segmentation: [3, 1, 1]  # Number of [r, theta, z] subdivisions (note that arc approximation already segments in theta)
 # --- #
 
@@ -86,7 +86,7 @@ coil:
   radius_min_mm: 460.0
   radius_max_mm: 674.5
   height_mm: 123.5
-  current_A: 29000  # Amp-turns
+  current_A: 29000  # Amp-turns   35194.097
   num_segments: 25
 
 material:
@@ -103,7 +103,7 @@ simulation:
 optimization:
   target_frequency_mhz: 42
   frequency_tolerance_mhz: 0.001
-  max_iterations: 100
+  max_iterations: 100  # 100
   coil_current_min_A: 25000
   coil_current_max_A: 45000
   num_workers: 1   # Unused
@@ -111,6 +111,9 @@ optimization:
   reference_coil_current: 29000
   regularization_weight: 0.0  # Penalty for jagged shim shapes
   random_init: false
+  opt_top: false
+  opt_side: false
+  opt_coil: true
   # Optimizer choice
   # nelder-mead, more to come?
   optimizer: 'nelder-mead'

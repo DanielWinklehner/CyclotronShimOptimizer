@@ -123,6 +123,9 @@ class OptimizationConfig:
     regularization_weight: float
     optimizer: str
     random_init: bool
+    opt_top: Optional[bool] = True
+    opt_side: Optional[bool] = True
+    opt_coil: Optional[bool] = True
 
 
 @dataclass
@@ -277,6 +280,9 @@ class CyclotronConfig:
                 'regularization_weight': self.optimization.regularization_weight,
                 'optimizer': self.optimization.optimizer,
                 'random_init': self.optimization.random_init,
+                'opt_top': self.optimization.opt_top,
+                'opt_side': self.optimization.opt_top,
+                'opt_coil': self.optimization.opt_top,
             },
             'visualization': {
                 'show_opengl': self.visualization.show_opengl,

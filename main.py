@@ -251,12 +251,13 @@ def main(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = 
         if rank <= 0 and verbosity >= 1:
             print(f"Calculating B-fields in parallel...", flush=True)
             # pole_offsets_array = pole_shape.get_side_offsets_deg()
-            config.coil.current_A = coil_current
 
+        config.coil.current_A = coil_current
         radii_out, bz_values, converged = evaluate_radii_parallel(
             config, pole_shape, radii_mm,
             rank=rank
         )
+
         if rank <= 0 and verbosity >= 1:
             if len(bz_values) > 0:
                 print(f"[OK] B-field calculation complete", flush=True)

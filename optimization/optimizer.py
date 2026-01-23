@@ -127,70 +127,110 @@ class CyclotronOptimizer:
         - Phase 3: Optimize coil current for target frequency
         """
 
+        # Determine which shims to optimize
+        opt_top = self.config.optimization.opt_top
+        opt_side = self.config.optimization.opt_side
+        opt_coil = self.config.optimization.opt_coil
+
+        if not self.config.top_shim.include:
+            opt_top = False
+        if not self.config.side_shim.include:
+            opt_side = False
+
+
         if self.rank <= 0 and self.verbosity >= 1:
             print("\n" + "=" * 100, flush=True)
             print("THREE-PHASE CYCLOTRON OPTIMIZATION", flush=True)
             print("=" * 100, flush=True)
             print(f"Phase 1: Optimize TOP shims for frequency flatness", flush=True)
+            if not opt_top:
+                print(f"---Omitting phase 1 as per config.yml", flush=True)
             print(f"Phase 2: Optimize SIDE shims for frequency flatness (keeping best top shims)", flush=True)
+            if not opt_side:
+                print(f"---Omitting phase 2 as per config.yml", flush=True)
             print(f"Phase 3: Optimize coil current for target frequency", flush=True)
+            if not opt_coil:
+                print(f"---Omitting phase 3 as per config.yml", flush=True)
             print("=" * 100 + "\n", flush=True)
 
         # ===== PHASE 1: Top shims =====
-        if self.rank <= 0 and self.verbosity >= 1:
-            print(f"\n{'='*100}\nPHASE 1: TOP SHIM OPTIMIZATION\n{'='*100}\n", flush=True)
+        if opt_top:
+            if self.rank <= 0 and self.verbosity >= 1:
+                print(f"\n{'='*100}\nPHASE 1: TOP SHIM OPTIMIZATION\n{'='*100}\n", flush=True)
 
-            self.plotter.setup(
-                figsize=(20, 7),
-                inner_radius_mm=self.config.pole.inner_radius_mm,
-                outer_radius_mm=self.config.pole.outer_radius_mm,
-                pole_angle_deg=self.config.pole.full_angle_deg,
-                target_frequency=self.config.optimization.target_frequency_mhz
+                self.plotter.setup(
+                    figsize=(20, 7),
+                    inner_radius_mm=self.config.pole.inner_radius_mm,
+                    outer_radius_mm=self.config.pole.outer_radius_mm,
+                    pole_angle_deg=self.config.pole.full_angle_deg,
+                    target_frequency=self.config.optimization.target_frequency_mhz
+                )
+
+            best_top, flatness_top = self.optimize_phase(
+                phase=1,
+                param_type='top',
+                n_params=self.n_top,
+                param_min=self.top_min,
+                param_max=self.top_max,
+                fixed_side=None,
+                fixed_top=None,
+                n_multistart=self.config.optimization.n_initial_points,
+                max_iter_per_start=self.config.optimization.max_iterations
             )
+        else:
 
-        best_top, flatness_top = self.optimize_phase(
-            phase=1,
-            param_type='top',
-            n_params=self.n_top,
-            param_min=self.top_min,
-            param_max=self.top_max,
-            fixed_side=None,
-            fixed_top=None,
-            n_multistart=self.config.optimization.n_initial_points,
-            max_iter_per_start=self.config.optimization.max_iterations
-        )
+            if self.config.top_shim.top_offsets_mm is not None:
+                best_top = np.array(self.config.top_shim.top_offsets_mm)
+            else:
+                best_top = np.ones(self.n_side) * self.config.top_shim.default_offset_mm
+
+            flatness_top = -1
 
         # ===== PHASE 2: Side shims (with best top fixed) =====
-        if self.rank <= 0 and self.verbosity >= 1:
-            print(f"\n{'='*100}\nPHASE 2: SIDE SHIM OPTIMIZATION (Top shims fixed)\n{'='*100}\n", flush=True)
+        if opt_side:
+            if self.rank <= 0 and self.verbosity >= 1:
+                print(f"\n{'='*100}\nPHASE 2: SIDE SHIM OPTIMIZATION (Top shims fixed)\n{'='*100}\n", flush=True)
 
-        best_side, flatness_side = self.optimize_phase(
-            phase=2,
-            param_type='side',
-            n_params=self.n_side,
-            param_min=self.side_min,
-            param_max=self.side_max,
-            fixed_side=None,
-            fixed_top=best_top,
-            n_multistart=self.config.optimization.n_initial_points,
-            max_iter_per_start=self.config.optimization.max_iterations
-        )
+            best_side, flatness_side = self.optimize_phase(
+                phase=2,
+                param_type='side',
+                n_params=self.n_side,
+                param_min=self.side_min,
+                param_max=self.side_max,
+                fixed_side=None,
+                fixed_top=best_top,
+                n_multistart=self.config.optimization.n_initial_points,
+                max_iter_per_start=self.config.optimization.max_iterations
+            )
+        else:
+            if self.config.side_shim.side_offsets_deg is not None:
+                best_side = np.array(self.config.side_shim.side_offsets_deg)
+            else:
+                best_side = np.ones(self.n_side) * self.config.side_shim.default_offset_deg
 
-        # ===== PHASE 3: Coil optimization (with best side and top fixed) =====
-        if self.rank <= 0 and self.verbosity >= 1:
-            print(f"\n{'='*100}\nPHASE 3: COIL CURRENT OPTIMIZATION\n{'='*100}\n", flush=True)
+            flatness_side = -1
 
         # Reconstruct full surface params
         best_full_surface = np.concatenate([best_side, best_top])
 
-        optimal_coil, coil_error, n_coil_evals = optimize_coil_final(
-            best_full_surface,
-            self.config,
-            self.radii_mm,
-            self.comm,
-            self.rank,
-            self.verbosity
-        )
+        if opt_coil:
+            # ===== PHASE 3: Coil optimization (with best side and top fixed) =====
+            if self.rank <= 0 and self.verbosity >= 1:
+                print(f"\n{'='*100}\nPHASE 3: COIL CURRENT OPTIMIZATION\n{'='*100}\n", flush=True)
+
+            optimal_coil, coil_error, n_coil_evals = optimize_coil_final(
+                best_full_surface,
+                self.config,
+                self.radii_mm,
+                self.comm,
+                self.rank,
+                self.verbosity
+            )
+
+        else:
+            optimal_coil = self.config.optimization.reference_coil_current
+            coil_error = -1
+            n_coil_evals = 0
 
         self.comm.Barrier()
 

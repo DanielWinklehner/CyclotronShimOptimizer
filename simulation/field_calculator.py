@@ -114,7 +114,6 @@ def evaluate_radii_parallel(config: CyclotronConfig,
     converged = (result[0] <= config.simulation.precision)  # Note: first result item is precision reached
 
     # Query all radii at once with single rad.Fld() call
-    # NOTE: Only rank 0 receives results
     num_angles = config.field_evaluation.num_points_circle
 
     if use_cache:

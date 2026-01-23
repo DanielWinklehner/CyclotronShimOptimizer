@@ -566,8 +566,7 @@ class SideShimComponent(GeometricComponent):
         area = SideShimComponent.polygon_area_2d(vertices)
 
         if area < min_area:
-            if verbosity >= 1:
-                print(f"[SideShim] Skipping degenerate polygon: area={area:.2e} mm² < {min_area} mm²")
+
             return False, area
 
         return True, area
@@ -840,7 +839,7 @@ class SideShimComponent(GeometricComponent):
         is_valid, area = self.is_valid_polygon(polygon)
         if not is_valid:
             if self.rank <= 0 and self.verbosity >= 1:
-                print(f"  Skipping extra block {j}: degenerate polygon (area={area:.2e})", flush=True)
+                print(f"  Skipping extra block {j}: Degenerate polygon (area = {area:.2e} mm²)", flush=True)
             return None
 
         bottom_polygon = np.array(polygon)[::-1].tolist()
@@ -1091,16 +1090,11 @@ class SideShimComponent(GeometricComponent):
         is_valid, area = self.is_valid_polygon(polygon)
         if not is_valid:
             if self.rank <= 0 and self.verbosity >= 1:
-                print(f"  Skipping extra block {j}: degenerate polygon (area={area:.2e})", flush=True)
+                print(f"  [SideShim] Skipping degenerate polygon in extra block {j}: "
+                      f"area = {area:.2e} mm² < {MIN_POLYGON_AREA_MM2} mm²", flush=True)
             return None
 
         bottom_polygon = np.array(polygon)[::-1].tolist()
-
-        # # Create prism
-        # block = rad.ObjMltExtPgn([
-        #     [polygon, pole_zs + block_h],
-        #     [bottom_polygon, pole_ze]
-        # ])
 
         # Check if angled cut needed
         if not np.isclose(z_iror[0], z_iror[1]):

@@ -64,8 +64,7 @@ def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
             radii_mm,
             rank=rank,
             verbosity=verbosity,
-            use_cache=use_cache,
-            num_workers=config.optimization.num_workers
+            use_cache=use_cache
         )
 
         if verbosity >= 2:
@@ -159,7 +158,7 @@ def optimize_coil_final(best_surface_params: np.ndarray,
     """
 
     target_f = config.optimization.target_frequency_mhz
-    coil_bounds = (50000.0, 150000.0)
+    coil_bounds = (config.optimization.coil_current_min_A, config.optimization.coil_current_max_A)
 
     if verbosity >= 1 and rank <= 0:
         print(f"Finding coil current to achieve target avg_f={target_f:.4f}MHz...\n", flush=True)
@@ -180,6 +179,9 @@ def optimize_coil_final(best_surface_params: np.ndarray,
         if verbosity >= 2 and rank <= 0:
             print(f"[RANK 0] Evaluating coil={coil_current:.0f}A...", flush=True)
 
+        if rank <=0:
+            coil_current = comm.bcast(coil_current, root=0)
+
         original_current = config.coil.current_A
         config.coil.current_A = coil_current
 
@@ -193,8 +195,7 @@ def optimize_coil_final(best_surface_params: np.ndarray,
                 pole_shape,
                 radii_mm,
                 rank=rank,
-                verbosity=verbosity,
-                num_workers=config.optimization.num_workers
+                verbosity=verbosity
             )
 
             if verbosity >= 2:
@@ -279,6 +280,7 @@ def optimize_coil_final(best_surface_params: np.ndarray,
             print(f"[RANK {rank}] Entering idle evaluation loop...", flush=True)
 
         iteration_local = 0
+
         while True:
             if verbosity >= 2:
                 print(f"[RANK {rank}] Waiting for coil_current broadcast...", flush=True)
@@ -292,7 +294,9 @@ def optimize_coil_final(best_surface_params: np.ndarray,
                 break
 
             iteration_local += 1
+
             if verbosity >= 2:
+
                 print(f"[RANK {rank}] >>> Received coil_current={coil_current_received:.0f}A", flush=True)
 
             # Call with received value
