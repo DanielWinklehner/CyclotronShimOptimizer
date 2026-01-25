@@ -1,0 +1,123 @@
+# Cyclotron Geometry Configuration
+
+particle_species: "muon"  # 'muon'
+max_machine_size_mm: 700.0
+seed: 42
+
+# Symmetry and angles
+geometry:
+  yoke_build_angle_deg: 45.0
+  angular_resolution: 15  # Number of segments to approximate arcs
+
+# Field evaluation
+field_evaluation:
+  num_points_circle: 360
+  radius_min_mm: 75.0
+  radius_max_mm: 350.0
+  n_eval_pts: 12
+  use_symmetry: true  # Exploit 8-fold symmetry
+
+# Geometry Parameters
+yoke:
+  outer_radius_mm: 700.0
+  inner_radius_mm: 596.5
+  height_mm: 188.5
+  segmentation: [2, 1, 4]  # [r, theta, z] divisions
+  window_width_mm: 300.0
+
+lid_lower:
+  outer_radius_mm: 700.0
+  inner_radius_mm: 400.0
+  height_mm: 96.5
+  segmentation: [4, 1, 4]  # [x, y, z] divisions
+
+lid_upper:
+  outer_radius_mm_1: 700.0
+  outer_radius_mm_2: 627.0
+  inner_radius_mm: 90.0
+  height_mm: 80.0
+  segmentation: [6, 1, 4]  # [r, theta, z] divisions (cylindrical)
+  hole_diameter_mm: 160.0
+  hole_center_xy: [198.0, 198.0]
+  cut_out_rf_stem_hole: false
+
+# --- Pole --- #
+# Base
+pole:
+  outer_radius_mm: 400.0
+  inner_radius_mm: 50.0
+  height_mm: 230.0  # 235 originally, but top shim is min 5 mm
+  full_angle_deg: 20.0  # 25 originally, but side shim is min 5 deg
+  angular_resolution_deg: 2.5  # Angular segment length for arc approximation (deg)
+  segmentation: [5, 1, 15]  # Number of [r, theta, z] segments (cylindrical)
+
+# Shimming
+side_shim:
+  include: true
+  num_rad_segments: 14  # number of radial segments along the pole edge
+  angular_resolution_deg: 1.25  # Angular segment length for arc approximation (deg)
+  default_offset_deg: 5.0  # deg
+  max_adjacent_step_deg: 2.0  # deg (only used in optimization)
+#  side_offsets_deg: [0.1, 0.1, 0.1, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 5.0, 5.0, 6.0, 6.0, 7.0, 8.0]
+#  side_offsets_deg: [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
+  # Best so far:
+#  side_offsets_deg: [ 9.15, 6.09, 5.88, 5.98, 5.97,6.74,7.07,5.64,
+#                      5.24, 5.0, 5.5, 5.5, 6.5, 8.5, 10.5 ]
+  side_offsets_deg: [9.401, 6.186, 5.979, 6.112, 6.252, 6.689, 6.807, 5.854, 5.306, 5.0, 5.12, 5.422, 6.65, 9.05, 10.64]
+
+  segmentation: [3, 1, 20]  # Number of [r, theta, z] segments (cylindrical)
+
+top_shim:
+  include: true
+  num_rad_segments: 14  # number of radial segments along the pole edge (keep same as side for now!)
+  angular_resolution_deg: 1.25 # Angular segment length for arc approximation (deg)
+  default_offset_mm: 5.0  # mm
+  max_adjacent_step_mm: 2.0  # mm (only used in optimization)
+#  top_offsets_mm: [1.0, 1.0, 1.0, 3.0, 4.0, 6.0, 6.0, 8.0, 8.0, 8.0, 8.0, 10.0, 10.0, 10.0, 10.0]
+#  top_offsets_mm: [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
+  # Best so far:
+#  top_offsets_mm: [ 7.76, 5.0, 6.02, 7.1, 9.16, 9.69, 10.54, 13.95,
+#                    14.83,17.0, 17.0, 17.0, 17.0, 17.0, 17.0 ]
+  top_offsets_mm: [7.511, 5.0, 6.231, 7.765, 9.859, 9.871, 11.736, 14.1, 14.5, 16.9, 17.0, 17.0, 17.0, 17.0, 17.0 ]
+  segmentation: [3, 1, 1]  # Number of [r, theta, z] subdivisions (note that arc approximation already segments in theta)
+# --- #
+
+coil:
+  radius_min_mm: 460.0
+  radius_max_mm: 574.5
+  height_mm: 123.5
+  current_A: 29455  # Amp-turns   35194.097
+  num_segments: 25
+
+material:
+  saturation_field_t: [20000, 2]
+  saturation_curve_m: [0.1, 2]
+  linear_curve_m: [0.1, 2]
+
+# Simulation
+simulation:
+  precision: 0.0001
+  iterations: 3000
+
+# Optimization
+optimization:
+  target_frequency_mhz: 42
+  frequency_tolerance_mhz: 0.001
+  max_iterations: 100  # 100
+  coil_current_min_A: 25000
+  coil_current_max_A: 45000
+  num_workers: 1   # Unused
+  n_initial_points: 1  # Initial random sample in Bayesian, or number of multistarts in Nelder-Mead
+  reference_coil_current: 29455
+  regularization_weight: 0.0  # Penalty for jagged shim shapes
+  random_init: false
+  opt_top: false
+  opt_side: false
+  opt_coil: true
+  # Optimizer choice
+  # nelder-mead, more to come?
+  optimizer: 'nelder-mead'
+
+# Visualization
+visualization:
+  show_opengl: true
