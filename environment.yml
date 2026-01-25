@@ -1,0 +1,18 @@
+name: radia_mpi_env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - matplotlib
+  - mpi4py
+  - numpy
+  - pillow
+  - pip=24.3.1
+  - python=3.8
+  - requests
+  - scikit-learn
+  - scikit-optimize
+  - scipy
+  - setuptools
+  - sympy
+  - tqdm

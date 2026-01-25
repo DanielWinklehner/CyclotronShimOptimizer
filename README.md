@@ -5,7 +5,9 @@ A three-phase optimization framework for cyclotron magnet design, featuring MPI 
 This program can calculate the magnetic field for a given geometry (only round, 4-hill isochronous cyclotrons for now)
 display magnetic fields and isochronism and optimize the shims (top and side) for maximum isochronism.
 
-This code was written for the [IsoDAR](https://www.nevis.columbia.edu/isodar/) project
+This code was written for the [IsoDAR](https://www.nevis.columbia.edu/isodar/) project.
+
+Note: Currently this code only runs in Windows (tested on Win 11).
 
 ## Overview
 
@@ -51,9 +53,12 @@ cd cyclotron_optimizer
 
 # Install dependencies
 pip install -r requirements.txt
+```
+OR
 
-# Verify Radia installation
-python -c "import sys; sys.path.insert(0, 'radialib'); import radia as rad; print('Radia OK')"
+Using Anaconda (recommended): 
+```bash
+conda env create -n <env_name> -f environment.yml
 ```
 
 ## Capabilities
