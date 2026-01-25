@@ -60,7 +60,7 @@ class Timer:
 
 
 def main(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = False, test_geometry: bool = False,
-         use_cache: bool = False):
+         use_cache: bool = False, conf: str = 'config.yml'):
     """
     Main workflow: Load config, create geometry, calculate isochronism, optionally optimize.
 
@@ -72,6 +72,7 @@ def main(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = 
     :param verbosity: Verbosity level (0=silent, 1=normal, 2=debug)
     :param run_optimization: Whether to run Bayesian optimization
     :param test_geometry: If called, just show the geometry in OpenGL w/o symmetries applied
+    :param conf: Path/Name of config.yml file
     :param use_cache
     """
 
@@ -87,8 +88,7 @@ def main(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = 
     with Timer("Load configuration", rank, verbosity):
         if rank <= 0 and verbosity >= 1:
             print(f"Loading configuration...", flush=True)
-        config_file = os.path.join(os.path.dirname(__file__), 'config.yml')
-        config = CyclotronConfig.from_yaml(config_file)
+        config = CyclotronConfig.from_yaml(conf)
         if rank <= 0 and verbosity >= 1:
             print(f"[OK] Configuration loaded", flush=True)
             print(f"  Species: {config.particle_species}", flush=True)
@@ -410,6 +410,7 @@ if __name__ == '__main__':
     parser.add_argument('--cached', action='store_true', help='Cache cyclotron base field and use as applied field for pole')
     parser.add_argument('--geo_test', action='store_true', help='Visual inspection of geometry only')
     parser.add_argument('--verbosity', type=int, default=1, help='Verbosity level (0-2)')
+    parser.add_argument('--config', type=str, help='Path to config file')
 
     args = parser.parse_args()
 
@@ -418,7 +419,8 @@ if __name__ == '__main__':
                    verbosity=args.verbosity,
                    run_optimization=args.optimize,
                    use_cache=args.cached,
-                   test_geometry=args.geo_test)
+                   test_geometry=args.geo_test,
+                   conf=args.config)
 
     # Finalize MPI
     rad.UtiMPI('off')
