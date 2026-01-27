@@ -287,27 +287,29 @@ def build_geometry(config: CyclotronConfig,
     coil_comp.build()
 
     # ========== APPLY SYMMETRIES ==========
+
+    if rank <= 0 and verbosity >= 1:
+        print("Applying 8-fold symmetry...", flush=True)
+
+    rad.TrfZerPerp(yoke, [0, 0, 0], [1, -1, 0])  # Mirror across xy diagonal
+    rad.TrfZerPerp(yoke, [0, 0, 0], [1, 0, 0])  # Mirror across x-axis
+    rad.TrfZerPerp(yoke, [0, 0, 0], [0, 1, 0])  # Mirror across y-axis
+    # 2-fold symmetry in z-direction
     if not omit_symmetry:
-        if rank <= 0 and verbosity >= 1:
-            print("Applying 8-fold symmetry...", flush=True)
-
-        # 4-fold symmetry in xy-plane
-        rad.TrfZerPerp(yoke, [0, 0, 0], [1, -1, 0])  # Mirror across xy diagonal
-        rad.TrfZerPerp(yoke, [0, 0, 0], [1, 0, 0])  # Mirror across x-axis
-        rad.TrfZerPerp(yoke, [0, 0, 0], [0, 1, 0])  # Mirror across y-axis
-        # 2-fold symmetry in z-direction
         rad.TrfZerPara(yoke, [0, 0, 0], [0, 0, 1])  # Mirror across z-plane
-        if use_cache:
-            # 4-fold symmetry in xy-plane
-            rad.TrfZerPerp(pole, [0, 0, 0], [1, -1, 0])  # Mirror across xy diagonal
-            rad.TrfZerPerp(pole, [0, 0, 0], [1, 0, 0])  # Mirror across x-axis
-            rad.TrfZerPerp(pole, [0, 0, 0], [0, 1, 0])  # Mirror across y-axis
-            # 2-fold symmetry in z-direction
-            rad.TrfZerPara(pole, [0, 0, 0], [0, 0, 1])  # Mirror across z-plane
-
     else:
         if rank <= 0 and verbosity >= 1:
             print("Symmetry DISABLED (geometry debug mode)", flush=True)
+    if use_cache:
+        rad.TrfZerPerp(pole, [0, 0, 0], [1, -1, 0])  # Mirror across xy diagonal
+        rad.TrfZerPerp(pole, [0, 0, 0], [1, 0, 0])  # Mirror across x-axis
+        rad.TrfZerPerp(pole, [0, 0, 0], [0, 1, 0])  # Mirror across y-axis
+        # 2-fold symmetry in z-direction
+        if not omit_symmetry:
+            rad.TrfZerPara(pole, [0, 0, 0], [0, 0, 1])  # Mirror across z-plane
+        else:
+            if rank <= 0 and verbosity >= 1:
+                print("Symmetry DISABLED (geometry debug mode)", flush=True)
 
     # ========== ASSEMBLE COMPLETE CYCLOTRON ==========
     if rank <= 0 and verbosity >= 1:

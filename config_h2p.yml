@@ -110,8 +110,8 @@ optimization:
   reference_coil_current: 132496
   regularization_weight: 0.0  # Penalty for jagged shim shapes
   random_init: false
-  opt_top: false
-  opt_side: false
+  opt_top: true
+  opt_side: true
   opt_coil: true
   # Optimizer choice
   # nelder-mead: Faster, fewer function calls, simpler
