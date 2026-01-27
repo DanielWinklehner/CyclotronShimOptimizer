@@ -47,7 +47,7 @@ pole:
   outer_radius_mm: 400.0
   inner_radius_mm: 50.0
   height_mm: 230.0  # 235 originally, but top shim is min 5 mm
-  full_angle_deg: 20.0
+  full_angle_deg: 20.0  # 25 originally, but side shim is min 5 deg
   angular_resolution_deg: 2.5  # Agular segment legth for arc approximation (deg)
   segmentation: [5, 1, 15]  # Number of [r, theta, z] segments (cylindrical)
 
