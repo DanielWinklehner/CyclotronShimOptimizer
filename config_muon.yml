@@ -86,7 +86,7 @@ coil:
   radius_min_mm: 460.0
   radius_max_mm: 674.5
   height_mm: 123.5
-  current_A: 29455  # Amp-turns   35194.097
+  current_A: 18000  # Amp-turns   35194.097
   num_segments: 25
 
 material:
@@ -97,7 +97,7 @@ material:
 # Simulation
 simulation:
   precision: 0.0001
-  iterations: 3000
+  iterations: 5000
 
 # Optimization
 optimization:
@@ -108,7 +108,7 @@ optimization:
   coil_current_max_A: 45000
   num_workers: 1   # Unused
   n_initial_points: 1  # Initial random sample in Bayesian, or number of multistarts in Nelder-Mead
-  reference_coil_current: 29455
+  reference_coil_current: 18000
   regularization_weight: 0.0  # Penalty for jagged shim shapes
   random_init: false
   opt_top: false

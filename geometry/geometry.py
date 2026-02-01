@@ -70,28 +70,27 @@ def build_geometry(config: CyclotronConfig,
     #     mat_cfg.linear_curve_m
     # )
 
-    # Dillinger BH curve (T-Oersted)
+    # Dillinger BH curve (mu0*A/m (=T), T)
     ironmat = rad.MatSatIsoTab([[0.0, 0.0],
-                                [0.024042, 0.64],
-                                [0.031614, 0.89],
-                                [0.05524, 1.25],
-                                [0.079021, 1.39],
-                                [0.11915, 1.49],
-                                [0.158333, 1.54],
-                                [0.23874, 1.61],
-                                [0.313926, 1.65],
-                                [0.395764, 1.69],
-                                [0.554342, 1.72],
-                                [0.792986, 1.78],
-                                [1.195692, 1.85],
-                                [1.588894, 1.91],
-                                [2.370694, 2.01],
-                                [3.971558, 2.12],
-                                [5.504643, 2.16],
-                                [7.874391, 2.19],
-                                [9.927199, 2.22],
-                                [20.0, 2.3]
-                                ])
+                                [0.000302, 0.64],
+                                [0.000397, 0.89],
+                                [0.000694, 1.25],
+                                [0.000993, 1.39],
+                                [0.001497, 1.49],
+                                [0.00199, 1.54],
+                                [0.003, 1.61],
+                                [0.003945, 1.65],
+                                [0.004973, 1.69],
+                                [0.006966, 1.72],
+                                [0.009965, 1.78],
+                                [0.015026, 1.85],
+                                [0.019967, 1.91],
+                                [0.029791, 2.01],
+                                [0.049908, 2.12],
+                                [0.069173, 2.16],
+                                [0.098953, 2.19],
+                                [0.124749, 2.22],
+                                [0.251327, 2.3]])
 
     ironcolor = [0, 0.5, 1]
 
@@ -291,11 +290,12 @@ def build_geometry(config: CyclotronConfig,
     if rank <= 0 and verbosity >= 1:
         print("Applying 8-fold symmetry...", flush=True)
 
-    rad.TrfZerPerp(yoke, [0, 0, 0], [1, -1, 0])  # Mirror across xy diagonal
-    rad.TrfZerPerp(yoke, [0, 0, 0], [1, 0, 0])  # Mirror across x-axis
-    rad.TrfZerPerp(yoke, [0, 0, 0], [0, 1, 0])  # Mirror across y-axis
+
     # 2-fold symmetry in z-direction
     if not omit_symmetry:
+        rad.TrfZerPerp(yoke, [0, 0, 0], [1, -1, 0])  # Mirror across xy diagonal
+        rad.TrfZerPerp(yoke, [0, 0, 0], [1, 0, 0])  # Mirror across x-axis
+        rad.TrfZerPerp(yoke, [0, 0, 0], [0, 1, 0])  # Mirror across y-axis
         rad.TrfZerPara(yoke, [0, 0, 0], [0, 0, 1])  # Mirror across z-plane
     else:
         if rank <= 0 and verbosity >= 1:

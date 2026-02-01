@@ -159,19 +159,19 @@ conda env create -n <env_name> -f environment.yml
 **2. Single-process (no MPI):**
 
 ```bash
-python main.py --optimize --verbosity 1
+python main.py --optimize --config <config_file_name> --verbosity 1
 ```
 
 **3. With MPI (4 processes):**
 
 ```bash
-mpiexec -n 4 python main.py --optimize --verbosity 1
+mpiexec -n 4 python main.py --optimize --config <config_file_name> --verbosity 1
 ```
 
 **4. With magnetization caching (first run):**
 
 ```bash
-mpiexec -n 4 python main.py --optimize --cached --verbosity 1
+mpiexec -n 4 python main.py --optimize --config <config_file_name> --cached --verbosity 1
 ```
 
 This creates cache on first run; subsequent runs use warm-start.
@@ -179,7 +179,7 @@ This creates cache on first run; subsequent runs use warm-start.
 **5. Geometry visualization only:**
 
 ```bash
-python main.py --geo_test --verbosity 2
+python main.py --geo_test --config <config_file_name> --verbosity 2
 ```
 
 Opens OpenGL viewer of current geometry.

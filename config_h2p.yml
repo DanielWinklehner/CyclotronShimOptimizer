@@ -12,9 +12,9 @@ geometry:
 # Field evaluation
 field_evaluation:
   num_points_circle: 360
-  radius_min_mm: 50.0
+  radius_min_mm: 75.0
   radius_max_mm: 350.0
-  n_eval_pts: 13
+  n_eval_pts: 12
   use_symmetry: true  # Exploit 8-fold symmetry
 
 # Geometry Parameters
@@ -22,7 +22,7 @@ yoke:
   outer_radius_mm: 860.0
   inner_radius_mm: 696.5
   height_mm: 188.5
-  segmentation: [2, 1, 2]  # [r, theta, z] divisions
+  segmentation: [2, 1, 4]  # [r, theta, z] divisions
   window_width_mm: 300.0
 
 lid_lower:
@@ -36,7 +36,7 @@ lid_upper:
   outer_radius_mm_2: 787.0
   inner_radius_mm: 165.0
   height_mm: 80.0
-  segmentation: [2, 1, 2]  # [r, theta, z] divisions (cylindrical)
+  segmentation: [6, 1, 4]  # [r, theta, z] divisions (cylindrical)
   hole_diameter_mm: 160.0
   hole_center_xy: [198.0, 198.0]
   cut_out_rf_stem_hole: false
@@ -60,10 +60,11 @@ side_shim:
   max_adjacent_step_deg: 2.0  # deg (only used in optimization)
   # side_offsets_deg: [2.0, 0.1, 0.1, 0.1, 0.1, 0.25, 0.5, 0.75, 0.75, 0.1, 0.1, 1.0, 1.75, 1.75, 2.0]
   # Best so far:
-  side_offsets_deg: [7.094361390352955, 5.16328010607657484, 5.13411228524866747, 5.1,
-                     5.11661889606375664, 5.26819056488524773, 5.5015736468832837, 5.7135311751436973,
-                     5.7329375098612074, 5.2404676477555279, 5.12272301845211593, 5.8527935541849507,
-                     6.7438719489631913, 6.93679885916906, 7.2999158287727846]
+#  side_offsets_deg: [7.094361390352955, 5.16328010607657484, 5.13411228524866747, 5.1,
+#                     5.11661889606375664, 5.26819056488524773, 5.5015736468832837, 5.7135311751436973,
+#                     5.7329375098612074, 5.2404676477555279, 5.12272301845211593, 5.8527935541849507,
+#                     6.7438719489631913, 6.93679885916906, 7.2999158287727846]
+  side_offsets_deg: [7.645036208743809, 5.157863590999308, 5.081546798849987, 5.100626317332834, 5.16784832926774, 5.402773744552573, 5.382469413802248, 5.392368162013359, 5.961849901893943, 5.311642742569048, 5.102830874524988, 5.639042402498603, 6.609469939744071, 7.206298187778705, 7.725076082933336]
   segmentation: [3, 1, 20 ]  # Number of [r, theta, z] segments (cylindrical)
 
 top_shim:
@@ -74,10 +75,11 @@ top_shim:
   max_adjacent_step_mm: 2.0  # mm (only used in optimization)
   # top_offsets_mm: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 3.75, 4.25, 4.25]
   # Best so far:
-  top_offsets_mm: [6.7755901194312433, 7.2147690194556935, 7.276484962484513, 7.178882485359684,
-                   6.5531573706200315, 6.5216502242193237, 6.327321032033622, 6.4125274596060016,
-                   7.1216825896442755, 6.8889741683452925, 6.2200844902718115, 7.052889291692592,
-                   8.1714690277632487, 8.8954333622614965, 9.222144117911688]
+#  top_offsets_mm: [6.7755901194312433, 7.2147690194556935, 7.276484962484513, 7.178882485359684,
+#                   6.5531573706200315, 6.5216502242193237, 6.327321032033622, 6.4125274596060016,
+#                   7.1216825896442755, 6.8889741683452925, 6.2200844902718115, 7.052889291692592,
+#                   8.1714690277632487, 8.8954333622614965, 9.222144117911688]
+  top_offsets_mm: [7.418775254811969, 10.676948333521405, 7.977899086759961, 5.358844894899125, 6.151881890508504, 7.148267610129949, 6.332857087364059, 5.961161463125447, 6.188594467726983, 6.255975174866347, 6.357813502630688, 5.816365431317179, 7.7176730827485605, 10.079810509167464, 9.221139937813172]
   segmentation: [3, 1, 1]  # Number of [r, theta, z] subdivisions (note that arc approximation already segments in theta)
 # --- #
 
@@ -104,16 +106,16 @@ optimization:
   frequency_tolerance_mhz: 0.001
   max_iterations: 100
   coil_current_min_A: 100000
-  coil_current_max_A: 140000
+  coil_current_max_A: 200000
   num_workers: 1   # Unused
   n_initial_points: 1  # Initial random sample in Bayesian, or number of multistarts in Nelder-Mead
-  reference_coil_current: 132496
+  reference_coil_current: 145000
   regularization_weight: 0.0  # Penalty for jagged shim shapes
   random_init: false
-  opt_top: true
-  opt_side: true
+  opt_top: false
+  opt_side: false
   opt_coil: true
-  # Optimizer choice
+  # Shim Optimizer choice (coil uses "minimize_scalar" with "bounded" method)
   # nelder-mead: Faster, fewer function calls, simpler
   optimizer: 'nelder-mead'
 

@@ -117,6 +117,10 @@ class OptimizationConfig:
     max_iterations: int
     coil_current_min_A: float
     coil_current_max_A: float
+    side_shim_min_deg: float
+    side_shim_max_deg: float
+    top_shim_min_mm: float
+    top_shim_max_mm: float
     num_workers: int
     n_initial_points: int
     reference_coil_current: float
@@ -283,6 +287,10 @@ class CyclotronConfig:
                 'opt_top': self.optimization.opt_top,
                 'opt_side': self.optimization.opt_top,
                 'opt_coil': self.optimization.opt_top,
+                'side_shim_min_deg': self.optimization.side_shim_min_deg,
+                'side_shim_max_deg': self.optimization.side_shim_max_deg,
+                'top_shim_min_mm': self.optimization.top_shim_min_mm,
+                'top_shim_max_mm': self.optimization.top_shim_max_mm,
             },
             'visualization': {
                 'show_opengl': self.visualization.show_opengl,

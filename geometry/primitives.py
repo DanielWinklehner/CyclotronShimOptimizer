@@ -206,6 +206,37 @@ class SegmentationStrategy:
 class ObjectFilter:
     """Filter and manipulate Radia object containers."""
 
+    # @staticmethod
+    # def keep_outside_radius(container: int,
+    #                         min_radius: float,
+    #                         verbose: bool = False) -> int:
+    #     """
+    #     Filter: keep only objects outside a radius (from origin).
+    #
+    #     :param container: Radia container object ID
+    #     :param min_radius: Minimum radius threshold
+    #     :param verbose: Print filtering info
+    #     :return: New container with filtered objects
+    #     """
+    #     objs_to_keep = []
+    #     objs_deleted = 0
+    #
+    #     for obj in rad.ObjCntStuf(container):
+    #         obj_center = rad.ObjM(obj)[0]
+    #
+    #         r_center = np.sqrt(obj_center[0] ** 2 + obj_center[1] ** 2)
+    #
+    #         if r_center > min_radius:
+    #             objs_to_keep.append(obj)
+    #         else:
+    #             rad.UtiDel(obj)
+    #             objs_deleted += 1
+    #
+    #     if verbose:
+    #         print(f"    ObjectFilter: kept {len(objs_to_keep)}, deleted {objs_deleted} (r < {min_radius:.1f})")
+    #
+    #     return rad.ObjCnt(objs_to_keep)
+
     @staticmethod
     def keep_outside_radius(container: int,
                             min_radius: float,
@@ -221,15 +252,32 @@ class ObjectFilter:
         objs_to_keep = []
         objs_deleted = 0
 
-        for obj in rad.ObjCntStuf(container):
-            obj_center = rad.ObjM(obj)[0]
-            r_center = np.sqrt(obj_center[0] ** 2 + obj_center[1] ** 2)
+        def traverse_comps(obj_id):
+            info_txt = rad.UtiDmp(obj_id)
+            if "Magnetic field source object: Container" in info_txt or \
+                    "Magnetic field source object: Subdivided Polyhedron" in info_txt:
+                for sub_obj_id in rad.ObjCntStuf(obj_id):
+                    traverse_comps(sub_obj_id)
+            elif "Magnetic field source object: Relaxable: Polyhedron" in info_txt:
+                try:
+                    obj_center = rad.ObjM(obj_id)[0]
+                    r_center = np.sqrt(obj_center[0] ** 2 + obj_center[1] ** 2)
 
-            if r_center > min_radius:
-                objs_to_keep.append(obj)
-            else:
-                rad.UtiDel(obj)
-                objs_deleted += 1
+                    if r_center > min_radius:
+                        objs_to_keep.append(obj_id)
+                    else:
+                        rad.UtiDel(obj_id)
+                        # objs_deleted += 1
+
+                except Exception as e:
+                    print(f"Exception happened while traversing Radia objects: {e}", flush=True)
+                    print("\nElement Info:", flush=True)
+                    print(info_txt, flush=True)
+                    print("", flush=True)
+                    rad.UtiMPI('off')
+                    exit(1)
+
+        traverse_comps(container)
 
         if verbose:
             print(f"    ObjectFilter: kept {len(objs_to_keep)}, deleted {objs_deleted} (r < {min_radius:.1f})")
@@ -253,16 +301,32 @@ class ObjectFilter:
         objs_to_keep = []
         objs_deleted = 0
 
-        for obj in rad.ObjCntStuf(container):
-            obj_center = rad.ObjM(obj)[0]
-            dist = np.sqrt((obj_center[0] - center[0]) ** 2 +
-                           (obj_center[1] - center[1]) ** 2)
+        def traverse_comps(obj_id):
+            info_txt = rad.UtiDmp(obj_id)
+            if "Magnetic field source object: Container" in info_txt or \
+                    "Magnetic field source object: Subdivided Polyhedron" in info_txt:
+                for sub_obj_id in rad.ObjCntStuf(obj_id):
+                    traverse_comps(sub_obj_id)
+            elif "Magnetic field source object: Relaxable: Polyhedron" in info_txt:
+                try:
+                    obj_center = rad.ObjM(obj_id)[0]
+                    dist = np.sqrt((obj_center[0] - center[0]) ** 2 +
+                                   (obj_center[1] - center[1]) ** 2)
 
-            if dist > radius:
-                objs_to_keep.append(obj)
-            else:
-                rad.UtiDel(obj)
-                objs_deleted += 1
+                    if dist > radius:
+                        objs_to_keep.append(obj_id)
+                    else:
+                        rad.UtiDel(obj_id)
+
+                except Exception as e:
+                    print(f"Exception happened while traversing Radia objects: {e}", flush=True)
+                    print("\nElement Info:", flush=True)
+                    print(info_txt, flush=True)
+                    print("", flush=True)
+                    rad.UtiMPI('off')
+                    exit(1)
+
+        traverse_comps(container)
 
         if verbose:
             print(f"    ObjectFilter: kept {len(objs_to_keep)}, deleted {objs_deleted} (dist < {radius:.1f})")
@@ -280,6 +344,8 @@ class ObjectFilter:
         :param max_depth: How many levels to flatten
         :param verbose: Print flattening info
         :return: Flattened container
+
+        TODO: This should be replaced with the logic in the above functions to do away with "depth"
         """
         flattened = []
 

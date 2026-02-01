@@ -251,7 +251,7 @@ def optimize_coil_final(best_surface_params: np.ndarray,
             evaluate_at_coil,
             bounds=coil_bounds,
             method='bounded',
-            tol=1e-6,
+            # tol=1e-6,
             options={
                 'maxiter': config.optimization.max_iterations,
                 'xatol': 1e-2,

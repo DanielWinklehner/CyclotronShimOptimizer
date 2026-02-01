@@ -267,7 +267,7 @@ class LidUpperComponent(GeometricComponent):
 
         # Cut RF stem hole if requested
         if cut_rf_hole:
-            seg_strategy = SegmentationStrategy(seg_div)
+            seg_strategy = SegmentationStrategy([2, ang_res, 1], [2000, 1, 1])
             seg_strategy.apply_cylindrical(
                 lid_temp,
                 [hole_center[0], hole_center[1], 0],
@@ -282,7 +282,7 @@ class LidUpperComponent(GeometricComponent):
 
         # Cut center bore
         # Cut out inner bore using angular resolution
-        seg_strategy = SegmentationStrategy([1, ang_res, 1])
+        seg_strategy = SegmentationStrategy([2, ang_res, 1], [2000, 1, 1])
         seg_strategy.apply_center_bore_cutout(lid_temp, lid_ir)
 
         # Filter: keep outside center bore

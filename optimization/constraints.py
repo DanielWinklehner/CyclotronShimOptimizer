@@ -15,11 +15,11 @@ def get_optimization_bounds(config) -> Tuple[List[float], List[float]]:
     """
     n_segments = config.side_shim.num_rad_segments
 
-    side_shim_lower = 5.0  # deg
-    side_shim_upper = 15.0  # deg
+    side_shim_lower = config.optimization.side_shim_min_deg  # deg
+    side_shim_upper = config.optimization.side_shim_max_deg  # deg
 
-    top_shim_lower = 5.0  # mm
-    top_shim_upper = 17.0  # mm
+    top_shim_lower = config.optimization.top_shim_min_mm  # mm
+    top_shim_upper = config.optimization.top_shim_max_mm  # mm
 
     # Coil current bounds (Amps)
     coil_lower = config.optimization.coil_current_min_A
