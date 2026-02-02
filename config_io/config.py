@@ -102,6 +102,7 @@ class MaterialConfig:
     saturation_field_t: list
     saturation_curve_m: list
     linear_curve_m: list
+    bh_filename: Optional[str] = None
     
 
 @dataclass
@@ -135,6 +136,7 @@ class OptimizationConfig:
 @dataclass
 class VisualizationConfig:
     show_opengl: bool
+    comsol_filename: Optional[str] = None
 
 
 @dataclass
@@ -249,6 +251,7 @@ class CyclotronConfig:
                 'saturation_field_t': self.material.saturation_field_t,
                 'saturation_curve_m': self.material.saturation_curve_m,
                 'linear_curve_m': self.material.linear_curve_m,
+                'bh_filename': self.material.bh_filename,
             },
             'side_shim': {
                 'num_rad_segments': self.side_shim.num_rad_segments,
@@ -294,5 +297,6 @@ class CyclotronConfig:
             },
             'visualization': {
                 'show_opengl': self.visualization.show_opengl,
+                'comsol_filename': self.visualization.comsol_filename,
             },
         }

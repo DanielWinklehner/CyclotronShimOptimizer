@@ -2,6 +2,8 @@
 
 import os
 import sys
+
+import matplotlib.pyplot as plt
 import numpy as np
 from typing import Tuple, List
 from io import StringIO
@@ -110,7 +112,24 @@ def evaluate_radii_parallel(config: CyclotronConfig,
     else:
         im_id = rad.RlxPre(yoke)  # calculate all from scratch
 
+    # TODO: Remove after debug
+    # prec = []
+    # for i in range(int(config.simulation.iterations/10)):
+    #     result = rad.RlxAuto(im_id, config.simulation.precision, 10, 4, 'ZeroM->False')  # Do 10 iterations at a time
+    #     prec.append(result[0])
+    #
+    # if rank <= 0:
+    #     plt.plot(prec)
+    #     plt.show()
+    #     rad.UtiMPI('off')
+    #     exit(0)
+    # TODO: End Debug
+
     result = rad.RlxAuto(im_id, config.simulation.precision, config.simulation.iterations, 4, 'ZeroM->False')
+
+    # if rank <=0:
+    #     print(result, flush=True)
+
     converged = (result[0] <= config.simulation.precision)  # Note: first result item is precision reached
 
     # Query all radii at once with single rad.Fld() call

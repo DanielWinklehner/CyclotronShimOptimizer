@@ -9,6 +9,7 @@ geometry:
   yoke_build_angle_deg: 45.0
   angular_resolution: 15  # Number of segments to approximate arcs
 
+
 # Field evaluation
 field_evaluation:
   num_points_circle: 360
@@ -49,13 +50,13 @@ pole:
   height_mm: 230.0  # 235 originally, but top shim is min 5 mm
   full_angle_deg: 20.0  # 25 originally, but side shim is min 5 deg
   angular_resolution_deg: 2.5  # Angular segment length for arc approximation (deg)
-  segmentation: [5, 1, 15]  # Number of [r, theta, z] segments (cylindrical)
+  segmentation: [10, 1, 15]  # Number of [r, theta, z] segments (cylindrical)
 
 # Shimming
 side_shim:
   include: true
   num_rad_segments: 14  # number of radial segments along the pole edge
-  angular_resolution_deg: 1.25  # Angular segment length for arc approximation (deg)
+  angular_resolution_deg: 2.5  # Angular segment length for arc approximation (deg)
   default_offset_deg: 5.0  # deg
   max_adjacent_step_deg: 2.0  # deg (only used in optimization)
 #  side_offsets_deg: [0.1, 0.1, 0.1, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 5.0, 5.0, 6.0, 6.0, 7.0, 8.0]
@@ -74,11 +75,11 @@ top_shim:
   default_offset_mm: 5.0  # mm
   max_adjacent_step_mm: 2.0  # mm (only used in optimization)
 #  top_offsets_mm: [1.0, 1.0, 1.0, 3.0, 4.0, 6.0, 6.0, 8.0, 8.0, 8.0, 8.0, 10.0, 10.0, 10.0, 10.0]
-  top_offsets_mm: [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
+#  top_offsets_mm: [5.0, 5.0, 6.0, 8.0, 10.0, 13.0, 15.0, 17.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0]
   # Best so far:
 #  top_offsets_mm: [ 7.76, 5.0, 6.02, 7.1, 9.16, 9.69, 10.54, 13.95,
 #                    14.83,17.0, 17.0, 17.0, 17.0, 17.0, 17.0 ]
-#  top_offsets_mm: [7.511, 5.0, 6.231, 7.765, 9.859, 9.871, 11.736, 14.1, 14.5, 16.9, 17.0, 17.0, 17.0, 17.0, 17.0 ]
+  top_offsets_mm: [5.0,5.0,5.873,6.809,7.711,10.969,11.965,16.039,17.790,18.739,18.884,20.0,20.0,20.0,20.0]
   segmentation: [3, 1, 1]  # Number of [r, theta, z] subdivisions (note that arc approximation already segments in theta)
 # --- #
 
@@ -93,11 +94,12 @@ material:
   saturation_field_t: [20000, 2]
   saturation_curve_m: [0.1, 2]
   linear_curve_m: [0.1, 2]
+  bh_filename: r"dillinger_steel.csv"
 
 # Simulation
 simulation:
   precision: 0.0001
-  iterations: 5000
+  iterations: 3000
 
 # Optimization
 optimization:
@@ -115,7 +117,7 @@ optimization:
   reference_coil_current: 18000
   regularization_weight: 0.0  # Penalty for jagged shim shapes
   random_init: false
-  opt_top: true
+  opt_top: false
   opt_side: true
   opt_coil: true
   # Optimizer choice
@@ -125,3 +127,4 @@ optimization:
 # Visualization
 visualization:
   show_opengl: true
+#  comsol_filename: "D:\MIT Dropbox\Daniel Winklehner\Projects\Muon Reacceleration\uCyclo_v1_Midplane_Res0.5mm_400x400mm.txt"

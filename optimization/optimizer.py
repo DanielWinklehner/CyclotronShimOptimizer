@@ -153,6 +153,8 @@ class CyclotronOptimizer:
                 print(f"---Omitting phase 3 as per config.yml", flush=True)
             print("=" * 100 + "\n", flush=True)
 
+        plotter_running = False
+
         # ===== PHASE 1: Top shims =====
         if opt_top:
             if self.rank <= 0 and self.verbosity >= 1:
@@ -165,6 +167,8 @@ class CyclotronOptimizer:
                     pole_angle_deg=self.config.pole.full_angle_deg,
                     target_frequency=self.config.optimization.target_frequency_mhz
                 )
+
+                plotter_running = True
 
             best_top, flatness_top = self.optimize_phase(
                 phase=1,
@@ -190,6 +194,15 @@ class CyclotronOptimizer:
         if opt_side:
             if self.rank <= 0 and self.verbosity >= 1:
                 print(f"\n{'='*100}\nPHASE 2: SIDE SHIM OPTIMIZATION (Top shims fixed)\n{'='*100}\n", flush=True)
+
+                if not plotter_running:
+                    self.plotter.setup(
+                        figsize=(20, 7),
+                        inner_radius_mm=self.config.pole.inner_radius_mm,
+                        outer_radius_mm=self.config.pole.outer_radius_mm,
+                        pole_angle_deg=self.config.pole.full_angle_deg,
+                        target_frequency=self.config.optimization.target_frequency_mhz
+                    )
 
             best_side, flatness_side = self.optimize_phase(
                 phase=2,

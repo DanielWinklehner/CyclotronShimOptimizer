@@ -365,18 +365,19 @@ def main(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = 
                 show=False
             )
 
-            compare_fields(
-                external_field_filename=r"D:\MIT Dropbox\Daniel Winklehner\Projects\Muon Reacceleration\uCyclo_v1_Midplane_Res0.5mm_400x400mm.txt",
-                config=config,
-                radii_mm_radia=np.array(radii_out),
-                bz_values_radia=np.array(bz_values),
-                rev_frequencies_radia_mhz=np.array(rev_frequencies_mhz),
-                mean_freq_radia_mhz=mean_freq_mhz,
-                std_dev_radia_mhz=std_dev_mhz,
-                percent_dev_radia=percent_dev,
-                pole_shape=pole_shape,
-                verbosity=verbosity
-            )
+            if config.visualization.comsol_filename is not None:
+                compare_fields(
+                    external_field_filename=config.visualization.comsol_filename,
+                    config=config,
+                    radii_mm_radia=np.array(radii_out),
+                    bz_values_radia=np.array(bz_values),
+                    rev_frequencies_radia_mhz=np.array(rev_frequencies_mhz),
+                    mean_freq_radia_mhz=mean_freq_mhz,
+                    std_dev_radia_mhz=std_dev_mhz,
+                    percent_dev_radia=percent_dev,
+                    pole_shape=pole_shape,
+                    verbosity=verbosity
+                )
 
             if verbosity >= 1:
                 print(f"[OK] Plots generated", flush=True)

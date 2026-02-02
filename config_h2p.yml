@@ -94,6 +94,7 @@ material:
   saturation_field_t: [20000, 2]
   saturation_curve_m: [0.1, 2]
   linear_curve_m: [0.1, 2]
+  bh_filename: r"dillinger_steel.csv"
 
 # Simulation
 simulation:
@@ -107,6 +108,10 @@ optimization:
   max_iterations: 100
   coil_current_min_A: 100000
   coil_current_max_A: 200000
+  side_shim_min_deg: 5
+  side_shim_max_deg: 15
+  top_shim_min_mm: 5
+  top_shim_max_mm: 20
   num_workers: 1   # Unused
   n_initial_points: 1  # Initial random sample in Bayesian, or number of multistarts in Nelder-Mead
   reference_coil_current: 145000

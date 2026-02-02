@@ -2,6 +2,7 @@
 
 # import numpy as np
 import radia as rad
+import numpy as np
 
 from config_io.config import CyclotronConfig
 from geometry.pole_shape import PoleShape
@@ -71,26 +72,47 @@ def build_geometry(config: CyclotronConfig,
     # )
 
     # Dillinger BH curve (mu0*A/m (=T), T)
-    ironmat = rad.MatSatIsoTab([[0.0, 0.0],
-                                [0.000302, 0.64],
-                                [0.000397, 0.89],
-                                [0.000694, 1.25],
-                                [0.000993, 1.39],
-                                [0.001497, 1.49],
-                                [0.00199, 1.54],
-                                [0.003, 1.61],
-                                [0.003945, 1.65],
-                                [0.004973, 1.69],
-                                [0.006966, 1.72],
-                                [0.009965, 1.78],
-                                [0.015026, 1.85],
-                                [0.019967, 1.91],
-                                [0.029791, 2.01],
-                                [0.049908, 2.12],
-                                [0.069173, 2.16],
-                                [0.098953, 2.19],
-                                [0.124749, 2.22],
-                                [0.251327, 2.3]])
+    if config.material.bh_filename is not None:
+
+        dillinger_data = np.genfromtxt(r"./radialib/dillinger_steel.csv", delimiter=",").tolist()
+
+        if rank <= 0 and verbosity >=1:
+            print(f"BH Curve loaded from file {config.material.bh_filename} (in mu0*A/m and T):", flush=True)
+            for pair in dillinger_data:
+                print(pair, flush=True)
+            print("", flush=True)
+
+        ironmat = rad.MatSatIsoTab(dillinger_data)
+
+    # ironmat = rad.MatSatIsoTab([[0.0, 0.0],
+    #                             [0.000302, 0.64],
+    #                             [0.000397, 0.89],
+    #                             [0.000694, 1.25],
+    #                             [0.000993, 1.39],
+    #                             [0.001497, 1.49],
+    #                             [0.00199, 1.54],
+    #                             [0.003, 1.61],
+    #                             [0.003945, 1.65],
+    #                             [0.004973, 1.69],
+    #                             [0.006966, 1.72],
+    #                             [0.009965, 1.78],
+    #                             [0.015026, 1.85],
+    #                             [0.019967, 1.91],
+    #                             [0.029791, 2.01],
+    #                             [0.049908, 2.12],
+    #                             [0.069173, 2.16],
+    #                             [0.098953, 2.19],
+    #                             [0.124749, 2.22],
+    #                             [0.251327, 2.3]])
+
+    else:
+        mat_cfg = config.material
+
+        ironmat = rad.MatSatIsoFrm(
+            mat_cfg.saturation_field_t,
+            mat_cfg.saturation_curve_m,
+            mat_cfg.linear_curve_m
+        )
 
     ironcolor = [0, 0.5, 1]
 

@@ -112,6 +112,25 @@ conda env create -n <env_name> -f environment.yml
   - Radia `RlxAuto(..., 'ZeroM->False')` prevents matrix reset
   - 2-5× speedup on convergence
 
+### B-H Curves
+BH curves can be loaded from a file in the radialib folder. Users can add their own BH curves there. The format is 
+comma-separated value, the units are T (mu_0 * A / m) and T. 
+The corresponding Radia function is: 
+
+```
+MatSatIsoTab(...)
+    MatSatIsoTab([[H1,M1],[H2,M2],...]) creates a nonlinear isotropic magnetic material with the M versus H curve defined by the list of pairs [[H1,M1],[H2,M2],...] in Tesla.
+```
+
+If the "bh_filename" entry is omitted from the config file, the default setup is used
+
+```
+MatSatIsoFrm(...)
+    MatSatIsoFrm([ksi1,ms1],[ksi2,ms2],[ksi3,ms3]) creates a nonlinear isotropic magnetic material with the M versus H curve defined by the formula M = ms1*tanh(ksi1*H/ms1) + ms2*tanh(ksi2*H/ms2) + ms3*tanh(ksi3*H/ms3), where H is the magnitude of the magnetic field strength vector (in Tesla). The parameters [ksi3,ms3] and [ksi2,ms2] may be omitted; in such a case the corresponding terms in the formula will be omitted too.
+```
+
+with [ksi1,ms1],[ksi2,ms2],[ksi3,ms3] given by the user in the config file.
+
 ## Core Implementation
 
 ### Architecture
@@ -202,6 +221,10 @@ output/
 phase, iteration, multistart, nelder_iter, avg_frequency_mhz, 
 flatness, regularization, objective, side_param_0, ..., top_param_0, ...
 ```
+
+Note: For troubleshooting, each function call appears twice in the CSV: Once before the solve and field calculation and 
+once after. This is so one can look up the shim values for which a solve failed. The "before" lines are indicated by a 
+-1 in the "objective" column.
 
 ## Python API Example
 
