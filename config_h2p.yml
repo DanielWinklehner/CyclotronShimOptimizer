@@ -57,7 +57,6 @@ side_shim:
   num_rad_segments: 14  # number of radial segments along the pole edge
   angular_resolution_deg: 1.25  # Agular segment legth for arc approximation (deg)
   default_offset_deg: 0.1  # deg
-  max_adjacent_step_deg: 2.0  # deg (only used in optimization)
   # side_offsets_deg: [2.0, 0.1, 0.1, 0.1, 0.1, 0.25, 0.5, 0.75, 0.75, 0.1, 0.1, 1.0, 1.75, 1.75, 2.0]
   # Best so far:
 #  side_offsets_deg: [7.094361390352955, 5.16328010607657484, 5.13411228524866747, 5.1,
@@ -72,7 +71,6 @@ top_shim:
   num_rad_segments: 14  # number of radial segments along the pole edge (keep same as side for now!)
   angular_resolution_deg: 1.25  # Agular segment legth for arc approximation (deg)
   default_offset_mm: 1.0  # mm
-  max_adjacent_step_mm: 2.0  # mm (only used in optimization)
   # top_offsets_mm: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 3.75, 4.25, 4.25]
   # Best so far:
 #  top_offsets_mm: [6.7755901194312433, 7.2147690194556935, 7.276484962484513, 7.178882485359684,

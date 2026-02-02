@@ -86,13 +86,3 @@ class PoleShape:
         if np.any(offsets <= 0):
             raise ValueError("All offsets must be > 0")
         self.side_offsets_deg = offsets.copy()
-
-    # def reset_to_default(self) -> None:
-    #     """Reset offsets to default values."""
-    #     self.offsets_deg = np.ones(self.num_segments) * self.default_offset_deg
-
-    def __repr__(self) -> str:
-        return (f"PoleShape(num_segments={self.num_segments}, "
-                f"default_offset={self.default_offset_deg:.4f}°, "
-                f"offsets_min={self.offsets_deg.min():.4f}°, "
-                f"offsets_max={self.offsets_deg.max():.4f}°)")

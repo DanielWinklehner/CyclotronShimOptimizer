@@ -71,7 +71,6 @@ class SideShimConfig:
     num_rad_segments: int
     angular_resolution_deg: float
     default_offset_deg: float
-    max_adjacent_step_deg: float
     segmentation: List[int]
     side_offsets_deg: Optional[List[float]] = None
     include: Optional[bool] = True
@@ -82,7 +81,6 @@ class TopShimConfig:
     num_rad_segments: int
     angular_resolution_deg: float
     default_offset_mm: float
-    max_adjacent_step_mm: float
     segmentation: List[int]
     top_offsets_mm:  Optional[List[float]] = None
     include: Optional[bool] = True
@@ -258,7 +256,6 @@ class CyclotronConfig:
                 'ang_resulution_deg': self.side_shim.angular_resolution_deg,
                 'default_offset_deg': self.side_shim.default_offset_deg,
                 'side_offsets_deg': self.side_shim.side_offsets_deg,
-                'max_adjacent_step_deg': self.side_shim.max_adjacent_step_deg,
                 'segmentation': self.side_shim.segmentation,
                 'include': self.side_shim.include,
             },
@@ -267,7 +264,6 @@ class CyclotronConfig:
                 'ang_resulution_deg': self.top_shim.angular_resolution_deg,
                 'default_offset_mm': self.top_shim.default_offset_mm,
                 'top_offsets_mm': self.top_shim.top_offsets_mm,
-                'max_adjacent_step_mm': self.top_shim.max_adjacent_step_mm,
                 'segmentation': self.top_shim.segmentation,
                 'include': self.top_shim.include,
             },

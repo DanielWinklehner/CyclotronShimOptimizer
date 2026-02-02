@@ -58,7 +58,6 @@ side_shim:
   num_rad_segments: 14  # number of radial segments along the pole edge
   angular_resolution_deg: 2.5  # Angular segment length for arc approximation (deg)
   default_offset_deg: 5.0  # deg
-  max_adjacent_step_deg: 2.0  # deg (only used in optimization)
 #  side_offsets_deg: [0.1, 0.1, 0.1, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 5.0, 5.0, 6.0, 6.0, 7.0, 8.0]
   side_offsets_deg: [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
   # Best so far:
@@ -73,13 +72,12 @@ top_shim:
   num_rad_segments: 14  # number of radial segments along the pole edge (keep same as side for now!)
   angular_resolution_deg: 1.25 # Angular segment length for arc approximation (deg)
   default_offset_mm: 5.0  # mm
-  max_adjacent_step_mm: 2.0  # mm (only used in optimization)
 #  top_offsets_mm: [1.0, 1.0, 1.0, 3.0, 4.0, 6.0, 6.0, 8.0, 8.0, 8.0, 8.0, 10.0, 10.0, 10.0, 10.0]
-#  top_offsets_mm: [5.0, 5.0, 6.0, 8.0, 10.0, 13.0, 15.0, 17.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0]
+  top_offsets_mm: [5.0, 5.0, 6.0, 8.0, 10.0, 13.0, 15.0, 17.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0]
   # Best so far:
 #  top_offsets_mm: [ 7.76, 5.0, 6.02, 7.1, 9.16, 9.69, 10.54, 13.95,
 #                    14.83,17.0, 17.0, 17.0, 17.0, 17.0, 17.0 ]
-  top_offsets_mm: [5.0,5.0,5.873,6.809,7.711,10.969,11.965,16.039,17.790,18.739,18.884,20.0,20.0,20.0,20.0]
+#  top_offsets_mm: [5.0,5.0,5.873,6.809,7.711,10.969,11.965,16.039,17.790,18.739,18.884,20.0,20.0,20.0,20.0]
   segmentation: [3, 1, 1]  # Number of [r, theta, z] subdivisions (note that arc approximation already segments in theta)
 # --- #
 
