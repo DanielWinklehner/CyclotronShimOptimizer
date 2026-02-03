@@ -84,6 +84,7 @@ coil:
   radius_min_mm: 460.0
   radius_max_mm: 674.5
   height_mm: 123.5
+  midplane_dist: 55
   current_A: 18000  # Amp-turns   35194.097
   num_segments: 25
 

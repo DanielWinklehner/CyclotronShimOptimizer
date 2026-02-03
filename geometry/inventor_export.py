@@ -85,6 +85,7 @@ class InventorPoleExporter:
         """
         lines = []
         for i, val in enumerate(values):
+            val *= 0.1  # Radia uses mm, VB Macro expects cm
             lines.append(f"    {array_name}({i}) = {val:.6f}")
         return "\n".join(lines)
 
@@ -353,10 +354,10 @@ class InventorPoleExporter:
         On Error GoTo 0
         Set oCompDef = oDoc.ComponentDefinition
 
-        ' Pole parameters (mm, degrees)
-        Const INNER_RADIUS As Double = {inner_rad}#
-        Const OUTER_RADIUS As Double = {outer_rad}#
-        Const pole_height As Double = {pole_height}#
+        ' Pole parameters (cm, degrees)
+        Const INNER_RADIUS As Double = {0.1 * inner_rad}#
+        Const OUTER_RADIUS As Double = {0.1 * outer_rad}#
+        Const pole_height As Double = {0.1 * pole_height}#
         Const POLE_ANGLE_DEG As Double = {pole_angle_deg}#
         Const POLE_HALF_ANGLE_DEG As Double = {pole_half_angle_deg}
         Const N_SEGMENTS As Integer = {n_segments}
@@ -371,7 +372,7 @@ class InventorPoleExporter:
         ' Side shim offsets (degrees) - angular displacement at each radius
     {side_assignments}
 
-        ' Top shim offsets (mm) - vertical displacement at each radius
+        ' Top shim offsets (cm) - vertical displacement at each radius
     {top_assignments}
 
         ' Create pole segments

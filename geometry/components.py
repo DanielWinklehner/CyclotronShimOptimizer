@@ -1224,16 +1224,17 @@ class CoilComponent(GeometricComponent):
         Rmax = cfg.radius_max_mm
         Nseg = cfg.num_segments
         h = cfg.height_mm
+        midplane_dist = cfg.midplane_dist
         current = cfg.current_A
 
         CurDens = current / h / (Rmax - Rmin)
 
         # Lower coil
-        pc1 = [0, 0, 55.0 + 0.5 * h]
+        pc1 = [0, 0, midplane_dist + 0.5 * h]
         coil1 = rad.ObjRaceTrk(pc1, [Rmin, Rmax], [0.0, 0.0], h, Nseg, CurDens)
 
         # Upper coil
-        pc2 = [0, 0, -(55.0 + 0.5 * h)]
+        pc2 = [0, 0, -(midplane_dist + 0.5 * h)]
         coil2 = rad.ObjRaceTrk(pc2, [Rmin, Rmax], [0.0, 0.0], h, Nseg, CurDens)
 
         # Set color

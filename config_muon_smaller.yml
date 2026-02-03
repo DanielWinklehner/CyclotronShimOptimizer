@@ -59,11 +59,11 @@ side_shim:
   angular_resolution_deg: 2.5  # Angular segment length for arc approximation (deg)
   default_offset_deg: 5.0  # deg
 #  side_offsets_deg: [0.1, 0.1, 0.1, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 5.0, 5.0, 6.0, 6.0, 7.0, 8.0]
-  side_offsets_deg: [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
+#  side_offsets_deg: [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
   # Best so far:
 #  side_offsets_deg: [ 9.15, 6.09, 5.88, 5.98, 5.97,6.74,7.07,5.64,
 #                      5.24, 5.0, 5.5, 5.5, 6.5, 8.5, 10.5 ]
-#  side_offsets_deg: [9.401, 6.186, 5.979, 6.112, 6.252, 6.689, 6.807, 5.854, 5.306, 5.0, 5.12, 5.422, 6.65, 9.05, 10.64]
+  side_offsets_deg: [6.057764119330464, 5.343095323247299, 5.65765668918826, 7.185318723298336, 7.847950225097227, 9.178730677377391, 6.990563223081416, 5.342445047403181, 5.0, 5.334122679368232, 5.519034578882448, 6.50318518254925, 6.922935902864445, 7.767904486416379, 10.48714788277266]
 
   segmentation: [3, 1, 20]  # Number of [r, theta, z] segments (cylindrical)
 
@@ -73,11 +73,11 @@ top_shim:
   angular_resolution_deg: 1.25 # Angular segment length for arc approximation (deg)
   default_offset_mm: 5.0  # mm
 #  top_offsets_mm: [1.0, 1.0, 1.0, 3.0, 4.0, 6.0, 6.0, 8.0, 8.0, 8.0, 8.0, 10.0, 10.0, 10.0, 10.0]
-  top_offsets_mm: [5.0, 5.0, 6.0, 8.0, 10.0, 13.0, 15.0, 17.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0]
+#  top_offsets_mm: [5.0, 5.0, 6.0, 8.0, 10.0, 13.0, 15.0, 17.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0]
   # Best so far:
 #  top_offsets_mm: [ 7.76, 5.0, 6.02, 7.1, 9.16, 9.69, 10.54, 13.95,
 #                    14.83,17.0, 17.0, 17.0, 17.0, 17.0, 17.0 ]
-#  top_offsets_mm: [5.0,5.0,5.873,6.809,7.711,10.969,11.965,16.039,17.790,18.739,18.884,20.0,20.0,20.0,20.0]
+  top_offsets_mm: [5.0,5.0,5.873,6.809,7.711,10.969,11.965,16.039,17.790,18.739,18.884,20.0,20.0,20.0,20.0]
   segmentation: [3, 1, 1]  # Number of [r, theta, z] subdivisions (note that arc approximation already segments in theta)
 # --- #
 
@@ -85,14 +85,15 @@ coil:
   radius_min_mm: 460.0
   radius_max_mm: 574.5
   height_mm: 123.5
-  current_A: 18000  # Amp-turns   35194.097
+  midplane_dist: 55
+  current_A: 15951  # Amp-turns   35194.097
   num_segments: 25
 
 material:
   saturation_field_t: [20000, 2]
   saturation_curve_m: [0.1, 2]
   linear_curve_m: [0.1, 2]
-  bh_filename: r"dillinger_steel.csv"
+  bh_filename: "dillinger_steel.csv"
 
 # Simulation
 simulation:
@@ -103,7 +104,7 @@ simulation:
 optimization:
   target_frequency_mhz: 42
   frequency_tolerance_mhz: 0.001
-  max_iterations: 100  # 100
+  max_iterations: 25  # 100
   coil_current_min_A: 10000
   coil_current_max_A: 30000
   side_shim_min_deg: 5
@@ -112,7 +113,7 @@ optimization:
   top_shim_max_mm: 20
   num_workers: 1   # Unused
   n_initial_points: 1  # Initial random sample in Bayesian, or number of multistarts in Nelder-Mead
-  reference_coil_current: 18000
+  reference_coil_current: 15951
   regularization_weight: 0.0  # Penalty for jagged shim shapes
   random_init: false
   opt_top: false

@@ -91,6 +91,7 @@ class CoilConfig:
     radius_min_mm: float
     radius_max_mm: float
     height_mm: float
+    midplane_dist: float
     current_A: float
     num_segments: int
 
@@ -242,6 +243,7 @@ class CyclotronConfig:
                 'radius_min_mm': self.coil.radius_min_mm,
                 'radius_max_mm': self.coil.radius_max_mm,
                 'height_mm': self.coil.height_mm,
+                'midplane_dist': self.coil.midplane_dist,
                 'current_A': self.coil.current_A,
                 'num_segments': self.coil.num_segments,
             },

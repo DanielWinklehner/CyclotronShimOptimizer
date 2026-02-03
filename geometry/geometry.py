@@ -3,6 +3,7 @@
 # import numpy as np
 import radia as rad
 import numpy as np
+import os
 
 from config_io.config import CyclotronConfig
 from geometry.pole_shape import PoleShape
@@ -74,7 +75,7 @@ def build_geometry(config: CyclotronConfig,
     # Dillinger BH curve (mu0*A/m (=T), T)
     if config.material.bh_filename is not None:
 
-        dillinger_data = np.genfromtxt(r"./radialib/dillinger_steel.csv", delimiter=",").tolist()
+        dillinger_data = np.genfromtxt(os.path.join("radialib", config.material.bh_filename), delimiter=",").tolist()
 
         if rank <= 0 and verbosity >=1:
             print(f"BH Curve loaded from file {config.material.bh_filename} (in mu0*A/m and T):", flush=True)
