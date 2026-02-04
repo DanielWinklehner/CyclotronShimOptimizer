@@ -63,6 +63,7 @@ def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
             pole_shape,
             radii_mm,
             rank=rank,
+            comm=comm,
             verbosity=verbosity,
             use_cache=use_cache
         )
@@ -195,6 +196,7 @@ def optimize_coil_final(best_surface_params: np.ndarray,
                 pole_shape,
                 radii_mm,
                 rank=rank,
+                comm=comm,
                 verbosity=verbosity
             )
 
@@ -315,8 +317,8 @@ def optimize_coil_final(best_surface_params: np.ndarray,
     final_error = comm.bcast(final_error, root=0)
 
     if verbosity >= 1 and rank <= 0:
-        print(f"\n  → Optimal coil current: {optimal_coil:.0f}A", flush=True)
-        print(f"  → Frequency error: {final_error:.4f}MHz", flush=True)
-        print(f"  → Total evaluations: {n_evals[0]}", flush=True)
+        print(f"\n  --> Optimal coil current: {optimal_coil:.0f}A", flush=True)
+        print(f"  --> Frequency error: {final_error:.4f}MHz", flush=True)
+        print(f"  --> Total evaluations: {n_evals[0]}", flush=True)
 
     return optimal_coil, final_error, n_evals[0]

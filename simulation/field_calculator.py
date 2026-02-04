@@ -78,6 +78,7 @@ def evaluate_radii_parallel(config: CyclotronConfig,
                             pole_shape: PoleShape,
                             radii_mm: List[float],
                             rank: int = 0,
+                            comm=None,
                             use_cache: bool = False,
                             verbosity=1):
     """
@@ -105,12 +106,17 @@ def evaluate_radii_parallel(config: CyclotronConfig,
     rad.UtiDelAll()
 
     # Build geometry
-    yoke, pole = build_geometry(config, pole_shape, rank=rank, verbosity=verbosity, use_cache=use_cache)
+    yoke, pole = build_geometry(config, pole_shape, rank=rank, comm=comm, verbosity=verbosity, use_cache=use_cache)
 
+    if rank <=0 and verbosity >= 1:
+        print("Building Interaction Matrix...", flush=True)
     if use_cache:
         im_id = rad.RlxPre(pole, yoke)  # use precalculated yoke magnetization as applied field source
     else:
         im_id = rad.RlxPre(yoke)  # calculate all from scratch
+    if rank <=0 and verbosity >= 1:
+        print("Done!", flush=True)
+
 
     # TODO: Remove after debug
     # prec = []
@@ -125,10 +131,12 @@ def evaluate_radii_parallel(config: CyclotronConfig,
     #     exit(0)
     # TODO: End Debug
 
+    if rank <=0 and verbosity >= 1:
+        print("Solving...", flush=True)
     result = rad.RlxAuto(im_id, config.simulation.precision, config.simulation.iterations, 4, 'ZeroM->False')
-
-    # if rank <=0:
-    #     print(result, flush=True)
+    if rank <=0 and verbosity >= 1:
+        print("Done!", flush=True)
+        print("Result:", result, flush=True)
 
     converged = (result[0] <= config.simulation.precision)  # Note: first result item is precision reached
 

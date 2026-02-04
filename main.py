@@ -114,7 +114,7 @@ def main(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = 
             rad.UtiDelAll()
             # If for_caching = True, returns (yoke with base pole, shims)
             cyclotron_for_cache, _ = build_geometry(config,
-                                                    pole_shape=None, rank=rank, for_caching=True,
+                                                    pole_shape=None, rank=rank, comm=comm, for_caching=True,
                                                     use_cache=True, verbosity=verbosity)
 
             # Solve magnetostatics problem
@@ -220,7 +220,7 @@ def main(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = 
         if rank <= 0:
             # Build geometry on rank 0 only
             rad.UtiDelAll()
-            cyclotron_vis, _ = build_geometry(config, pole_shape, rank=rank, omit_symmetry=True, verbosity=verbosity)
+            cyclotron_vis, _ = build_geometry(config, pole_shape, rank=rank, comm=comm, omit_symmetry=True, verbosity=verbosity)
             rad.ObjDrwOpenGL(cyclotron_vis)
             input("Hit Enter...")
 
@@ -256,7 +256,7 @@ def main(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = 
         config.coil.current_A = coil_current
         radii_out, bz_values, converged = evaluate_radii_parallel(
             config, pole_shape, radii_mm,
-            rank=rank
+            rank=rank, comm=comm
         )
 
         if rank <= 0 and verbosity >= 1:
@@ -325,21 +325,23 @@ def main(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = 
                 print(f"  % Deviation: {percent_dev:.4f}%", flush=True)
                 print(flush=True)
 
-        # ========== OPENGL VISUALIZATION (Rank 0 only) ==========
-        if config.visualization.show_opengl:
-            with Timer("Display geometry in OpenGL", rank, verbosity):
-                if verbosity >= 1:
-                    print(f"Opening OpenGL viewer...", flush=True)
-                # Rebuild geometry for visualization
-                rad.UtiDelAll()
-                cyclotron_vis, _ = build_geometry(config, pole_shape, rank=rank,
-                                                  omit_symmetry=True, verbosity=verbosity)
+    # ========== OPENGL VISUALIZATION (Rank 0 only) ==========
+    if config.visualization.show_opengl:
+        with Timer("Display geometry in OpenGL", rank, verbosity):
+            if rank <= 0 and verbosity >= 1:
+                print(f"Opening OpenGL viewer...", flush=True)
+            # Rebuild geometry for visualization
+            rad.UtiDelAll()
+            cyclotron_vis, _ = build_geometry(config, pole_shape, rank=rank, comm=comm,
+                                              omit_symmetry=True, verbosity=verbosity)
+            if rank <= 0:
                 rad.ObjDrwOpenGL(cyclotron_vis)
                 if verbosity >= 1:
                     print(f"[OK] OpenGL viewer closed", flush=True)
                     print(flush=True)
 
         # ========== VISUALIZATION (Rank 0 Only) ==========
+    if rank <= 0 < len(bz_values):
         with Timer("Generate plots", rank, verbosity):
             if verbosity >= 1:
                 print(f"Generating plots...", flush=True)

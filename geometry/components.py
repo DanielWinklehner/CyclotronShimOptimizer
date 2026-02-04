@@ -3,10 +3,12 @@
 from abc import ABC, abstractmethod
 import numpy as np
 from sympy import Point3D, Line3D, Plane, N
+from sympy.combinatorics import tetrahedron
 from sympy.geometry import intersection
 from typing import List, Optional, Dict, Any
 import radia as rad
 from scipy.interpolate import interp1d
+import gmsh
 
 from config_io.config import CyclotronConfig
 from geometry.pole_shape import PoleShape
@@ -21,6 +23,7 @@ class GeometricComponent(ABC):
                  config: CyclotronConfig,
                  material_id: Optional[int] = None,
                  rank: int = 0,
+                 comm = None,
                  verbosity: int = 0):
         """
         Initialize component.
@@ -28,12 +31,14 @@ class GeometricComponent(ABC):
         :param config: CyclotronConfig object
         :param material_id: Radia material ID (optional)
         :param rank: MPI rank
+        :param comm: MPI communicator
         :param verbosity: Verbosity level
         """
         self.config = config
         self.material_id = material_id
         self.radia_id = None
         self.rank = rank
+        self.comm = comm
         self.verbosity = verbosity
 
     @abstractmethod
@@ -42,6 +47,9 @@ class GeometricComponent(ABC):
         Build and return Radia object ID.
         Must be implemented by subclasses.
         """
+        pass
+
+    def segment(self, *args, **kwargs):
         pass
 
     def apply_material(self):
@@ -58,6 +66,93 @@ class GeometricComponent(ABC):
         """Log message if rank == 0 and verbosity sufficient."""
         if self.rank <= 0 and self.verbosity >= verbosity_level:
             print(f"  {msg}", flush=True)
+
+
+class FromSTPFileComponent(GeometricComponent):
+    """Load geometry component from file (STP only for now)"""
+
+    def __init__(self,
+                 config: CyclotronConfig,
+                 params: Dict[str, Any],
+                 material_id: Optional[int] = None,
+                 rank: int = 0,
+                 comm=None,
+                 verbosity: int = 0):
+        """
+        Initialize component from stp file.
+
+        :param config: CyclotronConfig object
+        :param params: Dict with keys:
+            - 'stp_filename':
+            - 'component_name': For logging
+        :param material_id: Radia material ID
+        :param rank: MPI rank
+        :param verbosity: Verbosity level
+        """
+        super().__init__(config, material_id, rank, comm, verbosity)
+        self.params = params
+
+
+    def build(self) -> int:
+        """Building from file"""
+
+        name = self.params.get('component_name', 'FromFile')
+        self._log(f"Building {name} from file...")
+
+        stp_fn = self.params['stp_filename']
+        elem_size = self.params.get('elem_size', 50)
+
+        if self.rank <=0:
+            # Initialize Gmsh
+            gmsh.initialize()
+            gmsh.option.setNumber("General.Verbosity", 2)
+
+            gmsh.model.add("model")
+
+            # Load the STP file
+            gmsh.model.occ.importShapes(stp_fn)
+            gmsh.model.occ.synchronize()
+
+            # Generate a 3D tetrahedral mesh
+            # TODO: Make meshing parameters configurable
+            gmsh.model.mesh.setSize(gmsh.model.getEntities(0), elem_size)
+            gmsh.model.mesh.generate(3)
+
+            # Get the mesh data
+            node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
+            element_types, element_tags, element_node_tags = gmsh.model.mesh.getElements()
+
+            # Finalize Gmsh
+            gmsh.finalize()
+
+            # Build a dictionary mapping node tags to coordinates
+            nodes_dict = {}
+            for i, tag in enumerate(node_tags):
+                nodes_dict[tag] = [node_coords[3 * i], node_coords[3 * i + 1], node_coords[3 * i + 2]]
+
+            tetrahedrons = []
+            # Find tetrahedra elements (gmsh type 4)
+            for elem_type_idx, elem_type in enumerate(element_types):
+                if elem_type == 4:  # 4 is the gmsh element code for tetrahedra
+                    node_list = element_node_tags[elem_type_idx]
+                    # Process each tetrahedron (4 nodes per element)
+                    for i in range(0, len(node_list), 4):
+                        tet_node_tags = node_list[i:i + 4]
+                        # Get coordinates for these nodes
+                        tet_coords = [nodes_dict[tag] for tag in tet_node_tags]
+                        tetrahedrons.append(tet_coords)
+        else:
+            tetrahedrons = None
+
+        tetrahedrons = self.comm.bcast(tetrahedrons, root=0)
+
+        radia_tets = []
+        for tet in tetrahedrons:
+            radia_tets.append(rad.ObjPolyhdr(tet, [[1, 2, 3], [1, 4, 2], [2, 4, 3], [3, 4, 1]]))
+
+        self.radia_id = rad.ObjCnt(radia_tets)
+        self._log(f"{name} built (ID={self.radia_id})")
+        return self.radia_id
 
 
 class AnnularWedgeComponent(GeometricComponent):
@@ -89,8 +184,10 @@ class AnnularWedgeComponent(GeometricComponent):
         super().__init__(config, material_id, rank, verbosity)
         self.params = params
 
+
     def build(self) -> int:
         """Build annular wedge."""
+        if self.rank <= 0: print("Yoke wall building in AnnularWedgeComponent!", flush=True)
         name = self.params.get('component_name', 'AnnularWedge')
         self._log(f"Building {name}...")
 

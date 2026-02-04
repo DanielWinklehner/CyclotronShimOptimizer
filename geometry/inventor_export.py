@@ -65,12 +65,12 @@ class InventorPoleExporter:
             f.write(macro_code)
 
         if self.verbosity >= 1:
-            print(f"✓ Inventor macro generated: {output_path}", flush=True)
-            print(f"  ├─ Radial segments: {n_segments}", flush=True)
-            print(f"  ├─ Inner radius: {pole_cfg.inner_radius_mm} mm", flush=True)
-            print(f"  ├─ Outer radius: {pole_cfg.outer_radius_mm} mm", flush=True)
-            print(f"  ├─ Pole height: {pole_cfg.height_mm} mm", flush=True)
-            print(f"  └─ Copy into Inventor: Tools → Macros → Edit/Run\n", flush=True)
+            print(f"[OK] Inventor macro generated: {output_path}", flush=True)
+            print(f"  --> Radial segments: {n_segments}", flush=True)
+            print(f"  --> Inner radius: {pole_cfg.inner_radius_mm} mm", flush=True)
+            print(f"  --> Outer radius: {pole_cfg.outer_radius_mm} mm", flush=True)
+            print(f"  --> Pole height: {pole_cfg.height_mm} mm", flush=True)
+            print(f"  --> Copy into Inventor: Tools → Macros → Edit/Run\n", flush=True)
 
         return output_path
 

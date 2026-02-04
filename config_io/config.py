@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 import sys
 
+
 # Add radialib to path for radia
 RADIA_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'radialib')
 if RADIA_PATH not in sys.path:
@@ -34,6 +35,7 @@ class YokeConfig:
     height_mm: float
     segmentation: List[int]
     window_width_mm: float
+    stp_filename: Optional[str] = None
 
 
 @dataclass
@@ -42,6 +44,7 @@ class LidLowerConfig:
     inner_radius_mm: float
     height_mm: float
     segmentation: List[int]
+    stp_filename: Optional[str] = None
 
 
 @dataclass
@@ -54,6 +57,7 @@ class LidUpperConfig:
     hole_diameter_mm: float
     hole_center_xy: List[float]
     cut_out_rf_stem_hole: bool
+    stp_filename: Optional[str] = None
 
 
 @dataclass
@@ -64,6 +68,7 @@ class PoleConfig:
     full_angle_deg: float
     angular_resolution_deg: float
     segmentation: List[int]
+    stp_filename: Optional[str] = None
 
 
 @dataclass
@@ -215,12 +220,14 @@ class CyclotronConfig:
                 'height_mm': self.yoke.height_mm,
                 'segmentation': self.yoke.segmentation,
                 'window_width_mm': self.yoke.window_width_mm,
+                'stp_filename': self.yoke.stp_filename,
             },
             'lid_lower': {
                 'outer_radius_mm': self.lid_lower.outer_radius_mm,
                 'inner_radius_mm': self.lid_lower.inner_radius_mm,
                 'height_mm': self.lid_lower.height_mm,
                 'segmentation': self.lid_lower.segmentation,
+                'stp_filename': self.lid_lower.stp_filename,
             },
             'lid_upper': {
                 'outer_radius_mm_1': self.lid_upper.outer_radius_mm_1,
@@ -231,6 +238,7 @@ class CyclotronConfig:
                 'hole_diameter_mm': self.lid_upper.hole_diameter_mm,
                 'hole_center_xy': self.lid_upper.hole_center_xy,
                 'cut_out_rf_stem_hole': self.lid_upper.cut_out_rf_stem_hole,
+                'stp_filename': self.lid_upper.stp_filename,
             },
             'pole': {
                 'outer_radius_mm': self.pole.outer_radius_mm,
@@ -238,6 +246,7 @@ class CyclotronConfig:
                 'height_mm': self.pole.height_mm,
                 'full_angle_deg': self.pole.full_angle_deg,
                 'segmentation': self.pole.segmentation,
+                'stp_filename': self.pole.stp_filename,
             },
             'coil': {
                 'radius_min_mm': self.coil.radius_min_mm,

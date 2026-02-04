@@ -252,14 +252,14 @@ class CyclotronOptimizer:
             print(f"THREE-PHASE OPTIMIZATION COMPLETE", flush=True)
             print(f"{'='*100}", flush=True)
             print(f"Phase 1 (Top shims):", flush=True)
-            print(f"  ├─ Best flatness: {flatness_top:.6f} MHz", flush=True)
-            print(f"  └─ Top offsets: {best_top.tolist()}", flush=True)
+            print(f"  --> Best flatness: {flatness_top:.6f} MHz", flush=True)
+            print(f"  --> Top offsets: {best_top.tolist()}", flush=True)
             print(f"Phase 2 (Side shims):", flush=True)
-            print(f"  ├─ Best flatness: {flatness_side:.6f} MHz", flush=True)
-            print(f"  └─ Side offsets: {best_side.tolist()}", flush=True)
+            print(f"  --> Best flatness: {flatness_side:.6f} MHz", flush=True)
+            print(f"  --> Side offsets: {best_side.tolist()}", flush=True)
             print(f"Phase 3 (Coil current):", flush=True)
-            print(f"  ├─ Optimal coil: {optimal_coil:.0f}A", flush=True)
-            print(f"  └─ Frequency error: {coil_error:.4f}MHz", flush=True)
+            print(f"  --> Optimal coil: {optimal_coil:.0f}A", flush=True)
+            print(f"  --> Frequency error: {coil_error:.4f}MHz", flush=True)
             print(f"{'='*100}\n", flush=True)
 
         return {
@@ -288,14 +288,14 @@ class CyclotronOptimizer:
 
         if self.rank <= 0 and self.verbosity >= 1:
             print(f"Configuration:", flush=True)
-            print(f"  ├─ Optimizing: {param_type.upper()} shims ({n_params} parameters)", flush=True)
+            print(f"  --> Optimizing: {param_type.upper()} shims ({n_params} parameters)", flush=True)
             if fixed_side is not None:
-                print(f"  ├─ Side shims: FIXED", flush=True)
+                print(f"  --> Side shims: FIXED", flush=True)
             if fixed_top is not None:
-                print(f"  ├─ Top shims: FIXED", flush=True)
-            print(f"  ├─ Multi-start: {n_multistart} initializations", flush=True)
-            print(f"  ├─ Random init: {self.config.optimization.random_init}", flush=True)
-            print(f"  └─ Max iterations per start: {max_iter_per_start}\n", flush=True)
+                print(f"  --> Top shims: FIXED", flush=True)
+            print(f"  --> Multi-start: {n_multistart} initializations", flush=True)
+            print(f"  --> Random init: {self.config.optimization.random_init}", flush=True)
+            print(f"  --> Max iterations per start: {max_iter_per_start}\n", flush=True)
 
         self.comm.Barrier()
 
@@ -395,9 +395,9 @@ class CyclotronOptimizer:
 
             if self.verbosity >= 1:
                 print(f"\nPhase {phase} complete:", flush=True)
-                print(f"  ├─ Best objective: {self.best_y:.6f}", flush=True)
-                print(f"  ├─ Total evaluations: {self.iteration_count}", flush=True)
-                print(f"  └─ Best {param_type}: {self.best_x.tolist()}", flush=True)
+                print(f"  --> Best objective: {self.best_y:.6f}", flush=True)
+                print(f"  --> Total evaluations: {self.iteration_count}", flush=True)
+                print(f"  --> Best {param_type}: {self.best_x.tolist()}", flush=True)
 
         # ===== RANKS 1+: Evaluation loop =====
         else:
@@ -514,7 +514,7 @@ class CyclotronOptimizer:
                 self.best_x = x_phase_phys
                 self.plateau_counter = 0
                 if self.verbosity >= 1:
-                    print(f"    ✓ NEW BEST: {self.best_y:.6f}", flush=True)
+                    print(f"    [OK] NEW BEST: {self.best_y:.6f}", flush=True)
             else:
                 self.plateau_counter += 1
 

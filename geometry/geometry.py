@@ -12,7 +12,7 @@ from geometry.components import (
     LidUpperComponent,
     TopShimComponent,
     SideShimComponent,
-    CoilComponent
+    CoilComponent, FromSTPFileComponent
 )
 from simulation.magnetization_cache import RadiaCache
 
@@ -21,6 +21,7 @@ def build_geometry(config: CyclotronConfig,
                    pole_shape: PoleShape = None,
                    omit_symmetry: bool = False,
                    rank: int = 0,
+                   comm = None,
                    verbosity: int = 1,
                    use_cache: bool = False,
                    for_caching: bool = False) -> (int, int):
@@ -34,6 +35,7 @@ def build_geometry(config: CyclotronConfig,
     :param pole_shape: PoleShape object. If None, creates default from config.
     :param omit_symmetry: If True, skip symmetry operations (for visualization)
     :param rank: MPI rank
+    :param comm: MPI communicator
     :param verbosity: Verbosity level (0=silent, 1=normal, 2=debug)
     :param use_cache
     :param for_caching: Flag whether we are creating just the base geometry for caching and reusing later (speedup)
@@ -65,13 +67,6 @@ def build_geometry(config: CyclotronConfig,
     if rank <= 0 and verbosity >= 1:
         print("Creating material...", flush=True)
 
-    # mat_cfg = config.material
-    # ironmat = rad.MatSatIsoFrm(
-    #     mat_cfg.saturation_field_t,
-    #     mat_cfg.saturation_curve_m,
-    #     mat_cfg.linear_curve_m
-    # )
-
     # Dillinger BH curve (mu0*A/m (=T), T)
     if config.material.bh_filename is not None:
 
@@ -84,27 +79,6 @@ def build_geometry(config: CyclotronConfig,
             print("", flush=True)
 
         ironmat = rad.MatSatIsoTab(dillinger_data)
-
-    # ironmat = rad.MatSatIsoTab([[0.0, 0.0],
-    #                             [0.000302, 0.64],
-    #                             [0.000397, 0.89],
-    #                             [0.000694, 1.25],
-    #                             [0.000993, 1.39],
-    #                             [0.001497, 1.49],
-    #                             [0.00199, 1.54],
-    #                             [0.003, 1.61],
-    #                             [0.003945, 1.65],
-    #                             [0.004973, 1.69],
-    #                             [0.006966, 1.72],
-    #                             [0.009965, 1.78],
-    #                             [0.015026, 1.85],
-    #                             [0.019967, 1.91],
-    #                             [0.029791, 2.01],
-    #                             [0.049908, 2.12],
-    #                             [0.069173, 2.16],
-    #                             [0.098953, 2.19],
-    #                             [0.124749, 2.22],
-    #                             [0.251327, 2.3]])
 
     else:
         mat_cfg = config.material
@@ -122,23 +96,41 @@ def build_geometry(config: CyclotronConfig,
         print("\nBuilding components:", flush=True)
 
     # Yoke wall (annular wedge with window)
-    yoke_wall_params = {
-        'outer_radius_mm': config.yoke.outer_radius_mm,
-        'inner_radius_mm': config.yoke.inner_radius_mm,
-        'height_mm': config.yoke.height_mm,
-        'z_offset_mm': 0.0,
-        'segmentation': config.yoke.segmentation,
-        'include_window': True,
-        'window_width_mm': config.yoke.window_width_mm,
-        'component_name': 'Yoke Wall'
-    }
-    yoke_wall_comp = AnnularWedgeComponent(
-        config,
-        yoke_wall_params,
-        material_id=ironmat,
-        rank=rank,
-        verbosity=verbosity
-    )
+    if config.yoke.stp_filename is not None:
+        yoke_wall_params = {
+            'stp_filename': config.yoke.stp_filename,
+            'component_name': 'Yoke Wall'
+        }
+
+        yoke_wall_comp = FromSTPFileComponent(
+            config,
+            yoke_wall_params,
+            material_id=ironmat,
+            rank=rank,
+            comm=comm,
+            verbosity=verbosity
+        )
+
+    else:
+        if rank <= 0: print("Yoke wall not from file!", flush=True)
+        yoke_wall_params = {
+            'outer_radius_mm': config.yoke.outer_radius_mm,
+            'inner_radius_mm': config.yoke.inner_radius_mm,
+            'height_mm': config.yoke.height_mm,
+            'z_offset_mm': 0.0,
+            'segmentation': config.yoke.segmentation,
+            'include_window': True,
+            'window_width_mm': config.yoke.window_width_mm,
+            'component_name': 'Yoke Wall'
+        }
+
+        yoke_wall_comp = AnnularWedgeComponent(
+            config,
+            yoke_wall_params,
+            material_id=ironmat,
+            rank=rank,
+            verbosity=verbosity
+        )
 
     yoke_wall_comp.build()
     yoke_wall_comp.segment(config.yoke.segmentation, [1, 1, 1])
@@ -146,22 +138,41 @@ def build_geometry(config: CyclotronConfig,
     yoke_wall_comp.set_drawing_attributes(ironcolor)
 
     # Lower lid (annular wedge without window)
-    lid_lower_params = {
-        'outer_radius_mm': config.lid_lower.outer_radius_mm,
-        'inner_radius_mm': config.lid_lower.inner_radius_mm,
-        'height_mm': config.lid_lower.height_mm,
-        'z_offset_mm': -config.yoke.height_mm,
-        'segmentation': config.lid_lower.segmentation,
-        'include_window': False,
-        'component_name': 'Lower Lid'
-    }
-    lid_lower_comp = AnnularWedgeComponent(
-        config,
-        lid_lower_params,
-        material_id=ironmat,
-        rank=rank,
-        verbosity=verbosity
-    )
+    if config.lid_lower.stp_filename is not None:
+
+        lid_lower_params = {
+            'stp_filename': config.lid_lower.stp_filename,
+            'component_name': 'Lower Lid'
+        }
+
+        lid_lower_comp = FromSTPFileComponent(
+            config,
+            lid_lower_params,
+            material_id=ironmat,
+            rank=rank,
+            comm=comm,
+            verbosity=verbosity
+        )
+
+    else:
+
+        lid_lower_params = {
+            'outer_radius_mm': config.lid_lower.outer_radius_mm,
+            'inner_radius_mm': config.lid_lower.inner_radius_mm,
+            'height_mm': config.lid_lower.height_mm,
+            'z_offset_mm': -config.yoke.height_mm,
+            'segmentation': config.lid_lower.segmentation,
+            'include_window': False,
+            'component_name': 'Lower Lid'
+        }
+
+        lid_lower_comp = AnnularWedgeComponent(
+            config,
+            lid_lower_params,
+            material_id=ironmat,
+            rank=rank,
+            verbosity=verbosity
+        )
 
     lid_lower_comp.build()
     lid_lower_comp.segment(config.lid_lower.segmentation, [1, 1, 1])
@@ -169,12 +180,28 @@ def build_geometry(config: CyclotronConfig,
     lid_lower_comp.set_drawing_attributes(ironcolor)
 
     # Upper lid
-    lid_upper_comp = LidUpperComponent(
-        config,
-        material_id=ironmat,
-        rank=rank,
-        verbosity=verbosity
-    )
+    if config.lid_upper.stp_filename is not None:
+        lid_upper_params = {
+            'stp_filename': config.lid_upper.stp_filename,
+            'component_name': 'Upper Lid'
+        }
+
+        lid_upper_comp = FromSTPFileComponent(
+            config,
+            lid_upper_params,
+            material_id=ironmat,
+            rank=rank,
+            comm=comm,
+            verbosity=verbosity
+        )
+
+    else:
+        lid_upper_comp = LidUpperComponent(
+            config,
+            material_id=ironmat,
+            rank=rank,
+            verbosity=verbosity
+        )
 
     lid_upper_comp.build()
     lid_upper_comp.segment(config.lid_upper.segmentation, [1, 1, 1])
@@ -182,28 +209,41 @@ def build_geometry(config: CyclotronConfig,
     lid_upper_comp.set_drawing_attributes(ironcolor)
 
     # Pole base (annular wedge with pole-specific angular resolution)
-    yoke_h = config.yoke.height_mm
-    lid_lower_h = config.lid_lower.height_mm
-    pole_h = config.pole.height_mm
+    if config.pole.stp_filename is not None:
+        pole_params = {
+            'stp_filename': config.pole.stp_filename,
+            'component_name': 'Pole Base',
+            'elem_size': 15,
+        }
 
-    pole_params = {
-        'outer_radius_mm': config.pole.outer_radius_mm,
-        'inner_radius_mm': config.pole.inner_radius_mm,
-        'height_mm': pole_h,
-        'z_offset_mm': -(yoke_h + lid_lower_h) + pole_h,
-        'segmentation': config.pole.segmentation,
-        'include_window': False,
-        'use_pole_resolution': True,  # Uses pole.angular_resolution_deg
-        'component_name': 'Pole Base'
-    }
+        pole_comp = FromSTPFileComponent(
+            config,
+            pole_params,
+            material_id=ironmat,
+            rank=rank,
+            comm=comm,
+            verbosity=verbosity
+        )
 
-    pole_comp = AnnularWedgeComponent(
-        config,
-        pole_params,
-        material_id=ironmat,
-        rank=rank,
-        verbosity=verbosity
-    )
+    else:
+        pole_params = {
+            'outer_radius_mm': config.pole.outer_radius_mm,
+            'inner_radius_mm': config.pole.inner_radius_mm,
+            'height_mm': config.pole.height_mm,
+            'z_offset_mm': -(config.yoke.height_mm + config.lid_lower.height_mm) + config.pole.height_mm,
+            'segmentation': config.pole.segmentation,
+            'include_window': False,
+            'use_pole_resolution': True,  # Uses pole.angular_resolution_deg
+            'component_name': 'Pole Base'
+        }
+
+        pole_comp = AnnularWedgeComponent(
+            config,
+            pole_params,
+            material_id=ironmat,
+            rank=rank,
+            verbosity=verbosity
+        )
 
     pole_comp.build()
     pole_comp.segment(config.pole.segmentation, [1, 1, 0.1])
@@ -302,9 +342,6 @@ def build_geometry(config: CyclotronConfig,
         pole = None
 
     # ========== BUILD COILS ==========
-    if rank <= 0 and verbosity >= 1:
-        print("Building coils...", flush=True)
-
     coil_comp = CoilComponent(config, rank=rank, verbosity=verbosity)
     coil_comp.build()
 
