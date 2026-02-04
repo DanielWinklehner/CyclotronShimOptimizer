@@ -85,7 +85,6 @@ class InventorPoleExporter:
         """
         lines = []
         for i, val in enumerate(values):
-            val *= 0.1  # Radia uses mm, VB Macro expects cm
             lines.append(f"    {array_name}({i}) = {val:.6f}")
         return "\n".join(lines)
 
@@ -102,8 +101,7 @@ class InventorPoleExporter:
 
         # Generate VBA array assignment code
         side_assignments = self._generate_array_assignments("sideShims", side_offsets_deg)
-        top_assignments = self._generate_array_assignments("topShims", top_offsets_mm)
-
+        top_assignments = self._generate_array_assignments("topShims", top_offsets_mm * 0.1) # Radia uses mm, VB Macro expects cm
         macro = f'''
     ' ============================================================================
     ' Cyclotron Pole Geometry - Auto-generated Inventor Macro
