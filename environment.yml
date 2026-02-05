@@ -16,3 +16,5 @@ dependencies:
   - setuptools
   - sympy
   - tqdm
+  - gmsh
+  - python-gmsh

@@ -12,7 +12,7 @@ from geometry.components import (
     LidUpperComponent,
     TopShimComponent,
     SideShimComponent,
-    CoilComponent, FromSTPFileComponent
+    CoilComponent, FromSTPFileComponent, GmshPoleComponent
 )
 from simulation.magnetization_cache import RadiaCache
 
@@ -112,7 +112,6 @@ def build_geometry(config: CyclotronConfig,
         )
 
     else:
-        if rank <= 0: print("Yoke wall not from file!", flush=True)
         yoke_wall_params = {
             'outer_radius_mm': config.yoke.outer_radius_mm,
             'inner_radius_mm': config.yoke.inner_radius_mm,
@@ -226,31 +225,39 @@ def build_geometry(config: CyclotronConfig,
         )
 
     else:
-        pole_params = {
-            'outer_radius_mm': config.pole.outer_radius_mm,
-            'inner_radius_mm': config.pole.inner_radius_mm,
-            'height_mm': config.pole.height_mm,
-            'z_offset_mm': -(config.yoke.height_mm + config.lid_lower.height_mm) + config.pole.height_mm,
-            'segmentation': config.pole.segmentation,
-            'include_window': False,
-            'use_pole_resolution': True,  # Uses pole.angular_resolution_deg
-            'component_name': 'Pole Base'
-        }
+        if config.geometry.use_gmsh_occ:
+            pole_comp = GmshPoleComponent(config,
+                                          pole_shape,
+                                          material_id=ironmat,
+                                          rank=rank,
+                                          comm=comm,
+                                          verbosity=verbosity)
+        else:
+            pole_params = {
+                'outer_radius_mm': config.pole.outer_radius_mm,
+                'inner_radius_mm': config.pole.inner_radius_mm,
+                'height_mm': config.pole.height_mm,
+                'z_offset_mm': -(config.yoke.height_mm + config.lid_lower.height_mm) + config.pole.height_mm,
+                'segmentation': config.pole.segmentation,
+                'include_window': False,
+                'use_pole_resolution': True,  # Uses pole.angular_resolution_deg
+                'component_name': 'Pole Base'
+            }
 
-        pole_comp = AnnularWedgeComponent(
-            config,
-            pole_params,
-            material_id=ironmat,
-            rank=rank,
-            verbosity=verbosity
-        )
+            pole_comp = AnnularWedgeComponent(
+                config,
+                pole_params,
+                material_id=ironmat,
+                rank=rank,
+                verbosity=verbosity
+            )
 
     pole_comp.build()
     pole_comp.segment(config.pole.segmentation, [1, 1, 0.1])
     pole_comp.apply_material()
     pole_comp.set_drawing_attributes(ironcolor)
 
-    if include_top:
+    if include_top and not config.geometry.use_gmsh_occ:  # Note: in Gmsh building, the shims are included
         # Top shim
         top_shim_comp = TopShimComponent(
             config,
@@ -263,7 +270,7 @@ def build_geometry(config: CyclotronConfig,
         top_shim_comp.apply_material()
         top_shim_comp.set_drawing_attributes(ironcolor)
 
-    if include_side:
+    if include_side and not config.geometry.use_gmsh_occ:
         # Side shim
         side_shim_comp = SideShimComponent(
             config,
@@ -285,10 +292,10 @@ def build_geometry(config: CyclotronConfig,
             pole_comp.radia_id,
         ]
 
-        if include_top:
+        if include_top and not config.geometry.use_gmsh_occ:
             yoke_components.append(top_shim_comp.radia_id)
 
-        if include_side:
+        if include_side and not config.geometry.use_gmsh_occ:
             yoke_components.append(side_shim_comp.radia_id)
 
         pole_components = None
@@ -316,10 +323,10 @@ def build_geometry(config: CyclotronConfig,
                 pole_comp.radia_id
             ]
 
-            if include_top:
+            if include_top and not config.geometry.use_gmsh_occ:
                 pole_components.append(top_shim_comp.radia_id)
 
-            if include_side:
+            if include_side and not config.geometry.use_gmsh_occ:
                 pole_components.append(side_shim_comp.radia_id)
 
             # --- Now we apply the cached magnetizations (saved after the solve step later)

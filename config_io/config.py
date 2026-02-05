@@ -17,7 +17,8 @@ if RADIA_PATH not in sys.path:
 class GeometryConfig:
     yoke_build_angle_deg: float
     angular_resolution: int
-
+    use_gmsh_occ: Optional[bool] = False
+    save_stp_files: Optional[bool] = False
 
 @dataclass
 class FieldEvaluationConfig:
@@ -206,6 +207,8 @@ class CyclotronConfig:
             'geometry': {
                 'yoke_build_angle_deg': self.geometry.yoke_build_angle_deg,
                 'angular_resolution': self.geometry.angular_resolution,
+                'use_gmsh_occ': self.geometry.use_gmsh_occ,
+                'save_stp_files': self.geometry.save_stp_files,
             },
             'field_evaluation': {
                 'num_points_circle': self.field_evaluation.num_points_circle,

@@ -1,6 +1,7 @@
 """Geometry components for modular cyclotron construction."""
 
 from abc import ABC, abstractmethod
+
 import numpy as np
 from sympy import Point3D, Line3D, Plane, N
 from sympy.combinatorics import tetrahedron
@@ -66,6 +67,324 @@ class GeometricComponent(ABC):
         """Log message if rank == 0 and verbosity sufficient."""
         if self.rank <= 0 and self.verbosity >= verbosity_level:
             print(f"  {msg}", flush=True)
+
+
+class GmshPoleComponent(GeometricComponent):
+    """Create the pole, optionally including the shims using open cascade, mesh and use tetrahedrons as Radia volumes"""
+
+    def __init__(self,
+                 config: CyclotronConfig,
+                 pole_shape: PoleShape,
+                 material_id: Optional[int] = None,
+                 rank: int = 0,
+                 comm=None,
+                 verbosity: int = 0):
+
+        """
+        :param config: CyclotronConfig object
+        :param pole_shape: PoleShape object containing shim information
+        :param material_id: Radia material ID
+        :param rank: MPI rank
+        :param comm: MPI Communicator
+        :param verbosity: Verbosity level
+        """
+        super().__init__(config, material_id, rank, comm, verbosity)
+        self.pole_shape = pole_shape
+
+
+    def build(self) -> int:
+
+        self._log(f"Building Pole as OCC object...")
+
+        top_cfg = self.config.top_shim
+        side_cfg = self.config.side_shim
+        pole_cfg = self.config.pole
+        # geom_cfg = self.config.geometry
+        yoke_h = self.config.yoke.height_mm
+        lid_lower_h = self.config.lid_lower.height_mm
+
+        pole_or = pole_cfg.outer_radius_mm
+        pole_ir = pole_cfg.inner_radius_mm
+        pole_h = pole_cfg.height_mm
+        pole_full_angle = pole_cfg.full_angle_deg
+        pole_half_angle = pole_full_angle / 2.0
+
+        pole_zs = -(yoke_h + lid_lower_h)
+
+        n_segs = self.pole_shape.num_segments
+        include_side_shims = side_cfg.include
+        include_top_shims = top_cfg.include
+
+        if include_top_shims:
+            top_shims = self.pole_shape.get_top_offsets_mm()
+        else:
+            top_shims = np.zeros(n_segs + 1)
+
+        if include_side_shims:
+            side_shims = self.pole_shape.get_side_offsets_deg()
+        else:
+            side_shims = np.zeros(n_segs + 1)
+
+        # TODO: If neither top nor side shims are desired, create a simple volume instead of N annular wedges?
+
+        if self.rank <= 0:
+
+            # Initialize gmsh
+            gmsh.initialize()
+            gmsh.option.setNumber("General.Verbosity", 3)
+            gmsh.model.add("Pole_w_Shims")
+
+            volumes = []
+            # Create each segment
+            for i in range(n_segs):
+                # Calculate radii for this segment
+                r_inner = pole_ir + (pole_or - pole_ir) * i / n_segs
+                r_outer = pole_ir + (pole_or - pole_ir) * (i + 1) / n_segs
+
+                # Angular positions (absolute angles)
+                ang_inner_deg = pole_half_angle + side_shims[i]
+                ang_outer_deg = pole_half_angle + side_shims[i + 1]
+
+                # Convert to radians
+                ang_inner_rad = np.deg2rad(ang_inner_deg)
+                ang_outer_rad = np.deg2rad(ang_outer_deg)
+
+                if self.verbosity >=2:
+                    print(f"Segment {i:2d}: r=[{r_inner:5.2f}, {r_outer:5.2f}] mm, "
+                          f"Theta=[{ang_inner_deg:6.3f}, {ang_outer_deg:6.3f}] deg, "
+                          f"top=[{top_shims[i]:.3f}, {top_shims[i + 1]:.3f}]")
+
+                try:
+                    volume = self._create_annular_wedge(
+                        r_inner, r_outer, ang_inner_rad, ang_outer_rad,
+                        pole_zs, pole_h, top_shims[i], top_shims[i + 1]
+                    )
+
+                    if volume is not None:
+                        volumes.append(volume)
+                        if self.verbosity >= 2:
+                            print(f"  [OK] Created volume {volume}")
+                    else:
+                        print(f"  [X] Failed to create volume")
+
+                except Exception as e:
+                    print(f"  [X] Error: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+                # Synchronize after each segment to ensure geometry is valid
+                gmsh.model.occ.synchronize()
+
+            if self.verbosity >= 2:
+                print()
+                print(f"Created {len(volumes)} segments in Gmsh/OCC Pole")
+
+            # Combine all volumes
+            if len(volumes) > 1:
+                if self.verbosity >= 2:
+                    print("\nCombining segments...")
+                try:
+                    base = (3, volumes[0])
+                    tools = [(3, v) for v in volumes[1:]]
+                    result = gmsh.model.occ.fuse([base], tools, removeTool=True)
+                    gmsh.model.occ.synchronize()
+
+                    if result[0]:
+                        final_volume = result[0][0][1]
+                        volumes = [final_volume]
+                        if self.verbosity >= 2:
+                            print(f"[OK] Combined into single volume {final_volume}")
+                    else:
+                        print("[X] Fusion failed, keeping separate volumes")
+                except Exception as e:
+                    print(f"[X] Fusion error: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            # Add physical group
+            if volumes:
+                gmsh.model.addPhysicalGroup(3, volumes, tag=1)
+                gmsh.model.setPhysicalName(3, 1, "CyclotronPole")
+
+                if self.config.geometry.save_stp_files:
+                    gmsh.write("output/pole_from_gmsh.step")
+
+            if self.verbosity >= 2:
+                print()
+                print("=" * 70)
+                print(f"[OK] Geometry created: {len(volumes)} volume(s)")
+                print("=" * 70)
+
+            # Generate mesh
+            if self.verbosity >= 2:
+                print("\nGenerating mesh...")
+            gmsh.option.setNumber("Mesh.CharacteristicLengthMin", 10.0)  # TODO: Make these user parameters
+            gmsh.option.setNumber("Mesh.CharacteristicLengthMax", 30.0)
+
+            try:
+                gmsh.model.mesh.generate(3)
+                if self.verbosity >= 2:
+                    print("[OK] Mesh generation complete")
+            except Exception as e:
+                print(f"[X] Mesh generation failed: {e}")
+
+            # Get the mesh data
+            node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
+            element_types, element_tags, element_node_tags = gmsh.model.mesh.getElements()
+
+            # Finalize Gmsh
+            gmsh.finalize()
+
+            # Build a dictionary mapping node tags to coordinates
+            nodes_dict = {}
+            for i, tag in enumerate(node_tags):
+                nodes_dict[tag] = [node_coords[3 * i], node_coords[3 * i + 1], node_coords[3 * i + 2]]
+
+            tetrahedrons = []
+            # Find tetrahedra elements (gmsh type 4)
+            for elem_type_idx, elem_type in enumerate(element_types):
+                if elem_type == 4:  # 4 is the gmsh element code for tetrahedra
+                    node_list = element_node_tags[elem_type_idx]
+                    # Process each tetrahedron (4 nodes per element)
+                    for i in range(0, len(node_list), 4):
+                        tet_node_tags = node_list[i:i + 4]
+                        # Get coordinates for these nodes
+                        tet_coords = [nodes_dict[tag] for tag in tet_node_tags]
+                        tetrahedrons.append(tet_coords)
+        else:
+            tetrahedrons = None
+
+        tetrahedrons = self.comm.bcast(tetrahedrons, root=0)
+
+        radia_tets = []
+        for tet in tetrahedrons:
+            radia_tets.append(rad.ObjPolyhdr(tet, [[1, 2, 3], [1, 4, 2], [2, 4, 3], [3, 4, 1]]))
+
+        self.radia_id = rad.ObjCnt(radia_tets)
+
+        self._log(f"Pole built (ID={self.radia_id})")
+
+        return self.radia_id
+
+
+    @staticmethod
+    def _create_annular_wedge(r_inner, r_outer, ang_inner, ang_outer, pole_zs, base_height, top_inner, top_outer):
+        """
+        Create annular wedge by explicitly defining all 8 corners, edges, faces, and volume
+
+        :param r_inner: Inner radius (mm)
+        :param r_outer: Outer radius (mm)
+        :param ang_inner: Angular extents (radians)
+        :param ang_outer: Angular extents (radians)
+        :param base_height: Base pole height (mm)
+        :param top_inner: Shim height at inner radius (mm)
+        :param top_outer: Shim height at outer radius (mm)
+        :return: Gmsh volume tag
+        """
+
+        # Calculate absolute heights
+        h_inner = pole_zs + base_height + top_inner
+        h_outer = pole_zs + base_height + top_outer
+
+        # ===== DEFINE 8 CORNER POINTS =====
+        # Bottom face (z = 0)
+        p1 = gmsh.model.occ.addPoint(r_inner,
+                                     0.0,
+                                     pole_zs)
+        p2 = gmsh.model.occ.addPoint(r_outer,
+                                     0.0,
+                                     pole_zs)
+        p3 = gmsh.model.occ.addPoint(r_outer * np.cos(ang_outer),
+                                     r_outer * np.sin(ang_outer),
+                                     pole_zs)
+        p4 = gmsh.model.occ.addPoint(r_inner * np.cos(ang_inner),
+                                     r_inner * np.sin(ang_inner),
+                                     pole_zs)
+
+        # Top face (z = h_inner or h_outer)
+        p5 = gmsh.model.occ.addPoint(r_inner,
+                                     0.0,
+                                     h_inner)
+        p6 = gmsh.model.occ.addPoint(r_outer,
+                                     0.0,
+                                     h_outer)
+        p7 = gmsh.model.occ.addPoint(r_outer * np.cos(ang_outer),
+                                     r_outer * np.sin(ang_outer),
+                                     h_outer)
+        p8 = gmsh.model.occ.addPoint(r_inner * np.cos(ang_inner),
+                                     r_inner * np.sin(ang_inner),
+                                     h_inner)
+
+        # Center points for arcs
+        center_bottom = gmsh.model.occ.addPoint(0.0, 0.0, pole_zs)
+        center_top_inner = gmsh.model.occ.addPoint(0.0, 0.0, h_inner)
+        center_top_outer = gmsh.model.occ.addPoint(0.0, 0.0, h_outer)
+
+        # ===== DEFINE 12 EDGES =====
+        # Bottom face edges (4 edges)
+        e1 = gmsh.model.occ.addLine(p1, p2)  # Radial at 0°
+        e2 = gmsh.model.occ.addCircleArc(p2, center_bottom, p3)  # Outer arc
+        e3 = gmsh.model.occ.addLine(p3, p4)  # Radial at end
+        e4 = gmsh.model.occ.addCircleArc(p4, center_bottom, p1)  # Inner arc
+
+        # Top face edges (4 edges)
+        e5 = gmsh.model.occ.addLine(p5, p6)  # Radial at 0°
+        e6 = gmsh.model.occ.addCircleArc(p6, center_top_outer, p7)  # Outer arc
+        e7 = gmsh.model.occ.addLine(p7, p8)  # Radial at end
+        e8 = gmsh.model.occ.addCircleArc(p8, center_top_inner, p5)  # Inner arc
+
+        # Vertical edges connecting bottom to top (4 edges)
+        e9 = gmsh.model.occ.addLine(p1, p5)  # Inner at 0°
+        e10 = gmsh.model.occ.addLine(p2, p6)  # Outer at 0°
+        e11 = gmsh.model.occ.addLine(p3, p7)  # Outer at end
+        e12 = gmsh.model.occ.addLine(p4, p8)  # Inner at end
+
+        # ===== DEFINE 6 FACES =====
+
+        # Face 1: Bottom (planar)
+        loop_bottom = gmsh.model.occ.addCurveLoop([e1, e2, e3, e4])
+        face_bottom = gmsh.model.occ.addPlaneSurface([loop_bottom])
+
+        # Face 2: Top (ruled surface - conical/tapered)
+        loop_top = gmsh.model.occ.addCurveLoop([e5, e6, e7, e8])
+        # Use surface filling for the tapered top
+        face_top = gmsh.model.occ.addSurfaceFilling(loop_top)
+
+        # Face 3: Radial side at 0° (planar - but may be non-planar if heights differ)
+        loop_side1 = gmsh.model.occ.addCurveLoop([e1, e10, -e5, -e9])
+        if abs(h_inner - h_outer) < 0.001:
+            face_side1 = gmsh.model.occ.addPlaneSurface([loop_side1])
+        else:
+            face_side1 = gmsh.model.occ.addSurfaceFilling(loop_side1)
+
+        # Face 4: Outer curved side (ruled surface)
+        loop_side2 = gmsh.model.occ.addCurveLoop([e2, e11, -e6, -e10])
+        face_side2 = gmsh.model.occ.addSurfaceFilling(loop_side2)
+
+        # Face 5: Radial side at end angle (planar - but may be non-planar)
+        loop_side3 = gmsh.model.occ.addCurveLoop([e3, e12, -e7, -e11])
+        if abs(h_inner - h_outer) < 0.001:
+            face_side3 = gmsh.model.occ.addPlaneSurface([loop_side3])
+        else:
+            face_side3 = gmsh.model.occ.addSurfaceFilling(loop_side3)
+
+        # Face 6: Inner curved side (ruled surface)
+        loop_side4 = gmsh.model.occ.addCurveLoop([e4, e9, -e8, -e12])
+        face_side4 = gmsh.model.occ.addSurfaceFilling(loop_side4)
+
+        # ===== CREATE SURFACE LOOP AND VOLUME =====
+        surface_loop = gmsh.model.occ.addSurfaceLoop([
+            face_bottom,
+            face_top,
+            face_side1,
+            face_side2,
+            face_side3,
+            face_side4
+        ])
+
+        volume = gmsh.model.occ.addVolume([surface_loop])
+
+        return volume
 
 
 class FromSTPFileComponent(GeometricComponent):
@@ -187,7 +506,6 @@ class AnnularWedgeComponent(GeometricComponent):
 
     def build(self) -> int:
         """Build annular wedge."""
-        if self.rank <= 0: print("Yoke wall building in AnnularWedgeComponent!", flush=True)
         name = self.params.get('component_name', 'AnnularWedge')
         self._log(f"Building {name}...")
 
@@ -338,7 +656,7 @@ class LidUpperComponent(GeometricComponent):
         lid_h = cfg.height_mm
         yoke_angle_deg = geom_cfg.yoke_build_angle_deg
         ang_res = geom_cfg.angular_resolution
-        seg_div = cfg.segmentation
+        # seg_div = cfg.segmentation
 
         cut_rf_hole = cfg.cut_out_rf_stem_hole
         hole_diam = cfg.hole_diameter_mm
