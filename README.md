@@ -255,7 +255,7 @@ cyclotron_id, pole_id = build_geometry(
 
 # Evaluate B-field
 radii_mm = np.linspace(50, 400, 50)
-radii_out, bz_values, converged = evaluate_radii_parallel(
+radii_out, bz_values, converged, cyclotron_id = evaluate_radii_parallel(
     config,
     pole_shape,
     radii_mm.tolist(),

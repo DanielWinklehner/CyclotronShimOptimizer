@@ -18,6 +18,7 @@ field_evaluation:
   radius_max_mm: 350.0
   n_eval_pts: 12
   use_symmetry: true  # Exploit 8-fold symmetry
+  save_median_plane_field:  true
 
 # Geometry Parameters
 yoke:

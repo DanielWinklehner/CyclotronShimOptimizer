@@ -1,5 +1,5 @@
 """Field calculation using Radia with MPI support."""
-
+import datetime
 import os
 import sys
 
@@ -72,6 +72,194 @@ def query_b_field_all_radii_at_once(cyclotron_id: int,
     bz_avg = np.mean(bz_grid, axis=1)
 
     return bz_avg
+
+
+import numpy as np
+import radia as rad
+import datetime
+from config_io.config import CyclotronConfig
+
+
+def save_median_plane_field(config: CyclotronConfig,
+                            cyclotron_id: int = None,
+                            output_path: str = "output/midplane_field.txt",
+                            rank=0,
+                            comm=None):
+    """
+    Save Bz field on median plane (z=0) exploiting 8-fold symmetry.
+
+    Only calculates in octant: 0 ≤ y ≤ x, x ≥ 0
+    Mirrors across x-axis, y-axis, and x=y plane to fill full domain.
+    """
+
+    # TODO: If cyclotron_id is None: delete all radia objects and rebuild/solve the cyclotron
+
+    # TODO: Get limits and spacing (and filename?) from config
+
+    # Domain limits and spacing
+    xmin = ymin = -400  # mm
+    xmax = ymax = 400  # mm
+    dxy = 0.5  # mm
+
+    if rank <= 0:
+        print("Calculating Midplane field (with 8-fold symmetry)...", flush=True)
+
+    # ===== GENERATE OCTANT POINTS (0 ≤ y ≤ x, x ≥ 0) =====
+    x_octant = np.arange(0, xmax + dxy / 2, dxy)
+
+    points_octant = []
+    for xi in x_octant:
+        for yi in np.arange(0, xi + dxy / 2, dxy):
+            points_octant.append([xi, yi])
+
+    points_octant = np.array(points_octant)
+    points_octant_3d = np.column_stack((points_octant, np.zeros(len(points_octant))))
+
+    if rank <= 0:
+        print(f"  Calculating {len(points_octant)} points in octant...", flush=True)
+
+    # Query Radia for octant only
+    bz_octant = np.array(rad.Fld(cyclotron_id, 'bz', points_octant_3d.tolist()))
+
+    if rank <= 0:
+        print(f"  Received {len(bz_octant)} field values", flush=True)
+
+        # ===== APPLY SYMMETRIES =====
+        print("  Applying 8-fold symmetry...", flush=True)
+
+        points_full = []
+        bz_full = []
+
+        for i, (xy, bz) in enumerate(zip(points_octant, bz_octant)):
+            x, y = xy
+
+            # 8 symmetric copies via mirror operations
+            symmetric_points = [
+                (x, y),  # Octant 1: original
+                (y, x),  # Octant 2: mirror across x=y
+                (x, -y),  # Octant 3: mirror across x-axis
+                (y, -x),  # Octant 4: mirror across x=y then x-axis
+                (-x, y),  # Octant 5: mirror across y-axis
+                (-y, x),  # Octant 6: mirror across y-axis then x=y
+                (-x, -y),  # Octant 7: mirror across both axes
+                (-y, -x),  # Octant 8: mirror across both axes then x=y
+            ]
+
+            for (xi, yi) in symmetric_points:
+                points_full.append([xi, yi])
+                bz_full.append(bz)
+
+        points_full = np.array(points_full)
+        bz_full = np.array(bz_full)
+
+        # Remove duplicates (points on axes counted multiple times)
+        points_full_tuple = [tuple(p) for p in points_full]
+        unique_points, unique_indices = np.unique(np.array(points_full_tuple), axis=0, return_index=True)
+
+        points_full = np.array(unique_points)
+        bz_full = bz_full[unique_indices]
+
+        # Sort by y, then by x
+        points_full = points_full[np.lexsort((points_full[:, 0], points_full[:, 1]))]
+        # Reorder bz_full to match sorted points
+        sort_idx = np.lexsort((points_full[:, 0], points_full[:, 1]))
+        bz_full = bz_full[sort_idx]
+
+        print(f"  Total unique points after symmetry: {len(points_full)}", flush=True)
+        print("Done!", flush=True)
+
+        header_text = f"""% Model:              uCyclo_v2
+% Version:            Cyclotron Optimizer v0.1
+% Date:               {datetime.date.today()}
+% Dimension:          2
+% Nodes:              {len(bz_full)}
+% Expressions:        1
+% Description:        Magnetic flux density, z-component
+% Length unit:        m
+% x                   y                    Bz (T)
+"""
+
+        points_m = points_full * 1e-3  # mm to m for OPAL
+        data = np.column_stack((points_m, bz_full))
+
+        print("Writing Midplane field...", flush=True)
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "w") as _of:
+            _of.write(header_text)
+            for _d in data:
+                _of.write(f"{_d[0]}            {_d[1]}            {_d[2]}\n")
+        print("Done!", flush=True)
+
+    return 0
+
+
+# def save_median_plane_field(config: CyclotronConfig,
+#                             cyclotron_id=None,
+#                             rank=0,
+#                             comm=None):
+#
+#     # TODO: If cyclotron_id is None: delete all radia objects and rebuild/solve the cyclotron
+#
+#     # TODO: Get limits and spacing (and filename?) from config
+#
+#     # TODO: Exploit symmetry!
+#
+#     # Create a list of points to evaluate in Radia
+#     # Create x and y coordinate arrays
+#     xmin = ymin = -400  # -400
+#     xmax = ymax = 400  # 400
+#     dxy = 0.5
+#
+#     x = np.arange(xmin, xmax + dxy / 2, dxy)  # +dxy/2 for floating point safety
+#     y = np.arange(ymin, ymax + dxy / 2, dxy)
+#
+#     # Create mesh grid
+#     xx, yy = np.meshgrid(x, y)
+#
+#     # Stack into (N, 2) array
+#     points = np.column_stack([xx.ravel(), yy.ravel()])
+#
+#     # Sort by y, then by x
+#     points = points[np.lexsort((points[:, 0], points[:, 1]))]
+#     points = np.column_stack((points, np.zeros(len(points))))
+#
+#     if rank <= 0:
+#         print("Calculating Midplane field...", flush=True)
+#
+#     # Note: For some reason, Radia only returns results on rank 0.
+#     # So we have to either bcast the results to other ranks or restrict
+#     # the rest of the function to rank 0.
+#     bz = np.array(rad.Fld(cyclotron_id, 'bz', points.tolist()))
+#
+#     if rank <= 0:
+#         print("Done!", flush=True)
+#         # print(points.tolist(), flush=True)
+#         # print(bz, flush=True)
+#         # print(len(bz), flush=True)
+#
+#         header_text = f"""% Model:              uCyclo_v2
+# % Version:            Cyclotron Optimizer v0.1
+# % Date:               {datetime.date.today()}
+# % Dimension:          2
+# % Nodes:              {len(bz)}
+# % Expressions:        1
+# % Description:        Magnetic flux density, z-component
+# % Length unit:        m
+# % x                   y                    Bz (T)
+# """
+#
+#         points *= 1e-3  # mm to m for OPAL
+#         data = np.column_stack((points, bz))
+#
+#         print("Writing Midplane field...", flush=True)
+#         with open(r"output/midplane_field.dat", "w") as _of:
+#             _of.write(header_text)
+#             for _d in data:
+#                 _of.write(f"{_d[0]}            {_d[1]}            {_d[2]}\n")
+#         print("Done!", flush=True)
+#
+#     return 0
 
 
 def evaluate_radii_parallel(config: CyclotronConfig,
@@ -154,4 +342,4 @@ def evaluate_radii_parallel(config: CyclotronConfig,
                                                 use_symmetry=config.field_evaluation.use_symmetry,
                                                 rank=rank)
 
-    return radii_mm, bz_values, converged
+    return radii_mm, bz_values, converged, cyclotron

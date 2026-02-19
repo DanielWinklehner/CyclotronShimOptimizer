@@ -3,6 +3,7 @@
 from abc import ABC, abstractmethod
 
 import numpy as np
+import os
 from sympy import Point3D, Line3D, Plane, N
 from sympy.combinatorics import tetrahedron
 from sympy.geometry import intersection
@@ -92,8 +93,8 @@ class GmshPoleComponent(GeometricComponent):
         self.pole_shape = pole_shape
 
 
-    def build(self) -> int:
-
+    def build(self, output_path: str = "output/pole_from_gmsh.step") -> int:
+        #TODO: Better grab output path from config
         self._log(f"Building Pole as OCC object...")
 
         top_cfg = self.config.top_shim
@@ -207,7 +208,8 @@ class GmshPoleComponent(GeometricComponent):
                 gmsh.model.setPhysicalName(3, 1, "CyclotronPole")
 
                 if self.config.geometry.save_stp_files:
-                    gmsh.write("output/pole_from_gmsh.step")
+                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                    gmsh.write(output_path)
 
             if self.verbosity >= 2:
                 print()

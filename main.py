@@ -25,7 +25,7 @@ from geometry.geometry import build_geometry
 from geometry.pole_shape import PoleShape
 from geometry.inventor_export import InventorPoleExporter
 
-from simulation.field_calculator import evaluate_radii_parallel
+from simulation.field_calculator import evaluate_radii_parallel, save_median_plane_field
 from core.frequency import revolution_time_from_radius_and_velocity, isochronism_deviation
 from visualization.plots import plot_isochronism_results, plot_isochronism_metric
 from core.species import IonSpecies
@@ -254,10 +254,13 @@ def main(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = 
             # pole_offsets_array = pole_shape.get_side_offsets_deg()
 
         config.coil.current_A = coil_current
-        radii_out, bz_values, converged = evaluate_radii_parallel(
+        radii_out, bz_values, converged, cyclo_id = evaluate_radii_parallel(
             config, pole_shape, radii_mm,
             rank=rank, comm=comm
         )
+
+        if config.field_evaluation.save_median_plane_field:
+            save_median_plane_field(config, cyclo_id, rank=rank, comm=comm)
 
         if rank <= 0 and verbosity >= 1:
             if len(bz_values) > 0:

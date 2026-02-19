@@ -27,6 +27,7 @@ class FieldEvaluationConfig:
     radius_max_mm: float
     n_eval_pts: int
     use_symmetry: bool = True
+    save_median_plane_field: Optional[bool] = False
 
 
 @dataclass
@@ -216,6 +217,7 @@ class CyclotronConfig:
                 'radius_max_mm': self.field_evaluation.radius_max_mm,
                 'n_eval_pts': self.field_evaluation.n_eval_pts,
                 'use_symmetry':  self.field_evaluation.use_symmetry,
+                'save_median_plane_field': self.field_evaluation.save_median_plane_field,
             },
             'yoke': {
                 'outer_radius_mm': self.yoke.outer_radius_mm,

@@ -58,7 +58,7 @@ def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
             print(f"[RANK {rank}] Before barrier 1...", flush=True)
         comm.Barrier()
 
-        radii_out, bz_values, converged = evaluate_radii_parallel(
+        radii_out, bz_values, converged, _ = evaluate_radii_parallel(
             config,
             pole_shape,
             radii_mm,
@@ -191,7 +191,7 @@ def optimize_coil_final(best_surface_params: np.ndarray,
                 print(f"[RANK {rank}] Before barrier...", flush=True)
             comm.Barrier()
 
-            radii_out, bz_values, converged = evaluate_radii_parallel(
+            radii_out, bz_values, converged, _ = evaluate_radii_parallel(
                 config,
                 pole_shape,
                 radii_mm,
