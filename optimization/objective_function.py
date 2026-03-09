@@ -226,7 +226,7 @@ def optimize_coil_final(best_surface_params: np.ndarray,
                 n_evals[0] += 1
 
                 if verbosity >= 1:
-                    print(f"    [Coil-eval {n_evals[0]}] I={coil_current:.0f}A → avg_f={avg_f:.4f}MHz, "
+                    print(f"    [Coil-eval {n_evals[0]}] I={coil_current:.0f}A -> avg_f={avg_f:.4f}MHz, "
                           f"err={np.sqrt(error):.4f}MHz", flush=True)
             else:
                 error = None

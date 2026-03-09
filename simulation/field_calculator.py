@@ -95,22 +95,29 @@ def save_median_plane_field(config: CyclotronConfig,
     # TODO: If cyclotron_id is None: delete all radia objects and rebuild/solve the cyclotron
 
     # TODO: Get limits and spacing (and filename?) from config
-
+    symmetries = config.field_evaluation.use_symmetry
     # Domain limits and spacing
     xmin = ymin = -400  # mm
     xmax = ymax = 400  # mm
     dxy = 0.5  # mm
 
-    if rank <= 0:
-        print("Calculating Midplane field (with 8-fold symmetry)...", flush=True)
-
-    # ===== GENERATE OCTANT POINTS (0 ≤ y ≤ x, x ≥ 0) =====
-    x_octant = np.arange(0, xmax + dxy / 2, dxy)
-
     points_octant = []
-    for xi in x_octant:
-        for yi in np.arange(0, xi + dxy / 2, dxy):
-            points_octant.append([xi, yi])
+    if symmetries:
+        if rank <= 0:
+            print("Calculating Midplane field (with 8-fold symmetry)...", flush=True)
+        # ===== GENERATE OCTANT POINTS (0 ≤ y ≤ x, x ≥ 0) =====
+        x_octant = np.arange(0, xmax + dxy / 2, dxy)
+        for xi in x_octant:
+            for yi in np.arange(0, xi + dxy / 2, dxy):
+                points_octant.append([xi, yi])
+    else:
+        if rank <= 0:
+            print("Calculating Midplane field (without symmetry)...", flush=True)
+        # ===== GENERATE ALL POINTS  =====
+        x_octant = np.arange(xmin, xmax + dxy / 2, dxy)
+        for xi in x_octant:
+            for yi in np.arange(ymin, ymax + dxy / 2, dxy):
+                points_octant.append([xi, yi])
 
     points_octant = np.array(points_octant)
     points_octant_3d = np.column_stack((points_octant, np.zeros(len(points_octant))))
@@ -125,25 +132,31 @@ def save_median_plane_field(config: CyclotronConfig,
         print(f"  Received {len(bz_octant)} field values", flush=True)
 
         # ===== APPLY SYMMETRIES =====
-        print("  Applying 8-fold symmetry...", flush=True)
+        if symmetries:
+            print("  Applying 8-fold symmetry...", flush=True)
 
         points_full = []
         bz_full = []
 
         for i, (xy, bz) in enumerate(zip(points_octant, bz_octant)):
             x, y = xy
-
-            # 8 symmetric copies via mirror operations
-            symmetric_points = [
-                (x, y),  # Octant 1: original
-                (y, x),  # Octant 2: mirror across x=y
-                (x, -y),  # Octant 3: mirror across x-axis
-                (y, -x),  # Octant 4: mirror across x=y then x-axis
-                (-x, y),  # Octant 5: mirror across y-axis
-                (-y, x),  # Octant 6: mirror across y-axis then x=y
-                (-x, -y),  # Octant 7: mirror across both axes
-                (-y, -x),  # Octant 8: mirror across both axes then x=y
-            ]
+            if symmetries:
+                # 8 symmetric copies via mirror operations
+                symmetric_points = [
+                    (x, y),  # Octant 1: original
+                    (y, x),  # Octant 2: mirror across x=y
+                    (x, -y),  # Octant 3: mirror across x-axis
+                    (y, -x),  # Octant 4: mirror across x=y then x-axis
+                    (-x, y),  # Octant 5: mirror across y-axis
+                    (-y, x),  # Octant 6: mirror across y-axis then x=y
+                    (-x, -y),  # Octant 7: mirror across both axes
+                    (-y, -x),  # Octant 8: mirror across both axes then x=y
+                ]
+            else:
+                # all already included
+                symmetric_points = [
+                    (x, y),  
+                ]
 
             for (xi, yi) in symmetric_points:
                 points_full.append([xi, yi])

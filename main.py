@@ -260,7 +260,7 @@ def main(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = 
         )
 
         if config.field_evaluation.save_median_plane_field:
-            save_median_plane_field(config, cyclo_id, rank=rank, comm=comm)
+            save_median_plane_field(config, cyclo_id,output_path=config.field_evaluation.median_plane_field_output, rank=rank, comm=comm)
 
         if rank <= 0 and verbosity >= 1:
             if len(bz_values) > 0:
