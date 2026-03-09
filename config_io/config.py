@@ -30,6 +30,8 @@ class FieldEvaluationConfig:
     use_symmetry: bool = True
     save_median_plane_field: Optional[bool] = False
     median_plane_field_output: Optional[str] = None
+    save_bore_field: Optional[bool] = False
+
 
 @dataclass
 class YokeConfig:
@@ -41,7 +43,7 @@ class YokeConfig:
     max_mesh_size: float
     stp_filename: Optional[str] = None
     stp_output: Optional[str] = None
-    
+
 
 @dataclass
 class LidLowerConfig:
@@ -52,7 +54,7 @@ class LidLowerConfig:
     max_mesh_size: float
     stp_filename: Optional[str] = None
     stp_output: Optional[str] = None
-    
+
 
 @dataclass
 class LidUpperConfig:
@@ -67,7 +69,7 @@ class LidUpperConfig:
     max_mesh_size: float
     stp_filename: Optional[str] = None
     stp_output: Optional[str] = None
-    
+
 
 @dataclass
 class ExtractChannelConfig:
@@ -83,7 +85,7 @@ class ExtractChannelConfig:
     use_extract_chan: Optional[bool] = False
     stp_filename: Optional[str] = None
     stp_output: Optional[str] = None
-    
+
 
 @dataclass
 class PoleConfig:
@@ -96,7 +98,7 @@ class PoleConfig:
     max_mesh_size: float
     stp_filename: Optional[str] = None
     stp_output: Optional[str] = None
-    
+
 
 @dataclass
 class SideShimConfig:
@@ -246,7 +248,7 @@ class CyclotronConfig:
                 'n_eval_pts': self.field_evaluation.n_eval_pts,
                 'use_symmetry':  self.field_evaluation.use_symmetry,
                 'save_median_plane_field': self.field_evaluation.save_median_plane_field,
-                'median_plane_field_output': self.field_evaluation.median_plane_field_output,
+                'save_bore_field': self.field_evaluation.save_bore_field,
             },
             'yoke': {
                 'outer_radius_mm': self.yoke.outer_radius_mm,
@@ -257,7 +259,7 @@ class CyclotronConfig:
                 'max_mesh_size': self.yoke.max_mesh_size,
                 'stp_filename': self.yoke.stp_filename,
                 'stp_output': self.yoke.stp_output,
-                
+
             },
             'lid_lower': {
                 'outer_radius_mm': self.lid_lower.outer_radius_mm,
@@ -267,7 +269,7 @@ class CyclotronConfig:
                 'max_mesh_size': self.lid_lower.max_mesh_size,
                 'stp_filename': self.lid_lower.stp_filename,
                 'stp_output': self.lid_lower.stp_output,
-                
+
             },
             'lid_upper': {
                 'outer_radius_mm_1': self.lid_upper.outer_radius_mm_1,
@@ -281,7 +283,7 @@ class CyclotronConfig:
                 'max_mesh_size': self.lid_upper.max_mesh_size,
                 'stp_filename': self.lid_upper.stp_filename,
                 'stp_output': self.lid_upper.stp_output,
-                
+
             },
             'extract_channel': {
                 'outer_radius_mm': self.extract_channel.outer_radius_mm,
@@ -296,7 +298,7 @@ class CyclotronConfig:
                 'use_extract_chan': self.extract_channel.use_extract_chan,
                 'stp_filename': self.extract_channel.stp_filename,
                 'stp_output': self.extract_channel.stp_output,
-                
+
             },
             'pole': {
                 'outer_radius_mm': self.pole.outer_radius_mm,
@@ -307,7 +309,7 @@ class CyclotronConfig:
                 'max_mesh_size': self.pole.max_mesh_size,
                 'stp_filename': self.pole.stp_filename,
                 'stp_output': self.pole.stp_output,
-                
+
             },
             'coil': {
                 'radius_min_mm': self.coil.radius_min_mm,

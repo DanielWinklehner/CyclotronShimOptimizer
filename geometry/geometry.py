@@ -503,7 +503,7 @@ def build_geometry(config: CyclotronConfig,
 
     # --- Note: Yoke and Pole components must be built in the above order so that the IDs are --- #
     # --- consistent between cached version and current version! Shims are never cached             --- #
-    # TODO: May cache shims in the future as well (cave: nuymber of shim blocks can change during optimization)
+    # TODO: May cache shims in the future as well (cave: number of shim blocks can change during optimization)
     # TODO: Think about a base level magnetization (maybe based on average in pole base) as a starting point
 
     yoke = rad.ObjCnt(yoke_components)

@@ -18,7 +18,8 @@ field_evaluation:
   radius_max_mm: 350.0
   n_eval_pts: 12
   use_symmetry: true  # Exploit 8-fold symmetry
-  save_median_plane_field:  true
+  save_median_plane_field:  false
+  save_bore_field: true
 
 # Geometry Parameters
 yoke:
@@ -83,7 +84,7 @@ coil:
   radius_max_mm: 574.5
   height_mm: 123.5
   midplane_dist: 55
-  current_A: 15368  # Amp-turns
+  current_A: -15368  # Amp-turns
   num_segments: 25
 
 material:
@@ -123,4 +124,4 @@ optimization:
 # Visualization
 visualization:
   show_opengl: true
-  comsol_filename: "D:\\MIT Dropbox\\Daniel Winklehner\\Projects\\Muon Reacceleration\\uCyclo_v2_Midplane_Res0.5mm_400x400mm.txt"
+#  comsol_filename: "D:\\MIT Dropbox\\Daniel Winklehner\\Projects\\Muon Reacceleration\\uCyclo_v2_Midplane_Res0.5mm_400x400mm.txt"
