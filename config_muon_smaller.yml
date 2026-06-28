@@ -8,7 +8,7 @@ seed: 42
 geometry:
   yoke_build_angle_deg: 45.0
   angular_resolution: 15  # Number of segments to approximate arcs
-  use_gmsh_occ: true
+  use_gmsh_occ_pole: true
   save_stp_files: false
 
 # Field evaluation
@@ -19,29 +19,33 @@ field_evaluation:
   n_eval_pts: 12
   use_symmetry: true  # Exploit 8-fold symmetry
   save_median_plane_field:  false
-  save_bore_field: true
+  save_bore_field: false
+  iso_method: "seo"  # can be "circle" (default), "seo", or "gordon"
 
 # Geometry Parameters
 yoke:
   outer_radius_mm: 700.0
   inner_radius_mm: 596.5
   height_mm: 188.5
+  max_mesh_size: 50
   segmentation: [2, 1, 3]  # [r, theta, z] divisions
   window_width_mm: 300.0
-#  stp_filename: "D:\\MIT Dropbox\\Daniel Winklehner\\Projects\\Muon Reacceleration\\CAD\\uCyclo_v2\\uCyclo_v2_YokeWall.stp"
+  stp_filename: "D:\\MIT Dropbox\\Daniel Winklehner\\Projects\\Muon Reacceleration\\CAD\\uCyclo_v2\\uCyclo_v2_YokeWall.stp"
 
 lid_lower:
   outer_radius_mm: 700.0
   inner_radius_mm: 400.0
   height_mm: 96.5
+  max_mesh_size: 50
   segmentation: [4, 1, 3]  # [x, y, z] divisions
-#  stp_filename: "D:\\MIT Dropbox\\Daniel Winklehner\\Projects\\Muon Reacceleration\\CAD\\uCyclo_v2\\uCyclo_v2_LidLower.stp"
+  stp_filename: "D:\\MIT Dropbox\\Daniel Winklehner\\Projects\\Muon Reacceleration\\CAD\\uCyclo_v2\\uCyclo_v2_LidLower.stp"
 
 lid_upper:
   outer_radius_mm_1: 700.0
   outer_radius_mm_2: 627.0
   inner_radius_mm: 75.0
   height_mm: 80.0
+  max_mesh_size: 50
   segmentation: [8, 1, 3]  # [r, theta, z] divisions (cylindrical)
   hole_diameter_mm: 120.0
   hole_center_xy: [198.0, 198.0]
@@ -53,15 +57,16 @@ lid_upper:
 pole:
   outer_radius_mm: 400.0
   inner_radius_mm: 50.0
+  max_mesh_size: 50
   height_mm: 230.0  # 235 originally, but top shim is min 5 mm
   full_angle_deg: 20.0  # 25 originally, but side shim is min 5 deg
   angular_resolution_deg: 2.5  # Angular segment length for arc approximation (deg)
   segmentation: [10, 1, 15]  # Number of [r, theta, z] segments (cylindrical)
-#  stp_filename: "D:\\MIT Dropbox\\Daniel Winklehner\\Projects\\Muon Reacceleration\\CAD\\uCyclo_v2\\uCyclo_v2_ShimmedPole.stp"
+  stp_filename: "D:\\MIT Dropbox\\Daniel Winklehner\\Projects\\Muon Reacceleration\\CAD\\uCyclo_v2\\uCyclo_v2_ShimmedPole.stp"
 
 # Shimming
 side_shim:
-  include: true
+  include: false
   num_rad_segments: 14  # number of radial segments along the pole edge
   angular_resolution_deg: 2.5  # Angular segment length for arc approximation (deg)
   default_offset_deg: 5.0  # deg
@@ -70,7 +75,7 @@ side_shim:
   segmentation: [3, 1, 20]  # Number of [r, theta, z] segments (cylindrical)
 
 top_shim:
-  include: true
+  include: false
   num_rad_segments: 14  # number of radial segments along the pole edge (keep same as side for now!)
   angular_resolution_deg: 1.25 # Angular segment length for arc approximation (deg)
   default_offset_mm: 5.0  # mm
@@ -79,12 +84,24 @@ top_shim:
   segmentation: [3, 1, 1]  # Number of [r, theta, z] subdivisions (note that arc approximation already segments in theta)
 # --- #
 
+extract_channel:
+  outer_radius_mm: 287.00
+  inner_radius_mm: 276.0
+  height_mm: 20
+  segmentation: [1, 4, 2]  # [r, theta, z] divisions
+  channel_width_mm: 12.5
+  # window_width_mm: 1.0
+  start_ang_deg: 35
+  end_ang_deg: 55
+  use_extract_chan: false
+  max_mesh_size: 20
+
 coil:
   radius_min_mm: 460.0
   radius_max_mm: 574.5
   height_mm: 123.5
   midplane_dist: 55
-  current_A: -15368  # Amp-turns
+  current_A: 15368  # Amp-turns
   num_segments: 25
 
 material:
@@ -123,5 +140,5 @@ optimization:
 
 # Visualization
 visualization:
-  show_opengl: true
+  show_opengl: false
 #  comsol_filename: "D:\\MIT Dropbox\\Daniel Winklehner\\Projects\\Muon Reacceleration\\uCyclo_v2_Midplane_Res0.5mm_400x400mm.txt"

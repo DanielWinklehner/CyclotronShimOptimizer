@@ -5,9 +5,8 @@ from typing import Tuple, Dict
 
 from config_io.config import CyclotronConfig
 from simulation.field_calculator import evaluate_radii_parallel
-from core.frequency import revolution_time_from_radius_and_velocity
 from core.species import IonSpecies
-from core.particles import ParticleDistribution
+from core.isochronicity import compute_isochronism
 from geometry.pole_shape import PoleShape
 from scipy.optimize import minimize_scalar
 
@@ -19,7 +18,6 @@ def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
                                             rank: int = 0,
                                             verbosity: int = 0,
                                             iteration: int = 0,
-                                            use_cache: bool = False,
                                             x_norm: np.ndarray = None) -> Tuple[float, Dict]:
     """
     Evaluate objective: flatness + regularization (minimizes shimming).
@@ -31,7 +29,6 @@ def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
     :param rank: MPI rank
     :param verbosity: Verbosity level
     :param iteration: Iteration number
-    :param use_cache
     :param x_norm: Normalized params [0,1] for regularization
     :return: (objective, results_dict)
     """
@@ -64,8 +61,7 @@ def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
             radii_mm,
             rank=rank,
             comm=comm,
-            verbosity=verbosity,
-            use_cache=use_cache
+            verbosity=verbosity
         )
 
         if verbosity >= 2:
@@ -96,23 +92,13 @@ def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
             if verbosity >= 2:
                 print(f"[RANK 0] Computing frequencies from {len(bz_values)} B-field values...", flush=True)
 
-            species = IonSpecies(config.particle_species)
-            particles = ParticleDistribution(species=species)
-
-            rev_frequencies_mhz = []
-            for r_mm, bz_t in zip(radii_out, bz_values):
-                b_rho_tmm = r_mm * bz_t
-                b_rho_tm = b_rho_tmm * 1e-3
-                energy = particles.set_z_momentum_from_b_rho(b_rho_tm)
-                v_mean = particles.v_mean_m_per_s
-                rev_time = revolution_time_from_radius_and_velocity(r_mm, v_mean)
-                rev_freq_hz = 1.0 / rev_time
-                rev_freq_mhz = rev_freq_hz / 1e6
-                rev_frequencies_mhz.append(rev_freq_mhz)
-
-            frequencies = np.array(rev_frequencies_mhz)
-            flatness = np.std(frequencies)
-            avg_f = np.mean(frequencies)
+            # Configured method (circle / gordon / seo) via the shared dispatch.
+            iso = compute_isochronism(config.field_evaluation.iso_method, bz_values, radii_out,
+                                      config, IonSpecies(config.particle_species),
+                                      rank=rank, comm=comm, verbose=(verbosity >= 2))
+            frequencies = iso['rev_frequencies_mhz']
+            flatness = iso['std_dev_mhz']
+            avg_f = iso['mean_freq_mhz']
 
             if x_norm is not None:
                 offset_magnitude = np.linalg.norm(x_norm, ord=2)
@@ -207,21 +193,10 @@ def optimize_coil_final(best_surface_params: np.ndarray,
             converged = comm.bcast(converged, root=0)
 
             if rank <= 0 < len(bz_values):
-                species = IonSpecies(config.particle_species)
-                particles = ParticleDistribution(species=species)
-
-                frequencies = []
-                for r_mm, bz_t in zip(radii_out, bz_values):
-                    b_rho_tmm = r_mm * bz_t
-                    b_rho_tm = b_rho_tmm * 1e-3
-                    energy = particles.set_z_momentum_from_b_rho(b_rho_tm)
-                    v_mean = particles.v_mean_m_per_s
-                    rev_time = revolution_time_from_radius_and_velocity(r_mm, v_mean)
-                    rev_freq_hz = 1.0 / rev_time
-                    rev_freq_mhz = rev_freq_hz / 1e6
-                    frequencies.append(rev_freq_mhz)
-
-                avg_f = np.mean(frequencies)
+                iso = compute_isochronism(config.field_evaluation.iso_method, bz_values, radii_out,
+                                          config, IonSpecies(config.particle_species),
+                                          rank=rank, comm=comm)
+                avg_f = iso['mean_freq_mhz']
                 error = (avg_f - target_f) ** 2
                 n_evals[0] += 1
 

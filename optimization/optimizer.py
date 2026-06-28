@@ -27,8 +27,7 @@ class CyclotronOptimizer:
                  rank: int = 0,
                  verbosity: int = 1,
                  check_convergence: bool = True,
-                 max_retries: int = 2,
-                 use_cache: bool = False):
+                 max_retries: int = 2):
         """Initialize optimizer."""
         self.config = config
         self.radii_mm = radii_mm
@@ -38,7 +37,6 @@ class CyclotronOptimizer:
         self.verbosity = verbosity
         self.check_convergence = check_convergence
         self.max_retries = max_retries
-        self.use_cache = use_cache
 
         # Best tracking per phase
         self.best_x = None
@@ -436,8 +434,7 @@ class CyclotronOptimizer:
                                  fixed_top: np.ndarray,
                                  multistart_idx: int,
                                  nelder_iter: int,
-                                 pbar,
-                                 use_cache: bool = False) -> float:
+                                 pbar) -> float:
         """
         Objective wrapper for a single phase.
         Reconstructs full surface from phase parameters + fixed parameters.
@@ -494,7 +491,6 @@ class CyclotronOptimizer:
                     comm=self.comm,
                     rank=self.rank,
                     verbosity=self.verbosity,
-                    use_cache=use_cache,
                     iteration=self.iteration_count,
                     x_norm=x_norm_phase_for_reg if self.rank <= 0 else None
                 )

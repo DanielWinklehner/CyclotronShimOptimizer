@@ -31,7 +31,7 @@ class FieldEvaluationConfig:
     save_median_plane_field: Optional[bool] = False
     median_plane_field_output: Optional[str] = None
     save_bore_field: Optional[bool] = False
-
+    iso_method: Optional[str] = "circle"
 
 @dataclass
 class YokeConfig:
@@ -249,6 +249,7 @@ class CyclotronConfig:
                 'use_symmetry':  self.field_evaluation.use_symmetry,
                 'save_median_plane_field': self.field_evaluation.save_median_plane_field,
                 'save_bore_field': self.field_evaluation.save_bore_field,
+                'iso_method': self.field_evaluation.iso_method,
             },
             'yoke': {
                 'outer_radius_mm': self.yoke.outer_radius_mm,
