@@ -219,7 +219,9 @@ def main(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = 
     energies_mev = rev_times_s = rev_frequencies_mhz = None
     mean_freq_mhz = std_dev_mhz = percent_dev = None
 
-    if rank <= 0 and bz_values is not None and len(bz_values) > 0:
+    # bz_values is a (Nr, Ntheta) array for circle/gordon or a PyPATools Field for seo,
+    # and is None on non-root ranks -- so test identity, not len().
+    if rank <= 0 and bz_values is not None:
         with Timer("Compute isochronism", rank, verbosity):
             # Single dispatch for circle / gordon / seo (see core.isochronicity).
             # SEO solver knob: 'newton' (full-turn fixed point, no residual betatron),

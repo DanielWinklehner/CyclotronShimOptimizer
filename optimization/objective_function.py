@@ -88,9 +88,11 @@ def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
         objective = 1e6
         frequencies = None
 
-        if rank <= 0 < len(bz_values):
+        # bz_values is a (Nr, Ntheta) array (circle/gordon) or a PyPATools Field (seo),
+        # and is None off-root -- test identity, not len().
+        if rank <= 0 and bz_values is not None:
             if verbosity >= 2:
-                print(f"[RANK 0] Computing frequencies from {len(bz_values)} B-field values...", flush=True)
+                print(f"[RANK 0] Computing isochronism ({config.field_evaluation.iso_method})...", flush=True)
 
             # Configured method (circle / gordon / seo) via the shared dispatch.
             iso = compute_isochronism(config.field_evaluation.iso_method, bz_values, radii_out,
@@ -99,6 +101,8 @@ def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
             frequencies = iso['rev_frequencies_mhz']
             flatness = iso['std_dev_mhz']
             avg_f = iso['mean_freq_mhz']
+            # Per-radius field for the result/plot (the raw input may be a grid or a Field).
+            bz_values = iso['bz_for_plot']
 
             if x_norm is not None:
                 offset_magnitude = np.linalg.norm(x_norm, ord=2)
@@ -192,7 +196,7 @@ def optimize_coil_final(best_surface_params: np.ndarray,
 
             converged = comm.bcast(converged, root=0)
 
-            if rank <= 0 < len(bz_values):
+            if rank <= 0 and bz_values is not None:
                 iso = compute_isochronism(config.field_evaluation.iso_method, bz_values, radii_out,
                                           config, IonSpecies(config.particle_species),
                                           rank=rank, comm=comm)
