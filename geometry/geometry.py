@@ -56,11 +56,12 @@ def _build_iron_material(config: CyclotronConfig) -> RadiaMaterial:
     return RadiaMaterial.from_radia_material(mat_id, name="iron")
 
 
-def _from_stp(stp_filename, max_mesh_size, model_name, material) -> MagnetizedComponent:
+def _from_stp(stp_filename, max_mesh_size, model_name, material, *, comm=None) -> MagnetizedComponent:
     return MagnetizedComponent.from_stp(
         stp_filename,
         mesh_size_max=max_mesh_size,
         model_name=model_name,
+        comm=comm,
         material=material,
         color=IRON_COLOR,
         apply_mat=True,
@@ -71,7 +72,7 @@ def _from_stp(stp_filename, max_mesh_size, model_name, material) -> MagnetizedCo
 def _build_yoke_wall(config, material, *, comm) -> MagnetizedComponent:
     cfg = config.yoke
     if cfg.stp_filename:
-        return _from_stp(cfg.stp_filename, cfg.max_mesh_size, "yoke", material)
+        return _from_stp(cfg.stp_filename, cfg.max_mesh_size, "yoke", material, comm=comm)
     return gb.build_wedge(
         inner_radius_mm=cfg.inner_radius_mm, outer_radius_mm=cfg.outer_radius_mm,
         height_mm=cfg.height_mm, z_offset_mm=0.0,
@@ -85,7 +86,7 @@ def _build_yoke_wall(config, material, *, comm) -> MagnetizedComponent:
 def _build_lid_lower(config, material, *, comm) -> MagnetizedComponent:
     cfg = config.lid_lower
     if cfg.stp_filename:
-        return _from_stp(cfg.stp_filename, cfg.max_mesh_size, "lid_lower", material)
+        return _from_stp(cfg.stp_filename, cfg.max_mesh_size, "lid_lower", material, comm=comm)
     return gb.build_wedge(
         inner_radius_mm=cfg.inner_radius_mm, outer_radius_mm=cfg.outer_radius_mm,
         height_mm=cfg.height_mm, z_offset_mm=-config.yoke.height_mm,
@@ -98,7 +99,7 @@ def _build_lid_lower(config, material, *, comm) -> MagnetizedComponent:
 def _build_lid_upper(config, material, *, comm) -> MagnetizedComponent:
     cfg = config.lid_upper
     if cfg.stp_filename:
-        return _from_stp(cfg.stp_filename, cfg.max_mesh_size, "lid_upper", material)
+        return _from_stp(cfg.stp_filename, cfg.max_mesh_size, "lid_upper", material, comm=comm)
     z_off = -(config.yoke.height_mm + config.lid_lower.height_mm)
     return gb.build_lid_upper(
         inner_radius_mm=cfg.inner_radius_mm,
@@ -113,7 +114,7 @@ def _build_lid_upper(config, material, *, comm) -> MagnetizedComponent:
 def _build_pole(config, pole_shape, material, *, comm) -> MagnetizedComponent:
     cfg = config.pole
     if cfg.stp_filename:
-        return _from_stp(cfg.stp_filename, cfg.max_mesh_size, "pole", material)
+        return _from_stp(cfg.stp_filename, cfg.max_mesh_size, "pole", material, comm=comm)
 
     n_segs = pole_shape.num_segments
     top = pole_shape.get_top_offsets_mm() if config.top_shim.include else np.zeros(n_segs + 1)
@@ -132,8 +133,8 @@ def _build_extract_channel(config, material, *, comm) -> List[MagnetizedComponen
     cfg = config.extract_channel
     if cfg.stp_filename:
         return [
-            _from_stp(cfg.stp_filename, cfg.max_mesh_size, "extract_1", material),
-            _from_stp(cfg.stp_filename, cfg.max_mesh_size, "extract_2", material),
+            _from_stp(cfg.stp_filename, cfg.max_mesh_size, "extract_1", material, comm=comm),
+            _from_stp(cfg.stp_filename, cfg.max_mesh_size, "extract_2", material, comm=comm),
         ]
     common = dict(
         inner_radius_mm=cfg.inner_radius_mm, outer_radius_mm=cfg.outer_radius_mm,
@@ -149,8 +150,12 @@ def _build_extract_channel(config, material, *, comm) -> List[MagnetizedComponen
     ]
 
 
-def _build_coils(config: CyclotronConfig) -> CurrentCarryingComponent:
-    """Build the upper/lower racetrack coil pair and return them as a container."""
+def build_coils(config: CyclotronConfig) -> CurrentCarryingComponent:
+    """Build the upper/lower racetrack coil pair and return them as a container.
+
+    The coil current is read from ``config.coil.current_A`` at build time, so the
+    coil-current inner loop rebuilds this (cheap, unmeshed) sub-container per current.
+    """
     cfg = config.coil
     z_off = cfg.midplane_dist + 0.5 * cfg.height_mm
     common = dict(
@@ -161,6 +166,62 @@ def _build_coils(config: CyclotronConfig) -> CurrentCarryingComponent:
     coil_lower = Coil(center=(0.0, 0.0, z_off), **common)
     coil_upper = Coil(center=(0.0, 0.0, -z_off), **common)
     return CurrentCarryingComponent.containerize([coil_lower, coil_upper])
+
+
+def build_iron(
+    config: CyclotronConfig,
+    pole_shape=None,
+    *,
+    omit_symmetry: bool = False,
+    rank: int = 0,
+    comm=None,
+    verbosity: int = 1,
+) -> List[MagnetizedComponent]:
+    """Build the iron assembly as one or two sub-containers.
+
+    Returns ``[symmetric_iron]`` (yoke + lids + pole, with the 8-fold cyclotron
+    symmetry applied) and, when an extraction channel is configured, additionally a
+    non-symmetric iron sub-container (the channel pieces, which break the 8-fold
+    symmetry and are therefore NOT symmetrized). Keeping these as standalone
+    sub-containers lets the coil-current inner loop swap only the coils while the iron
+    -- and its relaxed magnetization -- is reused (see the optimizer rework).
+
+    NOTE: the previous build symmetrized ALL iron including the extraction channel,
+    which 8-fold-replicated the channel; splitting it out fixes that.
+    """
+    say = verbosity >= 1 and rank <= 0
+    material = _build_iron_material(config)
+
+    if say:
+        print("Building symmetric iron (yoke, lids, pole)...", flush=True)
+    symmetric_parts: List[MagnetizedComponent] = [
+        _build_yoke_wall(config, material, comm=comm),
+        _build_lid_lower(config, material, comm=comm),
+        _build_lid_upper(config, material, comm=comm),
+        _build_pole(config, pole_shape, material, comm=comm),
+    ]
+    symmetric_iron = MagnetizedComponent.containerize(symmetric_parts)
+    if omit_symmetry:
+        if say:
+            print("Symmetry DISABLED (geometry debug mode)", flush=True)
+    else:
+        if say:
+            print("Applying 8-fold symmetry to symmetric iron...", flush=True)
+        symmetric_iron.apply_symmetry(CYCLOTRON_SYMMETRIES)
+
+    iron_subs: List[MagnetizedComponent] = [symmetric_iron]
+
+    if config.extract_channel.use_extract_chan:
+        if say:
+            print("Building non-symmetric iron (extraction channel)...", flush=True)
+        ext_parts = _build_extract_channel(config, material, comm=comm)
+        non_symmetric_iron = (
+            MagnetizedComponent.containerize(ext_parts)
+            if len(ext_parts) > 1 else ext_parts[0]
+        )
+        iron_subs.append(non_symmetric_iron)
+
+    return iron_subs
 
 
 def build_geometry(
@@ -192,43 +253,21 @@ def build_geometry(
         print("BUILDING CYCLOTRON GEOMETRY", flush=True)
         print("=" * 60 + "\n", flush=True)
 
-    # ---------- Material ----------
-    if say:
-        print("Creating iron material...", flush=True)
-    material = _build_iron_material(config)
-
-    # ---------- Iron pieces (fixed order -> consistent radia ids across ranks) ----------
-    if say:
-        print("Building iron components...", flush=True)
-    iron_parts: List[MagnetizedComponent] = [
-        _build_yoke_wall(config, material, comm=comm),
-        _build_lid_lower(config, material, comm=comm),
-        _build_lid_upper(config, material, comm=comm),
-    ]
-    if config.extract_channel.use_extract_chan:
-        iron_parts.extend(_build_extract_channel(config, material, comm=comm))
-    iron_parts.append(_build_pole(config, pole_shape, material, comm=comm))
-
-    iron = MagnetizedComponent.containerize(iron_parts)
-
-    # ---------- Symmetry (iron only; coils are already symmetric) ----------
-    if omit_symmetry:
-        if say:
-            print("Symmetry DISABLED (geometry debug mode)", flush=True)
-    else:
-        if say:
-            print("Applying 8-fold symmetry to iron...", flush=True)
-        iron.apply_symmetry(CYCLOTRON_SYMMETRIES)
+    # ---------- Iron (symmetric + optional non-symmetric sub-containers) ----------
+    iron_subs = build_iron(
+        config, pole_shape,
+        omit_symmetry=omit_symmetry, rank=rank, comm=comm, verbosity=verbosity,
+    )
 
     # ---------- Coils ----------
     if say:
         print("Building racetrack coils...", flush=True)
-    coils = _build_coils(config)
+    coils = build_coils(config)
 
-    # ---------- Assemble ----------
+    # ---------- Assemble: [symmetric_iron, (non_symmetric_iron), coils] ----------
     if say:
         print("Assembling cyclotron...", flush=True)
-    cyclotron = BaseRadiaComponent.containerize([iron, coils])
+    cyclotron = BaseRadiaComponent.containerize([*iron_subs, coils])
 
     if say:
         print("\n" + "=" * 60, flush=True)

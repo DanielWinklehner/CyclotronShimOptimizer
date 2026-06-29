@@ -160,3 +160,93 @@ def plot_isochronism_metric(radii_mm: List[float],
         plt.show()
 
     return fig, ax
+
+
+def plot_final_summary(radii_mm, bz_t, energies_mev, freq_mhz, tunes=None,
+                       target_freq_mhz=None, title=None, show=False, savepath=None):
+    """Final 4-panel summary of the optimized design.
+
+    Panels: (top-left) average Bz(r) + Energy(r) on a secondary axis; (top-right)
+    revolution frequency(r) + target line; (bottom-left) betatron tunes nu_r, nu_z(r)
+    with the nu_r=1, nu_z=0 references and the Walkinshaw 2*nu_z line; (bottom-right)
+    flutter F(r). ``tunes`` is the compute_isochronism()['tunes'] dict (None for
+    circle/seo -> those panels show a placeholder).
+    """
+    r = np.asarray(radii_mm, dtype=float)
+    fig, axs = plt.subplots(2, 2, figsize=(13, 9))
+    if title:
+        fig.suptitle(title, fontsize=13, fontweight='bold')
+
+    # ----- top-left: average Bz + Energy -----
+    ax = axs[0, 0]
+    ax.plot(r, np.asarray(bz_t, dtype=float), color='tab:blue', lw=2, marker='o', ms=3, label='<Bz>')
+    ax.set_xlabel("Radius (mm)")
+    ax.set_ylabel("<Bz> (T)", color='tab:blue')
+    ax.tick_params(axis='y', labelcolor='tab:blue')
+    ax.grid(True, alpha=0.3)
+    ax.set_title("Average field & energy", fontsize=11, fontweight='bold')
+    if energies_mev is not None:
+        axe = ax.twinx()
+        axe.plot(r, np.asarray(energies_mev, dtype=float), color='tab:green', lw=1.8,
+                 ls='--', marker='^', ms=3)
+        axe.set_ylabel("Energy (MeV)", color='tab:green')
+        axe.tick_params(axis='y', labelcolor='tab:green')
+
+    # ----- top-right: frequency + target -----
+    ax = axs[0, 1]
+    f = np.asarray(freq_mhz, dtype=float)
+    ax.plot(r, f, color='tab:red', lw=2, marker='s', ms=3, label='f_rev')
+    if target_freq_mhz is not None:
+        ax.axhline(target_freq_mhz, color='0.4', lw=1.2, ls=':', label=f'target {target_freq_mhz:g} MHz')
+        ax.text(0.02, 0.04, f'std = {np.std(f) * 1e3:.2f} kHz', transform=ax.transAxes, fontsize=9)
+    ax.set_xlabel("Radius (mm)")
+    ax.set_ylabel("f_rev (MHz)")
+    ax.grid(True, alpha=0.3)
+    ax.set_title("Isochronism: revolution frequency", fontsize=11, fontweight='bold')
+    ax.legend(fontsize=9, loc='best')
+
+    # ----- bottom-left: betatron tunes -----
+    ax = axs[1, 0]
+    if tunes is not None and tunes.get('nu_r') is not None:
+        rt = np.asarray(tunes.get('r_mm', r), dtype=float)
+        nu_r = np.asarray(tunes['nu_r'], dtype=float)
+        nu_z = np.asarray(tunes['nu_z'], dtype=float)
+        ax.plot(rt, nu_r, color='tab:purple', lw=2, marker='o', ms=3, label=r'$\nu_r$')
+        ax.plot(rt, nu_z, color='tab:orange', lw=2, marker='s', ms=3, label=r'$\nu_z$')
+        ax.plot(rt, 2.0 * nu_z, color='0.5', lw=1, ls='--', label=r'$2\nu_z$ (Walkinshaw)')
+        ax.axhline(1.0, color='0.6', lw=0.8, ls=':')
+        ax.axhline(0.0, color='0.6', lw=0.8, ls=':')
+        ax.set_ylabel("tune")
+        ax.legend(fontsize=9, loc='best')
+    else:
+        ax.text(0.5, 0.5, "tunes available with iso_method = gordon",
+                ha='center', va='center', transform=ax.transAxes, fontsize=10, color='0.5')
+        ax.set_ylabel("tune")
+    ax.set_xlabel("Radius (mm)")
+    ax.grid(True, alpha=0.3)
+    ax.set_title("Betatron tunes", fontsize=11, fontweight='bold')
+
+    # ----- bottom-right: flutter -----
+    ax = axs[1, 1]
+    if tunes is not None and tunes.get('flutter') is not None:
+        rt = np.asarray(tunes.get('r_mm', r), dtype=float)
+        ax.plot(rt, np.asarray(tunes['flutter'], dtype=float), color='tab:cyan', lw=2, marker='o', ms=3)
+        ax.set_ylabel(r"flutter  F = $\langle (B-\langle B\rangle)^2\rangle / \langle B\rangle^2$")
+    else:
+        ax.text(0.5, 0.5, "flutter available with iso_method = gordon",
+                ha='center', va='center', transform=ax.transAxes, fontsize=10, color='0.5')
+        ax.set_ylabel("flutter")
+    ax.set_xlabel("Radius (mm)")
+    ax.grid(True, alpha=0.3)
+    ax.set_title("Flutter", fontsize=11, fontweight='bold')
+
+    fig.tight_layout()
+    if savepath:
+        try:
+            fig.savefig(savepath, dpi=120)
+        except Exception:
+            pass
+    if show:
+        plt.show()
+
+    return fig, axs

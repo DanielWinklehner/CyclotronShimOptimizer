@@ -112,8 +112,9 @@ optimization:
   top_shim_max_mm: 20
   num_workers: 1   # Unused
   n_initial_points: 1  # Initial random sample in Bayesian, or number of multistarts in Nelder-Mead
-  reference_coil_current: 18000
+  reference_coil_current: 35000  # operating-band value (was 18000) so shims tune near the real saturation state
   regularization_weight: 0.0  # Penalty for jagged shim shapes
+  convergence_penalty_weight: 1.0  # MHz penalty per unit relaxation-misfit shortfall (continuous convergence gate)
   random_init: false
   opt_top: false
   opt_side: false

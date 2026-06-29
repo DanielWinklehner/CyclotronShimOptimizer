@@ -142,6 +142,7 @@ optimization:
   n_initial_points: 1  # Initial random sample in Bayesian, or number of multistarts in Nelder-Mead
   reference_coil_current: 134000
   regularization_weight: 0.0  # Penalty for jagged shim shapes
+  convergence_penalty_weight: 1.0  # MHz penalty per unit relaxation-misfit shortfall (continuous convergence gate)
   random_init: false
   opt_top: false
   opt_side: false

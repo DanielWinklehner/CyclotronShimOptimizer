@@ -33,6 +33,7 @@ def isochronicity_gordon_octant(
         theta_octant,
         species,            # IonSpecies object
         n_harmonics_max=6,
+        spiral_angle_deg=0.0,
 ):
     """
     Compute equilibrium-orbit properties from a single field octant (Gordon's method).
@@ -122,6 +123,20 @@ def isochronicity_gordon_octant(
     else:
         k_index = np.zeros(Nr)
 
+    # --- 6b. Betatron tunes (smooth/hard-edge approximation) ---
+    #   nu_r^2 = 1 + k                       (radial; ~ gamma for a well-isochronized field)
+    #   nu_z^2 = -k + F (1 + 2 tan^2 xi)     (vertical; xi = sector spiral angle)
+    # TODO: the true spiral angle comes from the side-shim radial twist; default to a
+    # radial sector (tan xi = 0). Pass spiral_angle_deg to include the spiral focusing boost.
+    spiral_tan2 = np.tan(np.deg2rad(spiral_angle_deg)) ** 2
+    nu_r_sq = 1.0 + k_index
+    nu_z_sq = -k_index + F * (1.0 + 2.0 * spiral_tan2)
+    nu_r = np.sqrt(np.clip(nu_r_sq, 0.0, None))
+    # nu_z is imaginary where nu_z_sq < 0 (vertical defocusing) -> expose NaN there;
+    # the signed nu_z_sq lets callers/plots flag the instability explicitly.
+    nu_z = np.where(nu_z_sq > 0.0, np.sqrt(np.clip(nu_z_sq, 0.0, None)), np.nan)
+    walkinshaw_distance = nu_r - 2.0 * nu_z   # 0 on the nu_r = 2 nu_z coupling resonance
+
     # --- 7. Energy ---
     energy_MeV = (gamma - 1.0) * species.mass_mev
     mass_number = species.q / species.q_over_a                  # = A (sign cancels)
@@ -137,6 +152,12 @@ def isochronicity_gordon_octant(
         'B0_azimuthal': B0,
         'flutter': F,
         'field_index': k_index,
+        'nu_r': nu_r,
+        'nu_z': nu_z,
+        'nu_r_sq': nu_r_sq,
+        'nu_z_sq': nu_z_sq,
+        'walkinshaw_distance': walkinshaw_distance,
+        'spiral_angle_deg': spiral_angle_deg,
         'gamma': gamma,
         'beta': beta,
         'beta_gamma': beta_gamma,
@@ -169,7 +190,7 @@ def _iso_metrics(freq_mhz):
     return mean, std, pct
 
 
-def _iso_result(method, energies_mev, rev_times_s, freq_mhz, bz_for_plot, orbits=None):
+def _iso_result(method, energies_mev, rev_times_s, freq_mhz, bz_for_plot, orbits=None, tunes=None):
     mean, std, pct = _iso_metrics(freq_mhz)
     return {
         'method': method,
@@ -181,6 +202,7 @@ def _iso_result(method, energies_mev, rev_times_s, freq_mhz, bz_for_plot, orbits
         'std_dev_mhz': std,
         'percent_dev': pct,
         'orbits': orbits,
+        'tunes': tunes,
     }
 
 
@@ -207,8 +229,18 @@ def _iso_gordon(bz_values, radii_mm, config, species):
         species,
         n_harmonics_max=6,
     )
+    tunes = {
+        'r_mm': np.asarray(radii_mm, dtype=float),
+        'nu_r': res['nu_r'],
+        'nu_z': res['nu_z'],
+        'nu_r_sq': res['nu_r_sq'],
+        'nu_z_sq': res['nu_z_sq'],
+        'walkinshaw_distance': res['walkinshaw_distance'],
+        'flutter': res['flutter'],
+        'field_index': res['field_index'],
+    }
     return _iso_result('gordon', res['energy_MeV'], res['T_rev'],
-                       res['f_rev'] * 1e-6, res['B_avg_orbit'])
+                       res['f_rev'] * 1e-6, res['B_avg_orbit'], tunes=tunes)
 
 
 def _iso_seo(bz_values, radii_mm, config, solver, energy_seeds_kev, verbose):

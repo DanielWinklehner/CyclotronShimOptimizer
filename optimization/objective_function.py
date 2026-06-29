@@ -8,7 +8,7 @@ from simulation.field_calculator import evaluate_radii_parallel
 from core.species import IonSpecies
 from core.isochronicity import compute_isochronism
 from geometry.pole_shape import PoleShape
-from scipy.optimize import minimize_scalar
+from scipy.optimize import minimize_scalar, brentq, newton
 
 
 def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
@@ -55,7 +55,7 @@ def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
             print(f"[RANK {rank}] Before barrier 1...", flush=True)
         comm.Barrier()
 
-        radii_out, bz_values, converged, _ = evaluate_radii_parallel(
+        radii_out, bz_values, converged, _, misfit = evaluate_radii_parallel(
             config,
             pole_shape,
             radii_mm,
@@ -87,6 +87,7 @@ def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
         regularization = 0.0
         objective = 1e6
         frequencies = None
+        convergence_penalty = 0.0
 
         # bz_values is a (Nr, Ntheta) array (circle/gordon) or a PyPATools Field (seo),
         # and is None off-root -- test identity, not len().
@@ -110,11 +111,20 @@ def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
                 offset_magnitude = 0.0
 
             regularization = regularization_weight * offset_magnitude
-            objective = flatness + regularization
+
+            # Continuous convergence gate: never silently accept an unconverged solve.
+            # Penalty is 0 at convergence (misfit <= precision) and grows smoothly with
+            # the relaxation shortfall, keeping the landscape continuous for the optimizer.
+            if not converged:
+                shortfall = max(0.0, misfit / config.simulation.precision - 1.0)
+                convergence_penalty = config.optimization.convergence_penalty_weight * shortfall
+
+            objective = flatness + regularization + convergence_penalty
 
             if verbosity >= 1:
                 print(f"      flatness={flatness:.2e}, avg_f={avg_f:.4f}, "
-                      f"reg={regularization:.4f} → obj={objective:.6f}", flush=True)
+                      f"reg={regularization:.4f}, conv_pen={convergence_penalty:.4f} "
+                      f"(converged={converged}, misfit={misfit:.2e}) → obj={objective:.6f}", flush=True)
 
         if verbosity >= 2:
             print(f"[RANK {rank}] Broadcasting from rank 0...", flush=True)
@@ -124,6 +134,8 @@ def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
         avg_f = comm.bcast(avg_f, root=0)
         regularization = comm.bcast(regularization, root=0)
         frequencies = comm.bcast(frequencies, root=0)
+        convergence_penalty = comm.bcast(convergence_penalty, root=0)
+        misfit = comm.bcast(misfit, root=0)
 
         return objective, {
             'flatness': flatness,
@@ -132,6 +144,9 @@ def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
             'avg_f': avg_f,
             'regularization': regularization,
             'objective': objective,
+            'converged': converged,
+            'misfit': misfit,
+            'convergence_penalty': convergence_penalty,
         }
 
     finally:
@@ -181,7 +196,7 @@ def optimize_coil_final(best_surface_params: np.ndarray,
                 print(f"[RANK {rank}] Before barrier...", flush=True)
             comm.Barrier()
 
-            radii_out, bz_values, converged, _ = evaluate_radii_parallel(
+            radii_out, bz_values, converged, _, _ = evaluate_radii_parallel(
                 config,
                 pole_shape,
                 radii_mm,
@@ -301,3 +316,122 @@ def optimize_coil_final(best_surface_params: np.ndarray,
         print(f"  --> Total evaluations: {n_evals[0]}", flush=True)
 
     return optimal_coil, final_error, n_evals[0]
+
+
+def solve_coil_for_target_frequency(solver, config, species, target_f_mhz, bracket,
+                                    *, rank: int = 0, comm=None, verbosity: int = 1,
+                                    xtol_A: float = 1.0, seed_current=None):
+    """Find the coil current whose mean revolution frequency equals the target.
+
+    Uses an already-built ReusableCyclotronSolver, so each trial current re-solves
+    cheaply (reuses the meshed iron; cold relax). Mean frequency is monotone in current,
+    so a bracketed root-find (brentq) is robust. This pins the mean frequency exactly,
+    so the shim flatness is always evaluated at the true operating (saturation) point --
+    fixing the working-point flaw of the old fixed-reference-current scheme.
+
+    MPI-collective: rank 0 drives brentq and broadcasts each trial current; ranks 1+
+    follow in a resolve loop until a None sentinel.
+
+    :param bracket: (I_min, I_max) Amps; must bracket the target frequency.
+    :return: (optimal_current_A, iso_dict, converged, misfit). iso_dict is the
+        compute_isochronism result at the on-target current (mean_freq_mhz, std_dev_mhz,
+        rev_frequencies_mhz, tunes, ...), broadcast to all ranks.
+    """
+    radii = solver.radii_mm
+    method = config.field_evaluation.iso_method
+
+    if rank <= 0:
+        n_eval = [0]
+
+        def g(coil_current):
+            if comm is not None:
+                comm.bcast(float(coil_current), root=0)   # ranks 1+ resolve this current
+            _, bz, _, _ = solver.resolve_at_current(coil_current)
+            iso_i = compute_isochronism(method, bz, radii, config, species, rank=rank, comm=comm)
+            n_eval[0] += 1
+            mf = iso_i['mean_freq_mhz']
+            if verbosity >= 1:
+                print(f"    [coil-solve {n_eval[0]}] I={coil_current:.1f} A -> "
+                      f"mean_f={mf:.4f} MHz (err={mf - target_f_mhz:+.4f})", flush=True)
+            return mf - target_f_mhz
+
+        # Warm-start from a seed current (e.g. the previous outer iterate's optimum) via
+        # the secant method -- few evals when the seed is close; fall back to a bracketed
+        # brentq over the full range if it strays out of bounds or fails to converge.
+        optimal_current = None
+        if seed_current is not None:
+            try:
+                x1 = float(min(max(seed_current * 1.02, bracket[0]), bracket[1]))
+                root = newton(g, x0=float(seed_current), x1=x1, tol=xtol_A, maxiter=10)
+                if bracket[0] <= root <= bracket[1]:
+                    optimal_current = float(root)
+            except (RuntimeError, ValueError):
+                optimal_current = None
+        if optimal_current is None:
+            optimal_current = brentq(g, bracket[0], bracket[1], xtol=xtol_A)
+
+        # one final collective resolve exactly at the root, for the on-target iso
+        if comm is not None:
+            comm.bcast(float(optimal_current), root=0)
+        _, bz, converged, misfit = solver.resolve_at_current(optimal_current)
+        iso = compute_isochronism(method, bz, radii, config, species, rank=rank, comm=comm)
+
+        if comm is not None:
+            comm.bcast(None, root=0)   # stop the ranks-1+ resolve loop
+    else:
+        while True:
+            ci = comm.bcast(None, root=0)
+            if ci is None:
+                break
+            solver.resolve_at_current(ci)
+        optimal_current = iso = converged = misfit = None
+
+    if comm is not None:
+        optimal_current = comm.bcast(optimal_current, root=0)
+        iso = comm.bcast(iso, root=0)
+        converged = comm.bcast(converged, root=0)
+        misfit = comm.bcast(misfit, root=0)
+
+    return optimal_current, iso, converged, misfit
+
+
+def physics_precondition_offsets(config, n_iso_levers=1):
+    """Cheap physics-based starting shim offsets (no field solve) for the DFO-LS x0.
+
+    Returns (side_offsets_deg, top_offsets_mm), each length num_rad_segments+1 sampled at the
+    pole radial stations (inner -> outer radius).
+
+    TOP (isochronism): an isochronous machine needs the average field B0(r) = B0(0)*gamma(r).
+    A simple gap-reluctance model gives B0 ~ 1/gap and the top shim reduces the gap, so the top
+    offset should grow with gamma(r). gamma follows analytically from the target revolution
+    frequency (v = omega*r): beta(r) = 2*pi*f_target*r/c, gamma = 1/sqrt(1-beta^2). Map gamma(r)
+    linearly onto [top_min, top_max].
+    SIDE (also first-order isochronism): the hill ANGULAR WIDTH sets the hill/valley duty cycle --
+    a wider hill means the orbit spends more azimuth in the high-field hill, so the azimuthal-
+    average B0 rises directly (this dominates the small flutter back-reaction). So for isochronism
+    the side width should follow the same gamma(r) target as the top; it ALSO sets flutter /
+    vertical focusing, a coupling that DFO-LS and the future nu_z constraint sort out.
+    """
+    clight = 299792458.0
+    n = config.side_shim.num_rad_segments + 1
+    r_m = np.linspace(config.pole.inner_radius_mm, config.pole.outer_radius_mm, n) * 1e-3
+    f_hz = config.optimization.target_frequency_mhz * 1e6
+    beta = np.clip(2.0 * np.pi * f_hz * r_m / clight, 0.0, 0.999)
+    gamma = 1.0 / np.sqrt(1.0 - beta ** 2)
+
+    # Split the gamma(r) B0 rise across the n_iso_levers being optimized (side and top are
+    # both first-order B0 levers), so that optimizing both does not provision ~2x the needed
+    # rise (double-counting Bz(r)). n_iso_levers=1 (single block) uses the full range.
+    share = 1.0 / max(1, n_iso_levers)
+
+    t_lo, t_hi = config.optimization.top_shim_min_mm, config.optimization.top_shim_max_mm
+    g_span = gamma.max() - gamma.min()
+    g_norm = (gamma - gamma.min()) / g_span if g_span > 0 else np.zeros(n)
+    top = t_lo + (t_hi - t_lo) * g_norm * share
+
+    # Side width is a first-order B0 lever via the hill duty cycle, so target the same
+    # gamma(r) isochronous rise as the top (wider hill at larger r -> higher average B0).
+    s_lo, s_hi = config.optimization.side_shim_min_deg, config.optimization.side_shim_max_deg
+    side = s_lo + (s_hi - s_lo) * g_norm * share
+
+    return np.clip(side, s_lo, s_hi), np.clip(top, t_lo, t_hi)

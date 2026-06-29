@@ -164,12 +164,16 @@ class OptimizationConfig:
     opt_top: Optional[bool] = True
     opt_side: Optional[bool] = True
     opt_coil: Optional[bool] = True
+    convergence_penalty_weight: Optional[float] = 1.0
+    precondition: Optional[bool] = False
+    coil_match_tol_mhz: Optional[float] = 0.05
 
 
 @dataclass
 class VisualizationConfig:
     show_opengl: bool
     comsol_filename: Optional[str] = None
+    live_plot: Optional[bool] = True
 
 
 @dataclass
@@ -359,8 +363,11 @@ class CyclotronConfig:
                 'optimizer': self.optimization.optimizer,
                 'random_init': self.optimization.random_init,
                 'opt_top': self.optimization.opt_top,
-                'opt_side': self.optimization.opt_top,
-                'opt_coil': self.optimization.opt_top,
+                'opt_side': self.optimization.opt_side,
+                'opt_coil': self.optimization.opt_coil,
+                'convergence_penalty_weight': self.optimization.convergence_penalty_weight,
+                'precondition': self.optimization.precondition,
+                'coil_match_tol_mhz': self.optimization.coil_match_tol_mhz,
                 'side_shim_min_deg': self.optimization.side_shim_min_deg,
                 'side_shim_max_deg': self.optimization.side_shim_max_deg,
                 'top_shim_min_mm': self.optimization.top_shim_min_mm,
@@ -369,5 +376,6 @@ class CyclotronConfig:
             'visualization': {
                 'show_opengl': self.visualization.show_opengl,
                 'comsol_filename': self.visualization.comsol_filename,
+                'live_plot': self.visualization.live_plot,
             },
         }

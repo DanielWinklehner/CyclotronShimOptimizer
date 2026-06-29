@@ -10,10 +10,10 @@ from io import StringIO
 
 # Import radia
 import radia as rad
-from PyRadia import FldGPU
 
 from config_io.config import CyclotronConfig
-from geometry.geometry import build_geometry
+from geometry.geometry import build_geometry, build_iron, build_coils
+from geometry.components import BaseRadiaComponent
 from geometry.pole_shape import PoleShape
 from PyPATools.field import Field
 
@@ -202,15 +202,10 @@ def get_median_plane_field_rz(cyclotron_id: int,
     # if rank <= 0:
     #     print("Gathering field values with CuPy")
 
-    # These are the model's symmetries. TODO: Need to keep them in a central spot
-    model_symmetries = [
-        ('perp', [0, 0, 0], [1, -1, 0]),
-        ('perp', [0, 0, 0], [1, 0, 0]),
-        ('perp', [0, 0, 0], [0, 1, 0]),
-        ('para', [0, 0, 0], [0, 0, 1]),
-    ]
-
-    bz_flat = FldGPU(cyclotron_id, points_flat, component='bz', symmetries=model_symmetries, verbose=(rank==0))
+    # The 8-fold symmetry is already baked into the iron object (TrfZerPerp/Para in
+    # build_geometry), so rad.Fld returns the full symmetric field at these octant
+    # sample points -- no explicit symmetry list needed (matches get_median_plane_field_2d).
+    bz_flat = rad.Fld(cyclotron_id, 'bz', points_flat, use_gpu=True)
 
     # Check if we got results (rank 0) or nothing (other ranks)
     if rank > 0:
@@ -452,7 +447,7 @@ def save_3d_field(config: CyclotronConfig,
         print(f"  Calculating {len(points_octant)} points in octant...", flush=True)
 
     # Query Radia for all three components
-    b_octant = np.array(rad.Fld(cyclotron_id, 'bxbybz', points_octant.tolist()))
+    b_octant = np.array(rad.Fld(cyclotron_id, 'bxbybz', points_octant.tolist(), use_gpu=True))
 
     if rank <= 0:
         print(f"  Received {len(b_octant)} field vectors", flush=True)
@@ -584,7 +579,7 @@ def save_median_plane_field(config: CyclotronConfig,
         print(f"  Calculating {len(points_octant)} points in octant...", flush=True)
 
     # Query Radia for octant only
-    bz_octant = np.array(rad.Fld(cyclotron_id, 'bz', points_octant_3d.tolist()))
+    bz_octant = np.array(rad.Fld(cyclotron_id, 'bz', points_octant_3d.tolist(), use_gpu=True))
 
     if rank <= 0:
         print(f"  Received {len(bz_octant)} field values", flush=True)
@@ -733,6 +728,125 @@ def save_median_plane_field(config: CyclotronConfig,
 #     return 0
 
 
+class ReusableCyclotronSolver:
+    """Stateful cyclotron solver that enables coil-current reuse.
+
+    Builds the iron + coils once; ``resolve_at_current`` then rebuilds ONLY the coils
+    (cheap, unmeshed) at a new current and re-relaxes WARM from the iron's retained
+    magnetization, reusing the meshed iron. This makes the nested coil-current solve
+    cheap. (Radia has no in-place coil-current setter, so each current still re-runs
+    RlxPre; the saving is skipping the gmsh mesh + ObjPolyhdr rebuild, which dominates.)
+
+    Disposal goes through the component wrappers: the throwaway top container is
+    disposed shallow (keeping the iron sub-containers) and the coils deep; the iron and
+    its magnetization persist across currents.
+    """
+
+    def __init__(self, config: CyclotronConfig, radii_mm, *, rank: int = 0,
+                 comm=None, verbosity: int = 1):
+        if isinstance(radii_mm, np.ndarray):
+            radii_mm = radii_mm.tolist()
+        if not isinstance(radii_mm, list):
+            radii_mm = [radii_mm]
+        self.config = config
+        self.radii_mm = radii_mm
+        self.rank = rank
+        self.comm = comm
+        self.verbosity = verbosity
+        self._iron_subs = None   # kept across coil currents (with their magnetization)
+        self._coils = None
+        self._cyclotron = None
+        self._im = None          # interaction matrix (rad.RlxPre handle)
+
+    def build(self, pole_shape, coil_current):
+        """Full (re)build from scratch (new shims), then solve."""
+        rad.UtiDelAll()
+        self._iron_subs = None
+        self._coils = None
+        self._cyclotron = None
+        self._im = None
+        self._iron_subs = build_iron(self.config, pole_shape, rank=self.rank,
+                                     comm=self.comm, verbosity=self.verbosity)
+        return self._solve_and_query(coil_current, zero_magnetization=False)
+
+    def resolve_at_current(self, coil_current, *, warm=False):
+        """Reuse the meshed iron; rebuild only the coils and re-solve at a new current.
+
+        warm=False (default): zero the magnetization and relax COLD -- gives the SAME
+        result as a full rebuild while skipping the (dominant) gmsh mesh + ObjPolyhdr
+        rebuild. warm=True keeps the previous magnetization (faster in principle), but
+        for large current jumps RlxAuto's per-iteration convergence criterion can trip
+        during slow creep and return a wrong field -- only use with tightened precision.
+        """
+        if self._iron_subs is None:
+            raise RuntimeError("ReusableCyclotronSolver.build() must be called first.")
+        self._teardown_coils()
+        return self._solve_and_query(coil_current, zero_magnetization=not warm)
+
+    def dispose(self):
+        """Free the per-current coils / top container / interaction matrix and drop refs.
+
+        The meshed iron objects are intentionally left for the next ``rad.UtiDelAll()``
+        (issued by ``build()``) rather than deep-disposed tet-by-tet here.
+        """
+        self._teardown_coils()
+        self._iron_subs = None
+
+    def _teardown_coils(self):
+        # Dispose the top container (shallow -> keeps the iron sub-containers), the
+        # coils (deep), and the interaction matrix. Iron + magnetization persist.
+        if self._cyclotron is not None:
+            self._cyclotron.dispose(deep=False)
+            self._cyclotron = None
+        if self._coils is not None:
+            self._coils.dispose(deep=True)
+            self._coils = None
+        if self._im is not None:
+            try:
+                rad.UtiDel(self._im)
+            except RuntimeError:
+                pass  # already gone (e.g. a prior rad.UtiDelAll) -> idempotent
+            self._im = None
+
+    def _solve_and_query(self, coil_current, *, zero_magnetization):
+        self.config.coil.current_A = coil_current
+        self._coils = build_coils(self.config)
+        self._cyclotron = BaseRadiaComponent.containerize([*self._iron_subs, self._coils])
+        cid = self._cyclotron.id
+
+        if self.rank <= 0 and self.verbosity >= 1:
+            print("Building Interaction Matrix...", flush=True)
+            t0 = time.time()
+        self._im = rad.RlxPre(cid)
+        if self.rank <= 0 and self.verbosity >= 1:
+            print(f"Done! Assembling took {time.time() - t0} s.", flush=True)
+            print("Solving...", flush=True)
+            t0 = time.time()
+        zerom = 'ZeroM->True' if zero_magnetization else 'ZeroM->False'
+        result = rad.RlxAuto(self._im, self.config.simulation.precision,
+                             self.config.simulation.iterations, 9, zerom, 'omega->0.3')
+        if self.rank <= 0 and self.verbosity >= 1:
+            print(f"Done! Auto-Relaxation took {time.time() - t0} s", flush=True)
+            print(f"target={self.config.simulation.precision}: "
+                  f"iter={result[3]:.0f}, misfitM={result[0]:.6e}", flush=True)
+
+        converged = (result[0] <= self.config.simulation.precision)
+        misfit = float(result[0])
+
+        num_angles = self.config.field_evaluation.num_points_circle
+        if self.config.field_evaluation.iso_method != "seo":
+            bz_values = get_median_plane_field_rz(
+                cid, self.radii_mm, num_angles,
+                use_symmetry=self.config.field_evaluation.use_symmetry,
+                rank=self.rank, comm=self.comm)
+        else:
+            bz_values = get_median_plane_field_2d(
+                self.config, cid, limit=400, resolution=1.0,
+                rank=self.rank, comm=self.comm)
+
+        return self.radii_mm, bz_values, converged, misfit
+
+
 def evaluate_radii_parallel(config: CyclotronConfig,
                             pole_shape: PoleShape,
                             radii_mm: List[float],
@@ -750,8 +864,9 @@ def evaluate_radii_parallel(config: CyclotronConfig,
     :param radii_mm: List of radii to evaluate (mm)
     :param rank: MPI rank (0 for sequential)
     :param verbosity
-    :return: Tuple of (radii_mm, bz_avg_values, converged_flag)
-                Note: bz_avg_values is empty list on non-rank-0 processes
+    :return: Tuple of (radii_mm, bz_values, converged_flag, cyclotron_id, misfit)
+                Note: bz_values is None on non-rank-0 processes; misfit is the achieved
+                relaxation misfit (result[0]), valid on all ranks.
     """
     if isinstance(radii_mm, np.ndarray):
         radii_mm = radii_mm.tolist()
@@ -783,6 +898,7 @@ def evaluate_radii_parallel(config: CyclotronConfig,
         print(f"\ntarget={config.simulation.precision}: iter={result[3]:.0f}, misfitM={result[0]:.6e}")
 
     converged = (result[0] <= config.simulation.precision)  # Note: first result item is precision reached
+    misfit = float(result[0])  # achieved relaxation misfit (for the optimizer's convergence gate)
 
     # Query all radii at once with single rad.Fld() call
     num_angles = config.field_evaluation.num_points_circle
@@ -802,4 +918,4 @@ def evaluate_radii_parallel(config: CyclotronConfig,
                                               rank=rank,
                                               comm=comm)
 
-    return radii_mm, bz_values, converged, cyclotron
+    return radii_mm, bz_values, converged, cyclotron, misfit

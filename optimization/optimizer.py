@@ -5,16 +5,22 @@ from typing import Tuple, List, Dict
 from scipy.optimize import minimize
 from tqdm import tqdm
 import os
+import time
 from datetime import datetime
 import csv
 
 from config_io.config import CyclotronConfig
 from optimization.objective_function import (
     evaluate_cyclotron_objective_simplified,
-    optimize_coil_final
+    optimize_coil_final,
+    solve_coil_for_target_frequency,
+    physics_precondition_offsets,
 )
 from optimization.constraints import get_optimization_bounds
 from visualization.optimization_progress import OptimizationProgressPlotter
+from simulation.field_calculator import ReusableCyclotronSolver
+from geometry.pole_shape import PoleShape
+from core.species import IonSpecies
 
 
 class CyclotronOptimizer:
@@ -38,10 +44,14 @@ class CyclotronOptimizer:
         self.check_convergence = check_convergence
         self.max_retries = max_retries
 
+        # Reproducibility: seed the global RNG used by multistart / random init.
+        np.random.seed(config.seed)
+
         # Best tracking per phase
         self.best_x = None
         self.actual_x = None
         self.best_y = None
+        self.worst_y = None
         self.best_y_per_multistart = {}
         self.iteration_count = 0
         self.latest_results = None
@@ -86,7 +96,8 @@ class CyclotronOptimizer:
             writer = csv.writer(f)
             header = (
                 ['phase', 'iteration', 'multistart', 'nelder_iter',
-                 'avg_frequency_mhz', 'flatness', 'regularization', 'objective'] +
+                 'avg_frequency_mhz', 'flatness', 'regularization', 'objective',
+                 'converged', 'misfit', 'eval_seconds'] +
                 [f'side_param_{i}' for i in range(self.n_side)] +
                 [f'top_param_{i}' for i in range(self.n_top)]
             )
@@ -105,7 +116,10 @@ class CyclotronOptimizer:
                 results['avg_f'],
                 results['flatness'],
                 results['regularization'],
-                results['objective']
+                results['objective'],
+                results.get('converged', ''),
+                results.get('misfit', ''),
+                results.get('eval_seconds', ''),
             ] + side_offsets.tolist() + top_offsets.tolist()
             writer.writerow(row)
 
@@ -124,6 +138,10 @@ class CyclotronOptimizer:
         - Phase 2: Optimize side shims for flatness
         - Phase 3: Optimize coil current for target frequency
         """
+
+        opt_name = (self.config.optimization.optimizer or 'nelder-mead').lower().replace('_', '-')
+        if opt_name in ('dfo-ls', 'dfols', 'least-squares'):
+            return self.optimize_joint_least_squares()
 
         # Determine which shims to optimize
         opt_top = self.config.optimization.opt_top
@@ -272,6 +290,219 @@ class CyclotronOptimizer:
         }
 
 
+    def optimize_joint_least_squares(self) -> Dict:
+        """Joint DFO-LS over ALL shims; the coil is nested to hold the mean frequency
+        on target inside every evaluation.
+
+        Minimizes the per-radius frequency residual vector r_i = f_rev(r_i) - f_target
+        (a nonlinear least-squares problem -- DFO-LS exploits that structure) over the
+        2*(num_rad_segments+1) shim parameters. For every shim vector the coil current
+        is re-solved so the mean frequency == target, so flatness is always measured at
+        the true operating (saturation) point; coil reuse keeps that affordable.
+
+        MPI-collective: rank 0 drives DFO-LS, ranks 1+ follow each shim vector (and its
+        nested coil solve). Returns the same dict shape as the three-phase optimize().
+        """
+        import time as _time
+        try:
+            import dfols
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError("DFO-LS is not installed in this env. `pip install DFO-LS`.") from exc
+
+        cfg = self.config
+        species = IonSpecies(cfg.particle_species)
+        target = cfg.optimization.target_frequency_mhz
+        bracket = (cfg.optimization.coil_current_min_A, cfg.optimization.coil_current_max_A)
+        seed_current = cfg.optimization.reference_coil_current
+        # Coil-match tolerances (df/dI ~ f/I): loose during optimization (fast; saturation
+        # stays correct), tight for the final production match. Mean-centered residuals make
+        # the loose match harmless to the flatness objective.
+        coil_match_tol = getattr(cfg.optimization, 'coil_match_tol_mhz', 0.05)
+        loose_xtol_A = max(1e-3, coil_match_tol * seed_current / target)
+        final_xtol_A = max(1e-4, cfg.optimization.frequency_tolerance_mhz * seed_current / target)
+        n_seg = cfg.side_shim.num_rad_segments
+        n = n_seg + 1
+
+        # Which shim blocks to optimize (respect opt_side / opt_top); default to both.
+        blocks = [b for b, flag in (('side', cfg.optimization.opt_side),
+                                    ('top', cfg.optimization.opt_top)) if flag]
+        if not blocks:
+            blocks = ['side', 'top']
+        # An optimized shim must exist in the geometry, else _build_pole zeros its offsets
+        # (making the parameters inert). Force include=True for the optimized blocks.
+        if 'side' in blocks and not cfg.side_shim.include:
+            if self.rank <= 0:
+                print("[DFO-LS] side_shim.include was False -> enabling it (required to optimize side shims)", flush=True)
+            cfg.side_shim.include = True
+        if 'top' in blocks and not cfg.top_shim.include:
+            if self.rank <= 0:
+                print("[DFO-LS] top_shim.include was False -> enabling it (required to optimize top shims)", flush=True)
+            cfg.top_shim.include = True
+
+        # Fixed (non-optimized) offsets come from config (or the default offset).
+        side_fixed = (np.array(cfg.side_shim.side_offsets_deg, dtype=float)
+                      if cfg.side_shim.side_offsets_deg is not None
+                      else np.full(n, cfg.side_shim.default_offset_deg))
+        top_fixed = (np.array(cfg.top_shim.top_offsets_mm, dtype=float)
+                     if cfg.top_shim.top_offsets_mm is not None
+                     else np.full(n, cfg.top_shim.default_offset_mm))
+
+        # Bounds + x0 for the optimized blocks only.
+        s_lo, s_hi = cfg.optimization.side_shim_min_deg, cfg.optimization.side_shim_max_deg
+        t_lo, t_hi = cfg.optimization.top_shim_min_mm, cfg.optimization.top_shim_max_mm
+
+        # x0 basis for the optimized blocks: physics preconditioner (optional) or config offsets.
+        if getattr(cfg.optimization, 'precondition', False):
+            # Split the gamma(r) B0 target across the optimized levers so side+top don't
+            # both provision the full rise (double-counting Bz(r)).
+            side_pre, top_pre = physics_precondition_offsets(cfg, n_iso_levers=len(blocks))
+            if self.rank <= 0 and self.verbosity >= 1:
+                print(f"[DFO-LS] starting from the physics preconditioner "
+                      f"(gamma(r) B0 target split across {len(blocks)} lever(s): {blocks})", flush=True)
+        else:
+            side_pre, top_pre = side_fixed, top_fixed
+
+        lo_list, hi_list, x0p = [], [], []
+        if 'side' in blocks:
+            lo_list += [s_lo] * n; hi_list += [s_hi] * n; x0p += list(np.clip(side_pre, s_lo, s_hi))
+        if 'top' in blocks:
+            lo_list += [t_lo] * n; hi_list += [t_hi] * n; x0p += list(np.clip(top_pre, t_lo, t_hi))
+        lo = np.array(lo_list, dtype=float)
+        hi = np.array(hi_list, dtype=float)
+        x0 = np.clip((np.array(x0p, dtype=float) - lo) / (hi - lo), 0.0, 1.0)
+        n_params = len(lo)
+
+        def _split(x_phys):
+            """Reconstruct full (side, top) offset arrays from the optimized subvector."""
+            side, top, i = side_fixed.copy(), top_fixed.copy(), 0
+            if 'side' in blocks:
+                side = x_phys[i:i + n]; i += n
+            if 'top' in blocks:
+                top = x_phys[i:i + n]
+            return side, top
+
+        solver = ReusableCyclotronSolver(cfg, self.radii_mm, rank=self.rank,
+                                         comm=self.comm, verbosity=self.verbosity)
+        best = {'norm': np.inf, 'x': None, 'coil': None, 'flatness': -1.0, 'bz': None, 'freq': None}
+        last_coil = [seed_current]   # warm-start the inner coil solve across outer iterations
+
+        # Optional live 3-panel progress plot (rank 0 only; degrade gracefully if headless).
+        plotter = None
+        if self.rank <= 0 and getattr(cfg.visualization, 'live_plot', False):
+            try:
+                from visualization.optimization_progress import DFOLSProgressPlotter
+                plotter = DFOLSProgressPlotter()
+                plotter.setup(inner_radius_mm=cfg.pole.inner_radius_mm,
+                              outer_radius_mm=cfg.pole.outer_radius_mm,
+                              half_angle_deg=cfg.pole.full_angle_deg / 2.0,
+                              n_seg=n_seg, target_frequency=target)
+            except Exception as exc:
+                print(f"[DFO-LS] live plot disabled ({exc})", flush=True)
+                plotter = None
+
+        def _evaluate(x_norm, xtol_A):
+            side, top = _split(lo + x_norm * (hi - lo))
+            pole = PoleShape(n_seg, side_offsets=side, top_offsets=top)
+            solver.build(pole, last_coil[0])
+            coil, iso, converged, misfit = solve_coil_for_target_frequency(
+                solver, cfg, species, target, bracket,
+                rank=self.rank, comm=self.comm, verbosity=self.verbosity,
+                seed_current=last_coil[0], xtol_A=xtol_A)
+            last_coil[0] = coil
+            return coil, iso, converged, misfit
+
+        if self.rank <= 0:
+            self.iteration_count = 0
+            if self.verbosity >= 1:
+                print(f"\n{'=' * 100}\nJOINT DFO-LS SHIM OPTIMIZATION "
+                      f"({n_params} params, {len(self.radii_mm)} residuals)\n{'=' * 100}\n", flush=True)
+
+            def residual(x_norm):
+                nonlocal plotter
+                x_norm = np.asarray(x_norm, dtype=float)
+                self.comm.bcast((x_norm, loose_xtol_A), root=0)   # ranks 1+ evaluate this shim vector
+                t0 = _time.time()
+                coil, iso, converged, misfit = _evaluate(x_norm, loose_xtol_A)
+                self.iteration_count += 1
+                f = np.asarray(iso['rev_frequencies_mhz'], dtype=float)
+                # mean-centered residual = pure flatness, decoupled from coil-match precision
+                r = f - f.mean()
+                nrm = float(np.linalg.norm(r))
+                if nrm < best['norm']:
+                    best.update(norm=nrm, x=x_norm.copy(), coil=coil, flatness=iso['std_dev_mhz'],
+                                bz=np.asarray(iso['bz_for_plot'], dtype=float), freq=f.copy())
+                side_full, top_full = _split(lo + x_norm * (hi - lo))
+                self._write_diagnostics_row(
+                    0, 0, self.iteration_count,
+                    {'avg_f': iso['mean_freq_mhz'], 'flatness': iso['std_dev_mhz'],
+                     'regularization': 0.0, 'objective': nrm ** 2,
+                     'converged': converged, 'misfit': misfit,
+                     'eval_seconds': _time.time() - t0},
+                    side_full, top_full)
+                if self.verbosity >= 1:
+                    print(f"  [DFO-LS eval {self.iteration_count}] coil={coil:.0f}A "
+                          f"flatness={iso['std_dev_mhz']:.5f} MHz ||r||={nrm:.5f} "
+                          f"(best {best['norm']:.5f})", flush=True)
+                if plotter is not None:
+                    try:
+                        cside, ctop = _split(lo + x_norm * (hi - lo))
+                        bside, btop = _split(lo + np.asarray(best['x'], dtype=float) * (hi - lo))
+                        plotter.update(eval_idx=self.iteration_count,
+                                       side_cur=cside, top_cur=ctop, side_best=bside, top_best=btop,
+                                       radii=np.asarray(self.radii_mm, dtype=float),
+                                       bz_cur=np.asarray(iso['bz_for_plot'], dtype=float), freq_cur=f,
+                                       bz_best=best['bz'], freq_best=best['freq'],
+                                       obj_cur=float(iso['std_dev_mhz']), obj_best=best['flatness'], coil=coil)
+                    except Exception as exc:
+                        print(f"[DFO-LS] live plot update failed, disabling ({exc})", flush=True)
+                        plotter = None
+                return r
+
+            maxfun = max(cfg.optimization.max_iterations, n_params + 2)
+            soln = dfols.solve(
+                residual, x0,
+                bounds=(np.zeros(n_params), np.ones(n_params)),
+                maxfun=maxfun, rhobeg=0.1, rhoend=1e-3,
+            )
+            # Final high-accuracy coil match at the best shims -> production current + flatness.
+            if best['x'] is not None:
+                self.comm.bcast((np.asarray(best['x'], dtype=float), final_xtol_A), root=0)
+                coil_f, iso_f, _, _ = _evaluate(np.asarray(best['x'], dtype=float), final_xtol_A)
+                best.update(coil=coil_f, flatness=iso_f['std_dev_mhz'])
+            self.comm.bcast(None, root=0)   # stop ranks 1+
+            if self.verbosity >= 1:
+                print(f"\nDFO-LS finished ({soln.flag}) after {self.iteration_count} evals; "
+                      f"final tight match: coil={best['coil']:.0f}A, "
+                      f"flatness={best['flatness']:.5f} MHz", flush=True)
+            if plotter is not None:
+                plotter.finalize(savepath=os.path.join(
+                    self.output_dir, f'dfols_progress_{self.timestamp}.png'))
+        else:
+            while True:
+                msg = self.comm.bcast(None, root=0)
+                if msg is None:
+                    break
+                x_norm, xtol_A = msg
+                _evaluate(np.asarray(x_norm, dtype=float), xtol_A)
+
+        solver.dispose()
+
+        best_x = self.comm.bcast(best['x'] if self.rank <= 0 else None, root=0)
+        best_coil = self.comm.bcast(best['coil'] if self.rank <= 0 else None, root=0)
+        best_flatness = self.comm.bcast(best['flatness'] if self.rank <= 0 else None, root=0)
+
+        best_side, best_top = _split(lo + np.asarray(best_x, dtype=float) * (hi - lo))
+        return {
+            'best_side_shims': best_side,
+            'best_top_shims': best_top,
+            'flatness_phase1': -1,
+            'flatness_phase2': best_flatness,
+            'optimal_coil': best_coil,
+            'coil_error': -1,
+            'n_coil_evals': 0,
+            'diagnostics_file': self.diagnostics_file if self.rank <= 0 else None,
+        }
+
     def optimize_phase(self,
                        phase: int,
                        param_type: str,
@@ -299,6 +530,7 @@ class CyclotronOptimizer:
 
         self.iteration_count = 0
         self.best_y = None
+        self.worst_y = None
         self.best_x = None
         self.plateau_counter = 0
         self.best_y_per_multistart = {}
@@ -371,7 +603,7 @@ class CyclotronOptimizer:
                         'xatol': 1e-4,
                         'fatol': 1e-6,
                         'adaptive': True,
-                        'initial_simplex': self._get_initial_simplex(x0, scale=0.5)
+                        'initial_simplex': self._get_initial_simplex(x0, scale=0.1)
                     }
                 )
 
@@ -482,6 +714,7 @@ class CyclotronOptimizer:
         x_surface_full = self.comm.bcast(x_surface_full, root=0)
 
         # Evaluate
+        t_eval0 = time.time()
         for attempt in range(self.max_retries + 1):
             try:
                 objective, results_dict = evaluate_cyclotron_objective_simplified(
@@ -501,10 +734,17 @@ class CyclotronOptimizer:
                         print(f"[RANK {self.rank}] Attempt {attempt + 1} failed, retrying", flush=True)
                     continue
                 else:
-                    return 1e6
+                    # Finite, ordered penalty (not an infinite cliff) so a failed
+                    # build/solve does not wreck the simplex / trust-region geometry.
+                    return 1e3 if self.worst_y is None else max(1e3, 10.0 * self.worst_y)
+
+        eval_seconds = time.time() - t_eval0
 
         # Rank 0: Track best
         if self.rank <= 0:
+            results_dict['eval_seconds'] = eval_seconds
+            self.worst_y = objective if self.worst_y is None else max(self.worst_y, objective)
+
             if self.best_y is None or objective < self.best_y:
                 self.best_y = objective
                 self.best_x = x_phase_phys

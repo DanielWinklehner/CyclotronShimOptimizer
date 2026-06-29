@@ -16,11 +16,11 @@ field_evaluation:
   num_points_circle: 360
   radius_min_mm: 75.0
   radius_max_mm: 350.0
-  n_eval_pts: 12
+  n_eval_pts: 36  # >= shim params (30) so the least-squares is over-determined + less grid-overfitting (was 12)
   use_symmetry: true  # Exploit 8-fold symmetry
   save_median_plane_field:  false
   save_bore_field: false
-  iso_method: "seo"  # can be "circle" (default), "seo", or "gordon"
+  iso_method: "gordon"  # can be "circle" (default), "seo", or "gordon"
 
 # Geometry Parameters
 yoke:
@@ -58,20 +58,20 @@ pole:
   outer_radius_mm: 400.0
   inner_radius_mm: 50.0
   max_mesh_size: 50
-  height_mm: 230.0  # 235 originally, but top shim is min 5 mm
+  height_mm: 235.0  # 235 originally, but top shim is min 5 mm
   full_angle_deg: 20.0  # 25 originally, but side shim is min 5 deg
   angular_resolution_deg: 2.5  # Angular segment length for arc approximation (deg)
   segmentation: [10, 1, 15]  # Number of [r, theta, z] segments (cylindrical)
-  stp_filename: "D:\\MIT Dropbox\\Daniel Winklehner\\Projects\\Muon Reacceleration\\CAD\\uCyclo_v2\\uCyclo_v2_ShimmedPole.stp"
+#  stp_filename: "D:\\MIT Dropbox\\Daniel Winklehner\\Projects\\Muon Reacceleration\\CAD\\uCyclo_v2\\uCyclo_v2_ShimmedPole.stp"
 
 # Shimming
 side_shim:
-  include: false
+  include: true
   num_rad_segments: 14  # number of radial segments along the pole edge
   angular_resolution_deg: 2.5  # Angular segment length for arc approximation (deg)
   default_offset_deg: 5.0  # deg
 #  side_offsets_deg: [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
-  side_offsets_deg: [5.508060939922671, 5.268477357516903, 5.436617667869364, 7.5841071276073055, 8.066780216206357, 8.718783547230036, 7.380032674047312, 5.523226584838598, 5.0, 5.432610851746398, 5.830951485545202, 6.643234287427298, 6.668676693680339, 7.721763013636222, 11.102593035254122]
+#  side_offsets_deg: [5.508060939922671, 5.268477357516903, 5.436617667869364, 7.5841071276073055, 8.066780216206357, 8.718783547230036, 7.380032674047312, 5.523226584838598, 5.0, 5.432610851746398, 5.830951485545202, 6.643234287427298, 6.668676693680339, 7.721763013636222, 11.102593035254122]
   segmentation: [3, 1, 20]  # Number of [r, theta, z] segments (cylindrical)
 
 top_shim:
@@ -80,7 +80,7 @@ top_shim:
   angular_resolution_deg: 1.25 # Angular segment length for arc approximation (deg)
   default_offset_mm: 5.0  # mm
 #  top_offsets_mm: [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
-  top_offsets_mm: [5.0,5.0,5.873,6.809,7.711,10.969,11.965,16.039,17.790,18.739,18.884,20.0,20.0,20.0,20.0]
+#  top_offsets_mm: [5.0,5.0,5.873,6.809,7.711,10.969,11.965,16.039,17.790,18.739,18.884,20.0,20.0,20.0,20.0]
   segmentation: [3, 1, 1]  # Number of [r, theta, z] subdivisions (note that arc approximation already segments in theta)
 # --- #
 
@@ -130,13 +130,16 @@ optimization:
   n_initial_points: 1  # Initial random sample in Bayesian, or number of multistarts in Nelder-Mead
   reference_coil_current: 15368
   regularization_weight: 0.0  # Penalty for jagged shim shapes
+  convergence_penalty_weight: 1.0  # MHz penalty per unit relaxation-misfit shortfall (continuous convergence gate)
+  precondition: true  # DFO-LS x0 from the physics preconditioner (top & side both ~ gamma(r): gap & hill-duty-cycle -> B0)
+  coil_match_tol_mhz: 0.05  # loose coil/freq match DURING optimization; final match uses frequency_tolerance_mhz
   random_init: false
   opt_top: false
   opt_side: true
   opt_coil: true
   # Optimizer choice
   # nelder-mead, more to come?
-  optimizer: 'nelder-mead'
+  optimizer: 'dfo-ls'  # 'nelder-mead'
 
 # Visualization
 visualization:

@@ -128,6 +128,38 @@ def _extract_tet_coords() -> List[List[List[float]]]:
     return tets
 
 
+def _resolve_comm(comm: Any):
+    """Return the given comm, or fall back to MPI.COMM_WORLD when MPI is initialized.
+
+    Guards the comm=None trap: under a real multi-rank launch a None comm would make
+    every rank mesh independently (divergent radia ids). Falling back to COMM_WORLD
+    ensures the rank-0-mesh + broadcast path is used. Returns None only when MPI is not
+    initialized (genuine single-process / standalone use).
+    """
+    if comm is not None:
+        return comm
+    try:
+        from mpi4py import MPI
+        if MPI.Is_initialized():
+            return MPI.COMM_WORLD
+    except Exception:
+        pass
+    return None
+
+
+def _pin_gmsh_determinism() -> None:
+    """Pin gmsh to single-threaded Delaunay so meshing is reproducible run-to-run
+    (defense-in-depth for any per-rank meshing path)."""
+    import gmsh
+    for name, val in (("General.NumThreads", 1),
+                      ("Mesh.MaxNumThreads3D", 1),
+                      ("Mesh.Algorithm3D", 1)):  # 1 = Delaunay (single-threaded)
+        try:
+            gmsh.option.setNumber(name, val)
+        except Exception:
+            pass
+
+
 # -----------------------------
 # Material wrapper
 # -----------------------------
@@ -338,6 +370,45 @@ class BaseRadiaComponent:
             out.append(child)
         return out
 
+    def _forget_child(self, child_id: int) -> None:
+        """Drop a child from this container's bookkeeping (after the child is disposed)."""
+        self._children_cache.pop(child_id, None)
+        self._child_ids = [cid for cid in self._child_ids if cid != child_id]
+
+    def dispose(self, *, deep: bool = False) -> None:
+        """Delete this component's radia object (``rad.UtiDel``).
+
+        Radia objects are reference-counted handles; ``UtiDel`` removes only THIS
+        object's key from the global table -- it does NOT cascade. Hence:
+          - deep=False (default): delete only this object. Children keep their own
+            keys (they survive); each child's parent pointer is reset so a survivor
+            can be re-containerized into a fresh parent. Use on a top container whose
+            members you want to keep (e.g. swap the coils, reuse the iron).
+          - deep=True: dispose every child first, then this object. Use on a
+            throwaway sub-container (e.g. the coils) to also free its leaf objects.
+        Idempotent. After disposal ``id`` is None.
+        """
+        if self._id is None:
+            return
+        if deep:
+            for child in self.get_children():
+                child.dispose(deep=True)
+        else:
+            for child in list(self._children_cache.values()):
+                child._parent = None
+        try:
+            _call_radia("UtiDel", self._id)
+        except RuntimeError:
+            # Key already gone (e.g. a prior rad.UtiDelAll wiped it) -> idempotent.
+            pass
+        if self._parent is not None:
+            self._parent._forget_child(self._id)
+            self._parent = None
+        self._children_cache.clear()
+        self._child_ids = []
+        self._is_container = False
+        self._id = None
+
     def transform(self, *args: Any, **kwargs: Any) -> None:
         raise NotImplementedError("transform() is not implemented yet.")
 
@@ -536,6 +607,7 @@ class MagnetizedComponent(BaseRadiaComponent):
         mesh_size_max: Optional[float] = None,
         gmsh_terminal_output: bool = False,
         model_name: Optional[str] = None,
+        comm: Any = None,
         symmetries: Optional[SymmetryInput] = None,
         material: Optional[RadiaMaterial] = None,
         color: Optional[Sequence[float]] = None,
@@ -552,64 +624,50 @@ class MagnetizedComponent(BaseRadiaComponent):
         except Exception as exc:  # pragma: no cover
             raise RadiaComponentError("gmsh is required for from_stp(...).") from exc
 
-        tet_ids: List[int] = []
-        gmsh.initialize()
-        try:
-            gmsh.option.setNumber("General.Terminal", 1 if gmsh_terminal_output else 0)
-            gmsh.model.add(model_name or path.stem)
-            gmsh.merge(str(path))
-            gmsh.model.occ.synchronize()
+        # MPI-safe (mirrors from_gmsh_occ): mesh the STP on rank 0 only and broadcast the
+        # tet vertex list, so every rank builds identical radia ids. comm falls back to
+        # MPI.COMM_WORLD when MPI is initialized (see _resolve_comm).
+        comm = _resolve_comm(comm)
+        rank = comm.Get_rank() if comm is not None else 0
 
-            if mesh_size_min is not None:
-                gmsh.option.setNumber("Mesh.MeshSizeMin", float(mesh_size_min))
-            if mesh_size_max is not None:
-                gmsh.option.setNumber("Mesh.MeshSizeMax", float(mesh_size_max))
+        tet_coords: Optional[List[List[List[float]]]] = None
+        if rank <= 0:
+            gmsh.initialize()
+            try:
+                gmsh.option.setNumber("General.Terminal", 1 if gmsh_terminal_output else 0)
+                _pin_gmsh_determinism()
+                gmsh.model.add(model_name or path.stem)
+                gmsh.merge(str(path))
+                gmsh.model.occ.synchronize()
+                if mesh_size_min is not None:
+                    gmsh.option.setNumber("Mesh.MeshSizeMin", float(mesh_size_min))
+                if mesh_size_max is not None:
+                    gmsh.option.setNumber("Mesh.MeshSizeMax", float(mesh_size_max))
+                gmsh.model.mesh.generate(3)
+                tet_coords = _extract_tet_coords()
+            finally:
+                gmsh.finalize()
 
-            gmsh.model.mesh.generate(3)
+        if comm is not None:
+            tet_coords = comm.bcast(tet_coords, root=0)
 
-            node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
-            tag_to_xyz: Dict[int, Vertex] = {}
-            for i, tag in enumerate(node_tags):
-                j = 3 * i
-                tag_to_xyz[int(tag)] = (
-                    float(node_coords[j]),
-                    float(node_coords[j + 1]),
-                    float(node_coords[j + 2]),
-                )
+        if not tet_coords:
+            raise RadiaComponentError("No tetrahedra converted into radia objects.")
 
-            elem_types, _, elem_node_tags = gmsh.model.mesh.getElements(dim=3)
+        tet_ids = [_tet_to_polyhedron(t) for t in tet_coords]
+        container_id = _validate_radia_id(_call_radia("ObjCnt", tet_ids), "container_id")
 
-            for elem_type, conn in zip(elem_types, elem_node_tags):
-                name, _, _, num_nodes, _, _ = gmsh.model.mesh.getElementProperties(elem_type)
-                if "tetra" not in name.lower():
-                    continue
-
-                for i in range(0, len(conn), num_nodes):
-                    local_nodes = conn[i : i + num_nodes]
-                    corner_tags = local_nodes[:4]
-                    vertices = [tag_to_xyz[int(n)] for n in corner_tags]
-                    rid = _tet_to_polyhedron(vertices)
-                    tet_ids.append(_validate_radia_id(rid, "tet id"))
-
-            if len(tet_ids) == 0:
-                raise RadiaComponentError("No tetrahedra converted into radia objects.")
-
-            container_id = _call_radia("ObjCnt", tet_ids)
-            container_id = _validate_radia_id(container_id, "container_id")
-
-            return MagnetizedComponent(
-                container_id,
-                child_ids=tet_ids,
-                is_container=True,
-                symmetries=symmetries,
-                material=material,
-                color=color,
-                apply_sym=apply_sym,
-                apply_mat=apply_mat,
-                apply_color=apply_color,
-            )
-        finally:
-            gmsh.finalize()
+        return cls(
+            container_id,
+            child_ids=tet_ids,
+            is_container=True,
+            symmetries=symmetries,
+            material=material,
+            color=color,
+            apply_sym=apply_sym,
+            apply_mat=apply_mat,
+            apply_color=apply_color,
+        )
 
     @classmethod
     def from_gmsh_occ(
@@ -643,6 +701,7 @@ class MagnetizedComponent(BaseRadiaComponent):
         except Exception as exc:  # pragma: no cover
             raise RadiaComponentError("gmsh is required for from_gmsh_occ(...).") from exc
 
+        comm = _resolve_comm(comm)
         rank = comm.Get_rank() if comm is not None else 0
 
         tet_coords: Optional[List[List[List[float]]]] = None
@@ -650,6 +709,7 @@ class MagnetizedComponent(BaseRadiaComponent):
             gmsh.initialize()
             try:
                 gmsh.option.setNumber("General.Verbosity", gmsh_verbosity)
+                _pin_gmsh_determinism()
                 gmsh.model.add(model_name)
                 occ_builder()
                 gmsh.model.occ.synchronize()

@@ -28,7 +28,7 @@ from geometry.pole_shape import PoleShape
 from geometry.inventor_export import InventorPoleExporter
 
 from simulation.field_calculator import evaluate_radii_parallel, save_median_plane_field, save_3d_field
-from visualization.plots import plot_isochronism_results, plot_isochronism_metric
+from visualization.plots import plot_isochronism_results, plot_isochronism_metric, plot_final_summary
 from core.species import IonSpecies
 from optimization.optimizer import CyclotronOptimizer
 from core.isochronicity import compute_isochronism
@@ -154,11 +154,14 @@ def main(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = 
             print(flush=True)
 
     if test_geometry:
-        if rank <= 0:
-            # Build geometry on rank 0 only
-            rad.UtiDelAll()
-            cyclotron_vis = build_geometry(config, pole_shape, rank=rank, comm=comm, omit_symmetry=True, verbosity=verbosity).id
+        # Build COLLECTIVELY: build_geometry -> from_gmsh_occ/from_stp mesh on rank 0 and
+        # broadcast, so every rank must call it (else rank 0 hangs forever in the bcast).
+        # Only the visualization is rank-0-only.
+        rad.UtiDelAll()
+        cyclotron_vis = build_geometry(config, pole_shape, rank=rank, comm=comm,
+                                       omit_symmetry=True, verbosity=verbosity).id
 
+        if rank <= 0:
             ObjDrwPyVista(cyclotron_vis)
             # rad.ObjDrwOpenGL(cyclotron_vis)
 
@@ -193,7 +196,7 @@ def main(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = 
 
         config.coil.current_A = coil_current
 
-        radii_out, bz_values, converged, cyclo_id = evaluate_radii_parallel(
+        radii_out, bz_values, converged, cyclo_id, _ = evaluate_radii_parallel(
             config, pole_shape, radii_mm,
             rank=rank, comm=comm
         )
@@ -218,6 +221,7 @@ def main(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = 
     # ========== ENERGY AND FREQUENCY CALCULATION (Rank 0 only) ==========
     energies_mev = rev_times_s = rev_frequencies_mhz = None
     mean_freq_mhz = std_dev_mhz = percent_dev = None
+    tunes = None
 
     # bz_values is a (Nr, Ntheta) array for circle/gordon or a PyPATools Field for seo,
     # and is None on non-root ranks -- so test identity, not len().
@@ -238,6 +242,7 @@ def main(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = 
             mean_freq_mhz = iso['mean_freq_mhz']
             std_dev_mhz = iso['std_dev_mhz']
             percent_dev = iso['percent_dev']
+            tunes = iso.get('tunes')
 
             # SEO returns the tracked orbits -> show them
             if iso['orbits'] is not None:
@@ -291,6 +296,14 @@ def main(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = 
                 std_dev_mhz,
                 percent_dev,
                 show=False
+            )
+
+            # Plot 3: Final 4-panel design summary (Bz+Energy, frequency, tunes, flutter)
+            fig3, ax3 = plot_final_summary(
+                radii_out, bz_values, energies_mev, rev_frequencies_mhz, tunes,
+                target_freq_mhz=config.optimization.target_frequency_mhz,
+                title=f"Final design summary: {config.particle_species.capitalize()}",
+                show=False,
             )
 
             if config.visualization.comsol_filename is not None:
