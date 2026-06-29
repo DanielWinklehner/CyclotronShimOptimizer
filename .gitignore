@@ -2,3 +2,7 @@
 /output/
 /.idea/
 generate_md.py
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
