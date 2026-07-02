@@ -1,7 +1,18 @@
 """Main entry point for cyclotron optimizer with MPI support."""
+import os
+# gmsh (the conda-forge *_intel build) links the LLVM OpenMP runtime
+# (libomp140.x86_64.dll), while MKL-backed numpy/scipy link Intel's libiomp5md.dll.
+# When the field calc loads both into one process you get:
+#   OMP: Error #15: Initializing libiomp5md.dll, but found libomp140.x86_64.dll
+#   already initialized.
+# --geo_test never runs the threaded MKL math, so it only shows up on a full run.
+# Forcing MKL to a non-OpenMP threading layer means the second OpenMP runtime is
+# never loaded, avoiding the clash. Must run before gmsh/numpy/mkl are imported.
+os.environ.setdefault("MKL_THREADING_LAYER", "SEQUENTIAL")
+
 import gmsh
 import radia as rad
-rad.UtiMPI('on')
+
 import os
 import sys
 import time

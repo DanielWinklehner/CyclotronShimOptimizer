@@ -7,10 +7,10 @@ from typing import Dict, Any, List, Optional
 import sys
 
 
-# Add radialib to path for radia
-RADIA_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'radialib')
-if RADIA_PATH not in sys.path:
-    sys.path.insert(0, RADIA_PATH)
+# # Add radialib to path for radia
+# RADIA_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'radialib')
+# if RADIA_PATH not in sys.path:
+#     sys.path.insert(0, RADIA_PATH)
 
 
 @dataclass
@@ -167,6 +167,14 @@ class OptimizationConfig:
     convergence_penalty_weight: Optional[float] = 1.0
     precondition: Optional[bool] = False
     coil_match_tol_mhz: Optional[float] = 0.05
+    # DFO-LS solver knobs (joint least-squares path). Defaults preserve prior behavior.
+    # rhoend should sit ABOVE the mesh-quantization dead zone (~0.026 norm at mesh=50) or
+    # the trust region collapses into a zero-gradient pocket and the optimizer quits early.
+    dfols_rhobeg: Optional[float] = 0.1
+    dfols_rhoend: Optional[float] = 1e-3
+    dfols_maxfun: Optional[int] = None  # None -> max(max_iterations, n_params + 2)
+    dfols_objfun_has_noise: Optional[bool] = False   # enables (soft) restarts + gentler termination
+    dfols_seek_global_minimum: Optional[bool] = False  # hard restarts via user_params (global search)
 
 
 @dataclass
@@ -368,6 +376,11 @@ class CyclotronConfig:
                 'convergence_penalty_weight': self.optimization.convergence_penalty_weight,
                 'precondition': self.optimization.precondition,
                 'coil_match_tol_mhz': self.optimization.coil_match_tol_mhz,
+                'dfols_rhobeg': self.optimization.dfols_rhobeg,
+                'dfols_rhoend': self.optimization.dfols_rhoend,
+                'dfols_maxfun': self.optimization.dfols_maxfun,
+                'dfols_objfun_has_noise': self.optimization.dfols_objfun_has_noise,
+                'dfols_seek_global_minimum': self.optimization.dfols_seek_global_minimum,
                 'side_shim_min_deg': self.optimization.side_shim_min_deg,
                 'side_shim_max_deg': self.optimization.side_shim_max_deg,
                 'top_shim_min_mm': self.optimization.top_shim_min_mm,

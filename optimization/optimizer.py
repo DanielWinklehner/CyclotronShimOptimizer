@@ -458,12 +458,34 @@ class CyclotronOptimizer:
                         plotter = None
                 return r
 
-            maxfun = max(cfg.optimization.max_iterations, n_params + 2)
-            soln = dfols.solve(
-                residual, x0,
+            opt = cfg.optimization
+            maxfun = (opt.dfols_maxfun if getattr(opt, 'dfols_maxfun', None)
+                      else max(opt.max_iterations, n_params + 2))
+            rhobeg = float(getattr(opt, 'dfols_rhobeg', 0.1) or 0.1)
+            rhoend = float(getattr(opt, 'dfols_rhoend', 1e-3) or 1e-3)
+            has_noise = bool(getattr(opt, 'dfols_objfun_has_noise', False))
+            seek_global = bool(getattr(opt, 'dfols_seek_global_minimum', False))
+            # DFO-LS 1.6.5 has NO seek_global_minimum kwarg; global behavior = hard restarts
+            # via user_params. objfun_has_noise on its own enables (soft) restarts.
+            user_params = {}
+            if seek_global:
+                user_params.update({
+                    'restarts.use_restarts': True,
+                    'restarts.use_soft_restarts': False,   # hard restarts explore -> global
+                    'restarts.max_unsuccessful_restarts': 20,
+                    'restarts.increase_npt': True,
+                })
+            solve_kwargs = dict(
                 bounds=(np.zeros(n_params), np.ones(n_params)),
-                maxfun=maxfun, rhobeg=0.1, rhoend=1e-3,
+                maxfun=maxfun, rhobeg=rhobeg, rhoend=rhoend,
+                objfun_has_noise=has_noise,
             )
+            if user_params:
+                solve_kwargs['user_params'] = user_params
+            if self.verbosity >= 1:
+                print(f"[DFO-LS] rhobeg={rhobeg} rhoend={rhoend} maxfun={maxfun} "
+                      f"objfun_has_noise={has_noise} seek_global_minimum={seek_global}", flush=True)
+            soln = dfols.solve(residual, x0, **solve_kwargs)
             # Final high-accuracy coil match at the best shims -> production current + flatness.
             if best['x'] is not None:
                 self.comm.bcast((np.asarray(best['x'], dtype=float), final_xtol_A), root=0)
