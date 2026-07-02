@@ -255,16 +255,17 @@ cyclotron_id, pole_id = build_geometry(
 
 # Evaluate B-field
 radii_mm = np.linspace(50, 400, 50)
-radii_out, bz_values, converged, cyclotron_id = evaluate_radii_parallel(
+radii_out, bz_values, converged, cyclotron, misfit = evaluate_radii_parallel(
     config,
     pole_shape,
     radii_mm.tolist(),
-    rank=0,
-    use_cache=False
+    rank=0
 )
 
+# bz_values is an RZFieldGrid (circle/gordon) or a PyPATools Field (seo);
+# cyclotron is the assembled geometry component (cyclotron.id = radia id)
 print(f"Convergence: {converged}")
-print(f"B-field range: {min(bz_values):.4f} to {max(bz_values):.4f} T")
+print(f"B-field range: {bz_values.bz.min():.4f} to {bz_values.bz.max():.4f} T")
 ```
 
 ## Troubleshooting

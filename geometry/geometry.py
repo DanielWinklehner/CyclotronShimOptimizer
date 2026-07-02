@@ -28,9 +28,12 @@ from geometry.components import (
 )
 from geometry import gmsh_builders as gb
 
-# 8-fold cyclotron symmetry of the iron, as (kind, point, normal). Identical to
-# simulation.field_calculator.model_symmetries so the same set can be reused for
-# GPU field evaluation.
+# 8-fold cyclotron symmetry of the iron, as (kind, point, normal). This is the
+# single source of truth: it is applied to the symmetric iron and declared on
+# the coil pair, and the field evaluator picks it up from the component
+# metadata (never from this global). A future config schema may supply these
+# per component instead (see the planned components/materials/symmetries
+# config migration).
 CYCLOTRON_SYMMETRIES = [
     ("perp", [0, 0, 0], [1, -1, 0]),  # mirror across x=y diagonal
     ("perp", [0, 0, 0], [1, 0, 0]),   # mirror across x=0 plane
@@ -155,6 +158,14 @@ def build_coils(config: CyclotronConfig) -> CurrentCarryingComponent:
 
     The coil current is read from ``config.coil.current_A`` at build time, so the
     coil-current inner loop rebuilds this (cheap, unmeshed) sub-container per current.
+
+    The PAIR's field is symmetric under every vertical mirror through the axis
+    and under the z=0 midplane mirror (equal currents at +/-z), so the full
+    cyclotron symmetry set is DECLARED on the container (metadata only, no
+    radia transforms) -- the field evaluator uses it to fold the coil field
+    together with the symmetric iron. Note the individual coils are NOT
+    z-mirror symmetric; only the pair is, hence the declaration on the
+    container and not on the members.
     """
     cfg = config.coil
     z_off = cfg.midplane_dist + 0.5 * cfg.height_mm
@@ -165,7 +176,9 @@ def build_coils(config: CyclotronConfig) -> CurrentCarryingComponent:
     )
     coil_lower = Coil(center=(0.0, 0.0, z_off), **common)
     coil_upper = Coil(center=(0.0, 0.0, -z_off), **common)
-    return CurrentCarryingComponent.containerize([coil_lower, coil_upper])
+    coils = CurrentCarryingComponent.containerize([coil_lower, coil_upper])
+    coils.declare_symmetries(CYCLOTRON_SYMMETRIES)
+    return coils
 
 
 def build_iron(

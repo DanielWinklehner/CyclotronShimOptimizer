@@ -31,7 +31,16 @@ class FieldEvaluationConfig:
     save_median_plane_field: Optional[bool] = False
     median_plane_field_output: Optional[str] = None
     save_bore_field: Optional[bool] = False
+    bore_field_output: Optional[str] = None
     iso_method: Optional[str] = "circle"
+    # Median-plane map extent/resolution (seo isochronism input + midplane save)
+    median_plane_limit_mm: float = 400.0
+    median_plane_resolution_mm: float = 1.0
+    # 3D bore-field map domain (x, y in [-limit, limit], z in [z_min, z_max])
+    bore_xy_limit_mm: float = 50.0
+    bore_z_min_mm: float = -100.0
+    bore_z_max_mm: float = 25.0
+    bore_resolution_mm: float = 0.5
 
 @dataclass
 class YokeConfig:
@@ -182,6 +191,13 @@ class VisualizationConfig:
     show_opengl: bool
     comsol_filename: Optional[str] = None
     live_plot: Optional[bool] = True
+    # Median-plane Bz visualization: always makes a 2D matplotlib contour plot;
+    # with show_opengl also overlaid as a semi-transparent plane in the 3D viewer.
+    show_median_plane_field: Optional[bool] = False
+    # Resolution of the DISPLAY map [mm]; None falls back to
+    # field_evaluation.median_plane_resolution_mm (which also feeds the seo
+    # solver, so keep that one fine and relax only this).
+    field_map_resolution_mm: Optional[float] = 2.0
 
 
 @dataclass
@@ -260,8 +276,16 @@ class CyclotronConfig:
                 'n_eval_pts': self.field_evaluation.n_eval_pts,
                 'use_symmetry':  self.field_evaluation.use_symmetry,
                 'save_median_plane_field': self.field_evaluation.save_median_plane_field,
+                'median_plane_field_output': self.field_evaluation.median_plane_field_output,
                 'save_bore_field': self.field_evaluation.save_bore_field,
+                'bore_field_output': self.field_evaluation.bore_field_output,
                 'iso_method': self.field_evaluation.iso_method,
+                'median_plane_limit_mm': self.field_evaluation.median_plane_limit_mm,
+                'median_plane_resolution_mm': self.field_evaluation.median_plane_resolution_mm,
+                'bore_xy_limit_mm': self.field_evaluation.bore_xy_limit_mm,
+                'bore_z_min_mm': self.field_evaluation.bore_z_min_mm,
+                'bore_z_max_mm': self.field_evaluation.bore_z_max_mm,
+                'bore_resolution_mm': self.field_evaluation.bore_resolution_mm,
             },
             'yoke': {
                 'outer_radius_mm': self.yoke.outer_radius_mm,
@@ -390,5 +414,7 @@ class CyclotronConfig:
                 'show_opengl': self.visualization.show_opengl,
                 'comsol_filename': self.visualization.comsol_filename,
                 'live_plot': self.visualization.live_plot,
+                'show_median_plane_field': self.visualization.show_median_plane_field,
+                'field_map_resolution_mm': self.visualization.field_map_resolution_mm,
             },
         }

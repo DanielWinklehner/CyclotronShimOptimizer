@@ -174,11 +174,30 @@ def isochronicity_gordon_octant(
 # Unified isochronism dispatch (circle / gordon / seo)
 # ============================================================================
 def _angles_from_config(config):
-    """Azimuthal sample angles matching simulation.get_median_plane_field_rz."""
+    """Legacy azimuthal sample angles (pre-RZFieldGrid): hardcoded 8-fold octant.
+
+    Only used as a fallback for plain (Nr, Ntheta) arrays; grids produced by
+    simulation.field_calculator.get_field_rz carry their actual angles (which
+    are derived from the geometry's symmetries) and take precedence -- see
+    _grid_and_angles.
+    """
     n = config.field_evaluation.num_points_circle
     if config.field_evaluation.use_symmetry:
         return np.linspace(0.0, 0.25 * np.pi, int(n / 8.0), endpoint=False)
     return np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+
+
+def _grid_and_angles(bz_values, config):
+    """(Bz grid, azimuthal angles) for the circle/gordon methods.
+
+    Prefers the angles attached to the field grid (RZFieldGrid from
+    get_field_rz); falls back to the config-derived angles for plain arrays.
+    """
+    angles = getattr(bz_values, 'angles', None)
+    grid = getattr(bz_values, 'bz', bz_values)
+    if angles is None:
+        angles = _angles_from_config(config)
+    return np.asarray(grid, dtype=float), np.asarray(angles, dtype=float)
 
 
 def _iso_metrics(freq_mhz):
@@ -208,7 +227,8 @@ def _iso_result(method, energies_mev, rev_times_s, freq_mhz, bz_for_plot, orbits
 
 def _iso_circle(bz_values, radii_mm, config, species):
     """Circle method: rigidity from the leakage-free azimuthal-average field."""
-    B0 = clean_azimuthal_average(np.asarray(bz_values, dtype=float), _angles_from_config(config))
+    bz_grid, angles = _grid_and_angles(bz_values, config)
+    B0 = clean_azimuthal_average(bz_grid, angles)
     r_m = np.asarray(radii_mm, dtype=float) * 1e-3
     b_rho = np.abs(B0) * r_m
     beta_gamma = RIGIDITY_K * abs(species.q) * b_rho / species.mass_mev
@@ -222,10 +242,11 @@ def _iso_circle(bz_values, radii_mm, config, species):
 
 def _iso_gordon(bz_values, radii_mm, config, species):
     """Gordon method: flutter-corrected equilibrium-orbit frequency."""
+    bz_grid, angles = _grid_and_angles(bz_values, config)
     res = isochronicity_gordon_octant(
-        np.abs(np.asarray(bz_values, dtype=float)),
+        np.abs(bz_grid),
         np.asarray(radii_mm, dtype=float) * 1e-3,
-        _angles_from_config(config),
+        angles,
         species,
         n_harmonics_max=6,
     )
@@ -273,8 +294,10 @@ def compute_isochronism(method, bz_values, radii_mm, config, species, *,
 
     :param method: 'circle', 'gordon', or 'seo'.
     :param bz_values: field as returned by evaluate_radii_parallel for this method --
-        an (Nr, Ntheta) median-plane grid for 'circle'/'gordon', or a 2D field map
-        for 'seo'.
+        an RZFieldGrid (or plain (Nr, Ntheta) array) for 'circle'/'gordon', or a
+        2D PyPATools Field map for 'seo'. An RZFieldGrid carries the azimuthal
+        sample angles actually used (symmetry-derived sector); plain arrays fall
+        back to the config-derived octant/full-circle angles.
     :param radii_mm: evaluation radii [mm].
     :param config: CyclotronConfig.
     :param species: IonSpecies (used by circle/gordon).

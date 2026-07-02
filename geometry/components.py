@@ -263,6 +263,15 @@ class BaseRadiaComponent:
       - parent
       - color
       - lazy child wrapper generation
+      - field-symmetry METADATA (declaration only; applying radia TrfZer*
+        transforms is MagnetizedComponent's job)
+
+    The ``symmetries`` metadata means: "the FIELD of this component, as built,
+    is invariant under these mirror operations". That holds for magnetized
+    parts whose TrfZer* transforms were applied (the model contains the
+    mirrored copies) and for intrinsically symmetric sources that merely
+    DECLARE it (e.g. a full-revolution +/-z coil pair). The field evaluator
+    reads this metadata to decide how a component's field map may be folded.
     """
 
     def __init__(
@@ -272,6 +281,7 @@ class BaseRadiaComponent:
         child_ids: Optional[Sequence[int]] = None,
         is_container: Optional[bool] = None,
         parent: Optional["BaseRadiaComponent"] = None,
+        symmetries: Optional[SymmetryInput] = None,
         color: Optional[Sequence[float]] = None,
         apply_color: bool = False,
     ) -> None:
@@ -285,6 +295,7 @@ class BaseRadiaComponent:
 
         self._parent: Optional["BaseRadiaComponent"] = None
         self._children_cache: Dict[int, BaseRadiaComponent] = {}
+        self._symmetries: List[SymmetryTuple] = _as_symmetry_list(symmetries)
 
         self._color: List[float] = [0.0, 0.5, 1.0]
         if color is not None:
@@ -300,6 +311,23 @@ class BaseRadiaComponent:
     @property
     def is_container(self) -> bool:
         return self._is_container
+
+    @property
+    def symmetries(self) -> List[SymmetryTuple]:
+        return list(self._symmetries)
+
+    def declare_symmetries(self, symmetries: SymmetryInput) -> None:
+        """Record field symmetries as metadata WITHOUT applying radia transforms.
+
+        Use for sources whose field is symmetric by construction (e.g. the
+        coil pair). Deliberately does NOT propagate to children: a declaration
+        describes this component AS A WHOLE (a +/-z coil pair is z-mirror
+        symmetric while its individual coils are not). For magnetized parts
+        that need the radia TrfZer* mirrors, use
+        MagnetizedComponent.apply_symmetry instead (there the transform DOES
+        cascade to the members, so propagation is correct).
+        """
+        self._symmetries.extend(_as_symmetry_list(symmetries))
 
     @property
     def color(self) -> List[float]:
@@ -342,8 +370,18 @@ class BaseRadiaComponent:
         return BaseRadiaComponent(
             child_id,
             parent=self,
+            symmetries=self._symmetries,
             color=self._color,
         )
+
+    def iter_cached_children(self):
+        """Iterate over the child wrappers that already exist (no lazy spawning).
+
+        Used by the symmetry collector: containers built via containerize()
+        hold real wrappers here, while anonymous leaf ids (e.g. STP-mesh tets)
+        are represented by the container's own metadata.
+        """
+        return iter(self._children_cache.values())
 
     def get_children(self) -> List["BaseRadiaComponent"]:
         """
@@ -407,6 +445,7 @@ class BaseRadiaComponent:
         self._children_cache.clear()
         self._child_ids = []
         self._is_container = False
+        self._symmetries = []
         self._id = None
 
     def transform(self, *args: Any, **kwargs: Any) -> None:
@@ -465,7 +504,8 @@ class MagnetizedComponent(BaseRadiaComponent):
     """
     Adds:
       - material metadata / application
-      - symmetry metadata / application
+      - symmetry APPLICATION (radia TrfZer* transforms; the metadata itself
+        lives on BaseRadiaComponent)
     """
 
     def __init__(
@@ -491,7 +531,6 @@ class MagnetizedComponent(BaseRadiaComponent):
             apply_color=apply_color,
         )
 
-        self._symmetries: List[SymmetryTuple] = []
         self._material: Optional[RadiaMaterial] = None
 
         if symmetries is not None:
@@ -499,10 +538,6 @@ class MagnetizedComponent(BaseRadiaComponent):
 
         if material is not None:
             self.set_material(material, apply_mat=apply_mat)
-
-    @property
-    def symmetries(self) -> List[SymmetryTuple]:
-        return list(self._symmetries)
 
     @property
     def material(self) -> Optional[RadiaMaterial]:
@@ -529,8 +564,7 @@ class MagnetizedComponent(BaseRadiaComponent):
             self._symmetries.append(sym)
 
         for child in self._children_cache.values():
-            if isinstance(child, MagnetizedComponent):
-                child._symmetries = list(self._symmetries)
+            child._symmetries = list(self._symmetries)
 
     def apply_symmetry(self, symmetries: SymmetryInput) -> None:
         self._add_symmetries(symmetries, apply_sym=True)

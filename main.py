@@ -38,8 +38,10 @@ from geometry.geometry import build_geometry
 from geometry.pole_shape import PoleShape
 from geometry.inventor_export import InventorPoleExporter
 
-from simulation.field_calculator import evaluate_radii_parallel, save_median_plane_field, save_3d_field
+from simulation.field_calculator import (evaluate_radii_parallel, get_median_plane_field,
+                                          save_median_plane_field, save_bore_field)
 from visualization.plots import plot_isochronism_results, plot_isochronism_metric, plot_final_summary
+from visualization.field_maps import plot_median_plane_field, show_model_with_median_plane_field
 from core.species import IonSpecies
 from optimization.optimizer import CyclotronOptimizer
 from core.isochronicity import compute_isochronism
@@ -170,10 +172,10 @@ def main(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = 
         # Only the visualization is rank-0-only.
         rad.UtiDelAll()
         cyclotron_vis = build_geometry(config, pole_shape, rank=rank, comm=comm,
-                                       omit_symmetry=True, verbosity=verbosity).id
+                                       omit_symmetry=True, verbosity=verbosity)
 
         if rank <= 0:
-            ObjDrwPyVista(cyclotron_vis)
+            ObjDrwPyVista(cyclotron_vis.id)
             # rad.ObjDrwOpenGL(cyclotron_vis)
 
             # After optimization
@@ -207,18 +209,20 @@ def main(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = 
 
         config.coil.current_A = coil_current
 
-        radii_out, bz_values, converged, cyclo_id, _ = evaluate_radii_parallel(
+        radii_out, bz_values, converged, cyclotron, _ = evaluate_radii_parallel(
             config, pole_shape, radii_mm,
             rank=rank, comm=comm
         )
 
         if config.field_evaluation.save_median_plane_field:
-            save_median_plane_field(config, cyclo_id,
+            save_median_plane_field(config, cyclotron,
                                     output_path=config.field_evaluation.median_plane_field_output,
                                     rank=rank, comm=comm)
 
         if config.field_evaluation.save_bore_field:
-            save_3d_field(config, cyclo_id, rank=rank, comm=comm)
+            save_bore_field(config, cyclotron,
+                            output_path=config.field_evaluation.bore_field_output,
+                            rank=rank, comm=comm)
 
         # if rank <= 0 and verbosity >= 1:
         #     if len(bz_values) > 0:
@@ -228,6 +232,33 @@ def main(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = 
         #         print(flush=True)
         #     else:
         #         print(f"[OK] B-field calculation complete (rank {rank}, no results)", flush=True)
+
+    # ========== MEDIAN-PLANE FIELD FOR VISUALIZATION (collective) ==========
+    # Grab the map from the SOLVED model now -- the OpenGL section below rebuilds
+    # the geometry (rad.UtiDelAll) and would wipe it. For the seo method,
+    # bz_values already IS this median-plane Field (same config limits), so no
+    # extra rad.Fld call is needed; for circle/gordon all ranks do a collective
+    # get_median_plane_field on the existing cyclotron handle.
+    median_plane_field = None
+    if config.visualization.show_median_plane_field:
+        with Timer("Calculate median-plane field", rank, verbosity):
+            if config.field_evaluation.iso_method == "seo":
+                # reuse the solver's (full-precision) map -- no extra rad.Fld
+                median_plane_field = bz_values if rank <= 0 else None
+            else:
+                # DISPLAY map only: coarser resolution + the fp32 GPU kernel
+                # (visualization-grade, ~1e-4 relative) -- never used for
+                # tracking or isochronism.
+                display_res = (config.visualization.field_map_resolution_mm
+                               or config.field_evaluation.median_plane_resolution_mm)
+                median_plane_field = get_median_plane_field(
+                    cyclotron,
+                    limit_mm=config.field_evaluation.median_plane_limit_mm,
+                    resolution_mm=display_res,
+                    use_symmetry=config.field_evaluation.use_symmetry,
+                    gpu_precision="single",
+                    rank=rank, comm=comm, verbosity=verbosity,
+                )
 
     # ========== ENERGY AND FREQUENCY CALCULATION (Rank 0 only) ==========
     energies_mev = rev_times_s = rev_frequencies_mhz = None
@@ -271,16 +302,30 @@ def main(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = 
     if config.visualization.show_opengl:
         with Timer("Display geometry in OpenGL", rank, verbosity):
             if rank <= 0 and verbosity >= 1:
-                print(f"Opening OpenGL viewer...", flush=True)
-            # Rebuild geometry for visualization
+                print("Opening OpenGL viewer...", flush=True)
+            # Rebuild geometry for visualization (full magnet, no symmetry
+            # transforms, for better visibility)
             rad.UtiDelAll()
             cyclotron_vis = build_geometry(config, pole_shape, rank=rank, comm=comm,
-                                           omit_symmetry=True, verbosity=verbosity).id
+                                           omit_symmetry=True, verbosity=verbosity)
+
             if rank <= 0:
-                rad.ObjDrwOpenGL(cyclotron_vis)
+                if median_plane_field is not None:
+                    show_model_with_median_plane_field(cyclotron_vis.id,
+                                                       median_plane_field)
+                else:
+                    ObjDrwPyVista(cyclotron_vis.id)
+
                 if verbosity >= 1:
                     print(f"[OK] OpenGL viewer closed", flush=True)
                     print(flush=True)
+
+    # ========== MEDIAN-PLANE FIELD 2D PLOT (Rank 0 only) ==========
+    # Always produced when show_median_plane_field is set (with show_opengl the
+    # field additionally appears in the 3D window above). Shown together with
+    # the other matplotlib figures at the end.
+    if rank <= 0 and median_plane_field is not None:
+        plot_median_plane_field(median_plane_field, show=False)
 
     # ========== VISUALIZATION (Rank 0 Only) ==========
     if rank <= 0 < len(bz_values):

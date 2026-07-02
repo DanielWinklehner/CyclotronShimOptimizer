@@ -1,733 +1,428 @@
-"""Field calculation using Radia with MPI support."""
-import datetime
-import os
-import sys
-import time
-import matplotlib.pyplot as plt
-import numpy as np
-from typing import Tuple, List
-from io import StringIO
+"""Field evaluation and export using Radia (MPI-aware, symmetry-exploiting).
 
-# Import radia
+Symmetry handling is generic: the field functions read each source's declared
+field symmetries from the geometry components (see geometry.components /
+geometry.symmetry), group the top-level sources by symmetry set, evaluate each
+group only on the fundamental subset of the requested grid, and fold the
+values back with the proper vector transforms. Sources without symmetries
+(e.g. the extraction channel) are automatically evaluated on the full grid --
+nothing about "octants" or 8-fold is hardcoded.
+
+Public API:
+  - get_field_3d / get_field_2d / get_median_plane_field: grid maps returned
+    as PyPATools Field objects (meters / Tesla).
+  - get_field_rz: Bz on midplane circles (isochronism input), returned as an
+    RZFieldGrid carrying the azimuthal sample angles actually used.
+  - save_median_plane_field / save_bore_field: thin wrappers that obtain the
+    field via the getters and write it through Field.save().
+  - ReusableCyclotronSolver / evaluate_radii_parallel: build + relax + query.
+
+NOTE: Radia returns field values only on MPI rank 0; the field functions
+return None on all other ranks (the rad.Fld calls themselves are collective).
+"""
+
+import time
+from typing import List, NamedTuple, Optional, Union
+
+import numpy as np
 import radia as rad
 
 from config_io.config import CyclotronConfig
-from geometry.geometry import build_geometry, build_iron, build_coils
 from geometry.components import BaseRadiaComponent
+from geometry.geometry import build_coils, build_iron
 from geometry.pole_shape import PoleShape
+from geometry.symmetry import (
+    SymmetryTuple,
+    azimuthal_sector,
+    canonical_symmetry_set,
+    collect_field_symmetries,
+    reduce_grid,
+    symmetry_group,
+)
 from PyPATools.field import Field
 
-
-import numpy as np
-import matplotlib.pyplot as plt
-from scipy.ndimage import median_filter
+ComponentOrId = Union[BaseRadiaComponent, int]
 
 
-def check_bz_outliers(
-    x_range,
-    y_range,
-    bz,
-    kernel_size=5,
-    threshold=5.0,
-    ax=None,
-):
+class RZFieldGrid(NamedTuple):
+    """Bz sampled on midplane circles, with the azimuthal angles actually used.
+
+    ``angles`` may span less than the full circle when the field's symmetry
+    allowed folding (e.g. [0, pi/4) for the 8-fold cyclotron); consumers
+    (core.isochronicity) read the angles from here instead of re-deriving them.
     """
-    Detect point-like spikes in a 2D magnetic-field map and plot them.
+    bz: np.ndarray        # (n_radii, n_angles)
+    angles: np.ndarray    # (n_angles,) [rad]
+    radii_mm: np.ndarray  # (n_radii,)
 
-    The detector uses a local median filter to absorb the legitimate
-    smooth radial trend and azimuthal flutter, then flags points whose
-    residual exceeds *threshold* × σ_MAD (robust standard deviation
-    estimated from the median absolute deviation of the residuals).
 
-    Parameters
-    ----------
-    x_range : array-like, shape (Nx,)
-        Horizontal coordinates of the grid.
-    y_range : array-like, shape (Ny,)
-        Vertical coordinates of the grid.
-    bz : ndarray, shape (Nx, Ny)
-        Magnetic field on the regular grid.
-    kernel_size : int, optional
-        Side length of the square median-filter window.  Must be odd.
-        Larger values tolerate broader legitimate features but may miss
-        clusters of bad points.  Default 5.
-    threshold : float, optional
-        Number of robust standard deviations above which a residual is
-        flagged as an outlier.  Default 5.0.
-    ax : pair of matplotlib Axes or None, optional
-        If given, plot into ``ax[0]`` (field) and ``ax[1]`` (residual).
-        If *None* a new two-panel figure is created.
+class _SourceGroup(NamedTuple):
+    radia_id: int
+    symmetries: List[SymmetryTuple]
+    temp: bool  # True if radia_id is a throwaway container to UtiDel afterwards
 
-    Returns
-    -------
-    outlier_mask : ndarray of bool, shape (Nx, Ny)
-        *True* where an outlier was detected.
-    outlier_coords : ndarray, shape (N_outliers, 2)
-        (x, y) physical coordinates of every flagged point.
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _fld(radia_id: int, components: str, points, use_gpu: bool = True,
+         *, precision: str = "double", rank: int = 0, verbosity: int = 1):
+    """rad.Fld with the RadiaCUDA use_gpu/precision kwargs, falling back to
+    plain radia.
+
+    precision='single' selects RadiaCUDA's fp32 polygon-face kernel
+    (visualization-grade, ~1e-4 relative; much faster on GeForce-class GPUs).
+    Keep the default 'double' for anything feeding tracking or isochronism.
+
+    Warns when a GPU-requested evaluation was actually serviced by the CPU
+    backend (e.g. an unsupported component id -- RadiaCUDA's GPU gate accepts
+    only 'b'/'bx'/'by'/'bz'), since that fallback is silent and can be
+    orders of magnitude slower.
     """
-    x = np.asarray(x_range)
-    y = np.asarray(y_range)
-    bz = np.asarray(bz, dtype=float)
+    kwargs = {"use_gpu": use_gpu}
+    if precision != "double":
+        kwargs["precision"] = precision
+    try:
+        result = rad.Fld(radia_id, components, points, **kwargs)
+    except TypeError:
+        return rad.Fld(radia_id, components, points)
 
-    # --- detection --------------------------------------------------------
-    if kernel_size % 2 == 0:
-        kernel_size += 1  # median_filter needs odd size
-
-    print("using filter", flush=True)
-    bz_smooth = median_filter(bz, size=kernel_size)
-    residual = bz - bz_smooth
-
-    # robust scale: MAD → σ  (factor 1.4826 for normal-equivalent σ)
-    mad = np.median(np.abs(residual - np.median(residual)))
-    sigma = mad * 1.4826 if mad > 0 else np.std(residual)
-
-    outlier_mask = np.abs(residual) > threshold * sigma
-
-    # physical coordinates of flagged points
-    ix, iy = np.nonzero(outlier_mask)
-    outlier_x = x[ix]
-    outlier_y = y[iy]
-    outlier_coords = np.column_stack([outlier_x, outlier_y]) if ix.size else np.empty((0, 2))
-
-    print("creating axis", flush=True)
-    # --- plotting ---------------------------------------------------------
-    if ax is None:
-        fig, ax = plt.subplots(1, 2, figsize=(14, 5), sharex=True, sharey=True)
-    else:
-        fig = ax[0].figure
-
-    print("generating meshgrid", flush=True)
-    X, Y = np.meshgrid(x, y, indexing="ij")
-
-    # left panel: raw field
-    c0 = ax[0].pcolormesh(X, Y, bz, shading="auto", cmap="viridis")
-    fig.colorbar(c0, ax=ax[0], label="$B_z$")
-    if outlier_x.size:
-        ax[0].scatter(
-            outlier_x, outlier_y,
-            s=120, facecolors="none", edgecolors="red", linewidths=1.5,
-            label=f"{outlier_x.size} outlier(s)",
-        )
-        ax[0].legend(loc="upper right", fontsize=9)
-    ax[0].set_xlabel("x")
-    ax[0].set_ylabel("y")
-    ax[0].set_title("Magnetic field  $B_z(x,y)$")
-    ax[0].set_aspect("equal")
-
-    # right panel: residual after median subtraction
-    res_lim = max(np.abs(residual).max(), 1e-30)
-    c1 = ax[1].pcolormesh(
-        X, Y, residual, shading="auto",
-        cmap="RdBu_r", vmin=-res_lim, vmax=res_lim,
-    )
-    fig.colorbar(c1, ax=ax[1], label="residual")
-    if outlier_x.size:
-        ax[1].scatter(
-            outlier_x, outlier_y,
-            s=120, facecolors="none", edgecolors="red", linewidths=1.5,
-        )
-    ax[1].axhline(0, color="grey", lw=0.3)
-    ax[1].axvline(0, color="grey", lw=0.3)
-    ax[1].set_xlabel("x")
-    ax[1].set_title(
-        f"Residual  (median kernel={kernel_size}, "
-        f"threshold={threshold}σ,  σ_MAD={sigma:.3g})"
-    )
-    ax[1].set_aspect("equal")
-
-    fig.tight_layout()
-    
-    print("Right before show()", flush=True)
-    
-    plt.show()
-
-    # summary to console
-    n = int(outlier_mask.sum())
-    if n:
-        peak = np.abs(residual[outlier_mask]).max()
-        print(
-            f"Found {n} outlier(s).  "
-            f"Largest residual: {peak:.4g}  ({peak / sigma:.1f}σ)"
-        )
-    else:
-        print("No outliers detected.")
-
-    return outlier_mask, outlier_coords
+    if use_gpu and rank <= 0 and verbosity >= 1 and hasattr(rad, "UtiFldLastBackend"):
+        if rad.UtiFldLastBackend() == "cpu":
+            print(f"  WARNING: rad.Fld('{components}', {len(points)} points) fell back "
+                  "to the CPU backend despite use_gpu=True!", flush=True)
+    return result
 
 
-def get_median_plane_field_rz(cyclotron_id: int,
-                              radii_mm: List[float],
-                              num_angles: int = 1000,
-                              rank: int = 0,
-                              comm=None,
-                              use_symmetry: bool = True) -> np.ndarray:
+def _component_id(component: ComponentOrId) -> int:
+    if isinstance(component, (int, np.integer)):
+        return int(component)
+    return component.id
+
+
+def symmetric_axis(limit_mm: float, resolution_mm: float) -> np.ndarray:
+    """Exactly mirror-symmetric axis [-limit, limit] with the given spacing.
+
+    Built by negating the positive half, so x[i] == -x[-1-i] bit-exactly
+    (required for lossless symmetry folding). The extent is rounded to the
+    nearest multiple of the resolution.
     """
-    Query Bz field at all radii simultaneously with single rad.Fld() call.
+    n_half = int(round(limit_mm / resolution_mm))
+    half = np.arange(n_half + 1) * float(resolution_mm)
+    return np.concatenate([-half[:0:-1], half])
 
-    Creates a 2D grid of points at each radius, queries all at once,
-    then averages along the angular direction.
 
-    NOTE: Radia returns field values only on rank 0; other ranks receive empty list.
+def _field_source_groups(component: ComponentOrId,
+                         use_symmetry: bool) -> List[_SourceGroup]:
+    """Group the top-level field sources by their declared field-symmetry set.
 
-    :param cyclotron_id: Radia object ID for cyclotron
-    :param radii_mm: List of radii in mm
-    :param num_angles: Number of angles per radius (default 1000)
-    :param use_symmetry:
-    :param rank: MPI rank
-    :return: Array of averaged Bz values at each radius (rank 0 only), empty array on other ranks
+    Children with identical symmetry sets are combined into one temporary
+    radia container (single rad.Fld call, folded once); each distinct set gets
+    its own group folded by its own symmetries. A bare radia id, a component
+    with its own declaration, or use_symmetry=False all yield a single group.
     """
-    n_radii = len(radii_mm)
+    if isinstance(component, (int, np.integer)):
+        return [_SourceGroup(int(component), [], False)]
+    if not use_symmetry:
+        return [_SourceGroup(component.id, [], False)]
 
-    # Create angles array [0; 2π[ or [0; π/4[ (using symmetry)
-    if use_symmetry:
-        num_angles = int(num_angles / 8.0)
-        angles = np.linspace(0.0, 0.25 * np.pi, num_angles, endpoint=False)
-    else:
-        angles = np.linspace(0.0, 2.0 * np.pi, num_angles, endpoint=False)
+    children = list(component.iter_cached_children())
+    if component.symmetries or not children:
+        return [_SourceGroup(component.id, list(component.symmetries), False)]
 
-    # Create 2D grid of points: (n_radii, num_angles, 3)
-    points_grid = np.zeros((n_radii, num_angles, 3))
+    grouped: dict = {}
+    for child in children:
+        syms = collect_field_symmetries(child)
+        key = canonical_symmetry_set(syms)
+        grouped.setdefault(key, (syms, []))[1].append(child.id)
 
-    for i, r_mm in enumerate(radii_mm):
-        points_grid[i, :, 0] = r_mm * np.cos(angles)  # x
-        points_grid[i, :, 1] = r_mm * np.sin(angles)  # y
-        points_grid[i, :, 2] = 0.0  # z = 0 (midplane)
+    groups: List[_SourceGroup] = []
+    for syms, ids in grouped.values():
+        if len(ids) == 1:
+            groups.append(_SourceGroup(ids[0], syms, False))
+        else:
+            groups.append(_SourceGroup(int(rad.ObjCnt(ids)), syms, True))
+    return groups
 
-    # Flatten to (n_radii * num_angles, 3)
-    points_flat = points_grid.reshape(-1, 3).tolist()
 
-    # NOTE: Only rank 0 receives results; other ranks get empty list
-    # bz_flat = rad.Fld(cyclotron_id, 'bz', points_flat)
+def _evaluate_b_grid(component: ComponentOrId,
+                     axes_mm,
+                     *,
+                     use_symmetry: bool = True,
+                     rank: int = 0,
+                     comm=None,
+                     verbosity: int = 1,
+                     use_gpu: bool = True,
+                     gpu_precision: str = "double") -> Optional[np.ndarray]:
+    """Evaluate (Bx, By, Bz) on a regular (x, y, z) grid, folding symmetries.
 
-    # if rank <= 0:
-    #     print("Gathering field values with CuPy")
+    :param axes_mm: three sorted 1D coordinate arrays [mm] (singletons allowed).
+    :return: (Nx, Ny, Nz, 3) array [T] on rank 0, None on other ranks.
+    """
+    axes = [np.asarray(a, dtype=float) for a in axes_mm]
+    shape = tuple(len(a) for a in axes)
+    say = rank <= 0 and verbosity >= 1
 
-    # The 8-fold symmetry is already baked into the iron object (TrfZerPerp/Para in
-    # build_geometry), so rad.Fld returns the full symmetric field at these octant
-    # sample points -- no explicit symmetry list needed (matches get_median_plane_field_2d).
-    bz_flat = rad.Fld(cyclotron_id, 'bz', points_flat, use_gpu=True)
+    groups = _field_source_groups(component, use_symmetry)
+    b_total = np.zeros(shape + (3,)) if rank <= 0 else None
 
-    # Check if we got results (rank 0) or nothing (other ranks)
+    try:
+        for group in groups:
+            ops = symmetry_group(group.symmetries)
+            reduction = reduce_grid(axes, ops)
+            if say:
+                print(f"  Field source group ({len(group.symmetries)} symmetries, "
+                      f"{reduction.n_ops} usable ops): evaluating "
+                      f"{len(reduction.eval_points)} of {reduction.n_total} grid points...",
+                      flush=True)
+            # Component id 'b' (NOT 'bxbybz'): RadiaCUDA's GPU gate in
+            # RadFld only accepts 'b'/'bx'/'by'/'bz' -- 'bxbybz' silently
+            # falls through to the (very slow) CPU path.
+            b_eval = _fld(group.radia_id, 'b',
+                          reduction.eval_points.tolist(), use_gpu=use_gpu,
+                          precision=gpu_precision, rank=rank, verbosity=verbosity)
+            if rank <= 0:
+                b_full = reduction.scatter_vector(np.asarray(b_eval, dtype=float))
+                b_total += b_full.reshape(shape + (3,))
+    finally:
+        for group in groups:
+            if group.temp:
+                try:
+                    rad.UtiDel(group.radia_id)
+                except RuntimeError:
+                    pass  # already gone (e.g. rad.UtiDelAll) -> idempotent
+
+    return b_total
+
+
+# ---------------------------------------------------------------------------
+# Field getters
+# ---------------------------------------------------------------------------
+def get_field_3d(component: ComponentOrId,
+                 x_mm, y_mm, z_mm,
+                 *,
+                 use_symmetry: bool = True,
+                 rank: int = 0,
+                 comm=None,
+                 verbosity: int = 1,
+                 use_gpu: bool = True,
+                 gpu_precision: str = "double",
+                 label: str = "Radia B-field (3D)") -> Optional[Field]:
+    """Full 3D B-field on a regular grid, exploiting declared symmetries.
+
+    :param component: geometry component (preferred; carries the symmetry
+        metadata) or a raw radia id (no folding).
+    :param x_mm, y_mm, z_mm: sorted 1D coordinate arrays [mm].
+    :param use_symmetry: master switch; what "symmetry" means is read from the
+        component metadata, and group elements that do not map the given grid
+        onto itself are dropped automatically (e.g. z-mirror on an asymmetric
+        z range).
+    :param gpu_precision: 'double' (default) or 'single' (fp32 GPU kernel,
+        visualization-grade only -- do NOT use for tracking/isochronism maps).
+    :return: PyPATools Field (grid in meters, values in Tesla) on rank 0,
+        None on other ranks.
+    """
+    b_grid = _evaluate_b_grid(component, (x_mm, y_mm, z_mm),
+                              use_symmetry=use_symmetry, rank=rank, comm=comm,
+                              verbosity=verbosity, use_gpu=use_gpu,
+                              gpu_precision=gpu_precision)
     if rank > 0:
-        # Non-rank-0 process, return empty array
         return None
 
-    # Reshape to (n_radii, num_angles)
-    bz_grid = np.array(bz_flat).reshape(n_radii, num_angles)
+    grid_m = {'x': np.asarray(x_mm, dtype=float) * 1e-3,
+              'y': np.asarray(y_mm, dtype=float) * 1e-3,
+              'z': np.asarray(z_mm, dtype=float) * 1e-3}
+    values = {'x': b_grid[..., 0], 'y': b_grid[..., 1], 'z': b_grid[..., 2]}
+    return Field.from_arrays(grid_m, values, label=label)
 
-    return bz_grid
 
+def get_field_2d(component: ComponentOrId,
+                 x_mm, y_mm,
+                 z_mm: float = 0.0,
+                 *,
+                 use_symmetry: bool = True,
+                 rank: int = 0,
+                 comm=None,
+                 verbosity: int = 1,
+                 use_gpu: bool = True,
+                 gpu_precision: str = "double",
+                 label: str = "Radia B-field (plane)") -> Optional[Field]:
+    """B-field on the horizontal plane z = z_mm (2D Field over x, y).
 
-def get_median_plane_field_2d(config: CyclotronConfig,
-                              cyclotron_id: int = None,
-                              limit=400,        # mm
-                              resolution=2.0,   # mm
-                              rank=0,
-                              comm=None):
+    A slice at z != 0 automatically loses the midplane-mirror fold but keeps
+    the in-plane symmetries; z = 0 uses the full declared set.
     """
-    Calculate Bz field on median plane (z=0) exploiting 8-fold symmetry (if set).
-    Only calculates in octant: 0 ≤ y ≤ x, x ≥ 0, then mirrors to fill the full domain.
-    """
-    use_symmetry = config.field_evaluation.use_symmetry
-    dxy = resolution
+    z_axis = np.array([float(z_mm)])
+    b_grid = _evaluate_b_grid(component, (x_mm, y_mm, z_axis),
+                              use_symmetry=use_symmetry, rank=rank, comm=comm,
+                              verbosity=verbosity, use_gpu=use_gpu,
+                              gpu_precision=gpu_precision)
+    if rank > 0:
+        return None
 
-    # --- Build the full regular grid definition ---
-    nxy = int(2 * limit / dxy) + 1
-    x_range = np.linspace(-limit, limit, nxy)  # mm
-    y_range = np.linspace(-limit, limit, nxy)  # mm
+    grid_m = {'x': np.asarray(x_mm, dtype=float) * 1e-3,
+              'y': np.asarray(y_mm, dtype=float) * 1e-3,
+              'z': z_axis * 1e-3}
+    values = {'x': b_grid[:, :, 0, 0],
+              'y': b_grid[:, :, 0, 1],
+              'z': b_grid[:, :, 0, 2]}
+    return Field.from_arrays(grid_m, values, label=label)
 
-    # --- Generate sample points (vectorised) ---
-    if use_symmetry:
-        if rank <= 0:
-            print("Calculating Midplane field (with 8-fold symmetry)...", flush=True)
 
-        # Octant grid: 0 ≤ y ≤ x, x ≥ 0
-        x_oct = np.arange(0, limit + dxy / 2, dxy)
-        y_oct = np.arange(0, limit + dxy / 2, dxy)
-        gx, gy = np.meshgrid(x_oct, y_oct, indexing='ij')
-        mask = gy <= gx + 1e-12  # 0 ≤ y ≤ x
-        sample_points = np.column_stack((gx[mask], gy[mask]))
-    else:
-        if rank <= 0:
-            print("Calculating Midplane field (without symmetry)...", flush=True)
-
-        gx, gy = np.meshgrid(x_range, y_range, indexing='ij')
-        sample_points = np.column_stack((gx.ravel(), gy.ravel()))
-
-    # Add z=0 for 3D field query
-    sample_points_3d = np.column_stack((sample_points, np.zeros(len(sample_points))))
-
-    # # Grid for non-symmetric elements
-    # gx, gy = np.meshgrid(x_range, y_range, indexing='ij')
-    # sample_points_full = np.column_stack((gx.ravel(), gy.ravel()))
-    # sample_points_full_3d = np.column_stack((sample_points_full, np.zeros(len(sample_points_full))))
-
-    if rank <= 0:
-        print(f"  Calculating {len(sample_points)} points...", flush=True)
-
-    # --- These are the model's geometric symmetries ---
-    model_symmetries = [
-        ('perp', [0, 0, 0], [1, -1, 0]),
-        ('perp', [0, 0, 0], [1, 0, 0]),
-        ('perp', [0, 0, 0], [0, 1, 0]),
-        ('para', [0, 0, 0], [0, 0, 1]),
-    ]
-
-    # main_objs = rad.ObjCntStuf(cyclotron_id)
-    #
-    # info = rad.UtiDmp(main_objs[0], 'asc')
-    # print(info)
-    #
-    # tr1 = rad.UtiDmpPrs(rad.UtiDmp(10589, 'bin'))
-    # tr2 = rad.UtiDmpPrs(rad.UtiDmp(10590, 'bin'))
-    # tr3 = rad.UtiDmpPrs(rad.UtiDmp(10591, 'bin'))
-    # tr4 = rad.UtiDmpPrs(rad.UtiDmp(10592, 'bin'))
-    #
-    # print(rad.UtiDmp(tr1, 'asc'))
-    #
-    # # sub_objs = rad.ObjCntStuf(main_objs[0])
-    # # for sub_obj in sub_objs:
-    # #     print(rad.UtiDmp(sub_obj, 'asc'))
-    #
-    # exit()
-
-    # geo_symmetric = rad.ObjCnt([main_objs[0], main_objs[2]])  # symmetric cyclotron parts + coil
-    # geo_non_symmetric = rad.ObjCnt([main_objs[1]])  # non-symmetric extraction channel parts
-
-    # bz_sample = FldGPU(cyclotron_id,
-    #                 sample_points_3d.tolist(),
-    #                 component='bz',
-    #                 symmetries=model_symmetries,
-    #                 verbose=(rank == 0))
-
-    # bz_non_sym = FldGPU(geo_non_symmetric,
-    #                     sample_points_full_3d.tolist(),
-    #                     component='bz',
-    #                     symmetries=None,
-    #                     verbose=(rank == 0))
-
-    bz_sample = rad.Fld(cyclotron_id, 'bz', sample_points_3d.tolist(), use_gpu=True)
-
-    # new_outliers = [[129, 79, 0],
-    #                 [258, 96, 0],
-    #                 [305, 181, 0],
-    #                 [311, 263, 0],
-    #                 [365, 262, 0],
-    #                 [383, 356, 0]]
-    #
-    # gpu_results = rad.Fld(cyclotron_id, 'bz', new_outliers, use_gpu=True)
-    # cpu_results = rad.Fld(cyclotron_id, 'bz', new_outliers, use_gpu=False)
-
-    # gpu_results = rad.Fld(cyclotron_id, 'bz', [[270, 14, 0], [270, 15, 0]], use_gpu=True)
-    # cpu_results = rad.Fld(cyclotron_id, 'bz', [[270, 14, 0], [270, 15, 0]], use_gpu=False)
-
-    # print("===========")
-    # print("Outliers on GPU: ", gpu_results)
-    # print("Outliers on CPU: ", cpu_results)
-    # print("===========")
-
-    # print("===========")
-    # print("single outlier: ", gpu_results[0])
-    # print("single neighbor: ", gpu_results[1])
-    # print("single outlier CPU: ", cpu_results[0])
-    # print("single neighbor CPU: ", cpu_results[1])
-    # print("===========")
-    #
-    # rad.UtiMPI('off')
-    # exit()
-
-    if rank <= 0:
-        print(f"  Received {len(bz_sample)} field values", flush=True)
-
-        # --- Place values onto the full grid ---
-        bz_grid = np.zeros((nxy, nxy))
-
-        # Convert mm coordinates to grid indices
-        def mm_to_idx(coords_mm):
-            return np.round((coords_mm + limit) / dxy).astype(int)
-
-        if use_symmetry:
-            print("  Applying 8-fold symmetry...", flush=True)
-            xs, ys = sample_points[:, 0], sample_points[:, 1]
-
-            # All 8 reflections at once: (±x,±y) and (±y,±x)
-            all_x = np.concatenate([ xs,  ys,  xs,  ys, -xs, -ys, -xs, -ys])
-            all_y = np.concatenate([ ys,  xs, -ys, -xs,  ys,  xs, -ys, -xs])
-            all_bz = np.tile(bz_sample, 8)
-
-            ix = mm_to_idx(all_x)
-            iy = mm_to_idx(all_y)
-
-            # Clip to valid range (handles floating-point edge cases)
-            valid = (ix >= 0) & (ix < nxy) & (iy >= 0) & (iy < nxy)
-            bz_grid[ix[valid], iy[valid]] = all_bz[valid]
-        else:
-            ix = mm_to_idx(sample_points[:, 0])
-            iy = mm_to_idx(sample_points[:, 1])
-            bz_grid[ix, iy] = bz_sample
-
-        # Convert to metres for tracking
-        x_range_m = x_range * 1e-3
-        y_range_m = y_range * 1e-3
-
-        count = np.count_nonzero(bz_grid) if use_symmetry else nxy * nxy
-        print(f"  Total filled grid points: {count}", flush=True)
+def get_median_plane_field(component: ComponentOrId,
+                           limit_mm: float = 400.0,
+                           resolution_mm: float = 1.0,
+                           *,
+                           use_symmetry: bool = True,
+                           rank: int = 0,
+                           comm=None,
+                           verbosity: int = 1,
+                           use_gpu: bool = True,
+                           gpu_precision: str = "double") -> Optional[Field]:
+    """B-field on the median plane (z=0) over [-limit, limit]^2 [mm]."""
+    if rank <= 0 and verbosity >= 1:
+        print(f"Calculating median-plane field (limit={limit_mm} mm, "
+              f"resolution={resolution_mm} mm, symmetry={'on' if use_symmetry else 'off'}, "
+              f"gpu_precision={gpu_precision})...",
+              flush=True)
+    axis = symmetric_axis(limit_mm, resolution_mm)
+    field = get_field_2d(component, axis, axis, 0.0,
+                         use_symmetry=use_symmetry, rank=rank, comm=comm,
+                         verbosity=verbosity, use_gpu=use_gpu,
+                         gpu_precision=gpu_precision,
+                         label="Radia B-field (median plane)")
+    if rank <= 0 and verbosity >= 1:
         print("Done!", flush=True)
-
-        # bz_grid += np.array(bz_non_sym).reshape(nxy, nxy)
-
-    #     # TODO: Remove after testing
-    #     outlier_mask, outlier_coords = check_bz_outliers(x_range_m, y_range_m, bz_grid, kernel_size=7, threshold=10.0)
-    #
-    #     for coords in outlier_coords:
-    #         print(f"x/y = ({coords[0]}, {coords[1]})")
-    #
-    # rad.UtiMPI('off')
-    # exit()
-    #     # TODO END
-
-        b_field = Field.from_arrays(
-            {"x": x_range_m, "y": y_range_m},
-            {"x": np.zeros_like(bz_grid),
-             "y": np.zeros_like(bz_grid),
-             "z": bz_grid}
-        )
-    else:
-        b_field = None  # non-root ranks
-
-    return b_field
+    return field
 
 
-def save_3d_field(config: CyclotronConfig,
-                  cyclotron_id=None,
-                  zmin=-100,
-                  zmax=25,
-                  rank=0,
-                  comm=None):
+def get_field_rz(component: ComponentOrId,
+                 radii_mm,
+                 num_angles: int = 1000,
+                 *,
+                 use_symmetry: bool = True,
+                 rank: int = 0,
+                 comm=None,
+                 verbosity: int = 1,
+                 use_gpu: bool = True) -> Optional[RZFieldGrid]:
+    """Bz on midplane circles at the given radii (isochronism input).
+
+    The azimuthal fundamental sector is derived from the component's declared
+    symmetries (pi/4 for the 8-fold cyclotron, full circle when no usable
+    symmetry, e.g. with the extraction channel present); ``num_angles`` is the
+    full-circle-equivalent count, so the effective angular resolution is
+    independent of the fold.
+
+    :return: RZFieldGrid(bz (Nr, Ntheta), angles, radii_mm) on rank 0, None on
+        other ranks.
     """
-    Save 3D Bx, By, Bz field exploiting 8-fold symmetry in x-y plane.
+    radii = np.atleast_1d(np.asarray(radii_mm, dtype=float))
 
-    Only calculates in octant: 0 ≤ y ≤ x, x ≥ 0
-    Mirrors across x-axis, y-axis, and x=y plane to fill full domain.
+    syms: List[SymmetryTuple] = []
+    if use_symmetry and not isinstance(component, (int, np.integer)):
+        syms = collect_field_symmetries(component)
+    sector = azimuthal_sector(syms)
 
-    :param config: CyclotronConfig
-    :param cyclotron_id: Radia cyclotron object ID
-    :param zmin: Minimum z (mm)
-    :param zmax: Maximum z (mm)
-    :param rank: MPI rank
-    :param comm: MPI communicator
-    """
+    n_ang = max(1, int(round(num_angles * sector / (2.0 * np.pi))))
+    angles = np.linspace(0.0, sector, n_ang, endpoint=False)
 
-    # TODO: If cyclotron_id is None: delete all radia objects and rebuild/solve the cyclotron
+    if rank <= 0 and verbosity >= 1:
+        print(f"Calculating Bz on {len(radii)} circles "
+              f"({n_ang} angles over {np.degrees(sector):.1f} deg sector)...", flush=True)
 
-    # TODO: Get limits and spacing (and filename?) from config
+    points = np.zeros((len(radii), n_ang, 3))
+    points[:, :, 0] = radii[:, None] * np.cos(angles)[None, :]
+    points[:, :, 1] = radii[:, None] * np.sin(angles)[None, :]
 
-    # Domain limits and spacing
-    xmin = ymin = -50  # mm
-    xmax = ymax = 50  # mm
-    dxy = 0.5  # mm
-    dz = 0.5  # mm (adjustable)
+    bz_flat = _fld(_component_id(component), 'bz',
+                   points.reshape(-1, 3).tolist(), use_gpu=use_gpu,
+                   rank=rank, verbosity=verbosity)
 
-    if rank <= 0:
-        print("Calculating 3D field (with 8-fold x-y symmetry)...", flush=True)
+    if rank > 0:
+        return None
 
-    # ===== GENERATE OCTANT POINTS (0 ≤ y ≤ x, x ≥ 0) =====
-    x_octant = np.arange(0, xmax + dxy / 2, dxy)
-    z_vals = np.arange(zmin, zmax + dz / 2, dz)
-
-    points_octant = []
-    for xi in x_octant:
-        for yi in np.arange(0, xi + dxy / 2, dxy):
-            for zi in z_vals:
-                points_octant.append([xi, yi, zi])
-
-    points_octant = np.array(points_octant)
-
-    if rank <= 0:
-        print(f"  Calculating {len(points_octant)} points in octant...", flush=True)
-
-    # Query Radia for all three components
-    b_octant = np.array(rad.Fld(cyclotron_id, 'bxbybz', points_octant.tolist(), use_gpu=True))
-
-    if rank <= 0:
-        print(f"  Received {len(b_octant)} field vectors", flush=True)
-
-        # ===== APPLY SYMMETRIES =====
-        print("  Applying 8-fold symmetry...", flush=True)
-
-        points_full = []
-        bx_full = []
-        by_full = []
-        bz_full = []
-
-        for i, (xyz, b) in enumerate(zip(points_octant, b_octant)):
-            x, y, z = xyz
-            bx, by, bz = b
-
-            # 8 symmetric copies via mirror operations
-            # Note: Bx, By change sign under certain mirrors; Bz does not
-            symmetric_copies = [
-                ((x, y, z), (bx, by, bz)),  # Octant 1: original
-                ((y, x, z), (by, bx, bz)),  # Octant 2: mirror across x=y (swap x↔y, Bx↔By)
-                ((x, -y, z), (bx, -by, bz)),  # Octant 3: mirror across x-axis (negate y, negate By)
-                ((y, -x, z), (-by, bx, bz)),  # Octant 4: mirror across x=y then x-axis
-                ((-x, y, z), (-bx, by, bz)),  # Octant 5: mirror across y-axis (negate x, negate Bx)
-                ((-y, x, z), (by, -bx, bz)),  # Octant 6: mirror across y-axis then x=y
-                ((-x, -y, z), (-bx, -by, bz)),  # Octant 7: mirror across both axes
-                ((-y, -x, z), (-by, -bx, bz)),  # Octant 8: mirror across both axes then x=y
-            ]
-
-            for (xi, yi, zi), (bxi, byi, bzi) in symmetric_copies:
-                points_full.append([xi, yi, zi])
-                bx_full.append(bxi)
-                by_full.append(byi)
-                bz_full.append(bzi)
-
-        points_full = np.array(points_full)
-        bx_full = np.array(bx_full)
-        by_full = np.array(by_full)
-        bz_full = np.array(bz_full)
-
-        # Remove duplicates
-        points_full_tuple = np.array([tuple(p) for p in points_full])
-        unique_points, unique_indices = np.unique(points_full_tuple, axis=0, return_index=True)
-
-        points_full = np.array([list(p) for p in unique_points])
-        bx_full = bx_full[unique_indices]
-        by_full = by_full[unique_indices]
-        bz_full = bz_full[unique_indices]
-
-        # Sort by z, then y, then x
-        points_full = points_full[np.lexsort((points_full[:, 0], points_full[:, 1], points_full[:, 2]))]
-        sort_idx = np.lexsort((points_full[:, 0], points_full[:, 1], points_full[:, 2]))
-        bx_full = bx_full[sort_idx]
-        by_full = by_full[sort_idx]
-        bz_full = bz_full[sort_idx]
+    return RZFieldGrid(bz=np.asarray(bz_flat, dtype=float).reshape(len(radii), n_ang),
+                       angles=angles,
+                       radii_mm=radii)
 
 
-        print(f"  Total unique points after symmetry: {len(points_full)}", flush=True)
-        print("Done!", flush=True)
-
-        header_text = f"""% Model:              uCyclo_v2
-% Version:            Cyclotron Optimizer v0.1
-% Date:               {datetime.date.today()}
-% Dimension:          3
-% Nodes:              {len(bx_full)}
-% Expressions:        3
-% Description:        Magnetic flux density components
-% Length unit:        m
-% x                   y                   z                   Bx (T)              By (T)              Bz (T)
-"""
-
-        points_m = points_full * 1e-3  # mm to m for OPAL
-        data = np.column_stack((points_m, bx_full, by_full, bz_full))
-
-        print("Writing 3D field...", flush=True)
-        with open(r"output/field_3d.dat", "w") as _of:
-            _of.write(header_text)
-            for _d in data:
-                _of.write(
-                    f"{_d[0]}            {_d[1]}            {_d[2]}            {_d[3]}            {_d[4]}            {_d[5]}\n")
-        print("Done!", flush=True)
-
-    return 0
+# ---------------------------------------------------------------------------
+# Save functions (obtain the field via the getters, write via Field.save)
+# ---------------------------------------------------------------------------
+_OPAL_HEADER_KWARGS = dict(model="uCyclo_v2", version="Cyclotron Optimizer v0.1")
 
 
 def save_median_plane_field(config: CyclotronConfig,
-                            cyclotron_id: int = None,
-                            output_path: str = "output/midplane_field.txt",
-                            rank=0,
-                            comm=None):
-    """
-    Save Bz field on median plane (z=0) exploiting 8-fold symmetry.
-
-    Only calculates in octant: 0 ≤ y ≤ x, x ≥ 0
-    Mirrors across x-axis, y-axis, and x=y plane to fill full domain.
-    """
-
-    # TODO: If cyclotron_id is None: delete all radia objects and rebuild/solve the cyclotron
-
-    # TODO: Get limits and spacing (and filename?) from config
-    symmetries = config.field_evaluation.use_symmetry
-    # Domain limits and spacing
-    xmin = ymin = -400  # mm
-    xmax = ymax = 400  # mm
-    dxy = 0.5  # mm
-
-    points_octant = []
-    if symmetries:
-        if rank <= 0:
-            print("Calculating Midplane field (with 8-fold symmetry)...", flush=True)
-        # ===== GENERATE OCTANT POINTS (0 ≤ y ≤ x, x ≥ 0) =====
-        x_octant = np.arange(0, xmax + dxy / 2, dxy)
-        for xi in x_octant:
-            for yi in np.arange(0, xi + dxy / 2, dxy):
-                points_octant.append([xi, yi])
-    else:
-        if rank <= 0:
-            print("Calculating Midplane field (without symmetry)...", flush=True)
-        # ===== GENERATE ALL POINTS  =====
-        x_octant = np.arange(xmin, xmax + dxy / 2, dxy)
-        for xi in x_octant:
-            for yi in np.arange(ymin, ymax + dxy / 2, dxy):
-                points_octant.append([xi, yi])
-
-    points_octant = np.array(points_octant)
-    points_octant_3d = np.column_stack((points_octant, np.zeros(len(points_octant))))
+                            component: ComponentOrId,
+                            output_path: Optional[str] = None,
+                            rank: int = 0,
+                            comm=None,
+                            verbosity: int = 1) -> Optional[Field]:
+    """Compute and save the median-plane field (Bz only for .comsol output)."""
+    fe = config.field_evaluation
+    field = get_median_plane_field(
+        component,
+        limit_mm=fe.median_plane_limit_mm,
+        resolution_mm=fe.median_plane_resolution_mm,
+        use_symmetry=fe.use_symmetry,
+        rank=rank, comm=comm, verbosity=verbosity,
+    )
 
     if rank <= 0:
-        print(f"  Calculating {len(points_octant)} points in octant...", flush=True)
+        path = output_path or fe.median_plane_field_output or "output/midplane_field.comsol"
+        if verbosity >= 1:
+            print(f"Writing median-plane field to '{path}'...", flush=True)
+        kwargs = {}
+        if path.lower().endswith(".comsol"):
+            kwargs = dict(components='z',
+                          description="Magnetic flux density, z-component (median plane z=0)",
+                          **_OPAL_HEADER_KWARGS)
+        field.save(path, **kwargs)
+        if verbosity >= 1:
+            print("Done!", flush=True)
 
-    # Query Radia for octant only
-    bz_octant = np.array(rad.Fld(cyclotron_id, 'bz', points_octant_3d.tolist(), use_gpu=True))
+    return field
+
+
+def save_bore_field(config: CyclotronConfig,
+                    component: ComponentOrId,
+                    output_path: Optional[str] = None,
+                    rank: int = 0,
+                    comm=None,
+                    verbosity: int = 1) -> Optional[Field]:
+    """Compute and save the 3D bore field (Bx, By, Bz)."""
+    fe = config.field_evaluation
+    xy_axis = symmetric_axis(fe.bore_xy_limit_mm, fe.bore_resolution_mm)
+    n_z = int(round((fe.bore_z_max_mm - fe.bore_z_min_mm) / fe.bore_resolution_mm)) + 1
+    z_axis = fe.bore_z_min_mm + np.arange(n_z) * fe.bore_resolution_mm
+
+    if rank <= 0 and verbosity >= 1:
+        print(f"Calculating 3D bore field ({len(xy_axis)}x{len(xy_axis)}x{n_z} points)...",
+              flush=True)
+
+    field = get_field_3d(component, xy_axis, xy_axis, z_axis,
+                         use_symmetry=fe.use_symmetry,
+                         rank=rank, comm=comm, verbosity=verbosity,
+                         label="Radia B-field (bore)")
 
     if rank <= 0:
-        print(f"  Received {len(bz_octant)} field values", flush=True)
+        path = output_path or fe.bore_field_output or "output/bore_field.comsol"
+        if verbosity >= 1:
+            print(f"Writing bore field to '{path}'...", flush=True)
+        kwargs = {}
+        if path.lower().endswith(".comsol"):
+            kwargs = dict(description="Magnetic flux density components (bore)",
+                          **_OPAL_HEADER_KWARGS)
+        field.save(path, **kwargs)
+        if verbosity >= 1:
+            print("Done!", flush=True)
 
-        # ===== APPLY SYMMETRIES =====
-        if symmetries:
-            print("  Applying 8-fold symmetry...", flush=True)
-
-        points_full = []
-        bz_full = []
-
-        for i, (xy, bz) in enumerate(zip(points_octant, bz_octant)):
-            x, y = xy
-            if symmetries:
-                # 8 symmetric copies via mirror operations
-                symmetric_points = [
-                    (x, y),  # Octant 1: original
-                    (y, x),  # Octant 2: mirror across x=y
-                    (x, -y),  # Octant 3: mirror across x-axis
-                    (y, -x),  # Octant 4: mirror across x=y then x-axis
-                    (-x, y),  # Octant 5: mirror across y-axis
-                    (-y, x),  # Octant 6: mirror across y-axis then x=y
-                    (-x, -y),  # Octant 7: mirror across both axes
-                    (-y, -x),  # Octant 8: mirror across both axes then x=y
-                ]
-            else:
-                # all already included
-                symmetric_points = [
-                    (x, y),  
-                ]
-
-            for (xi, yi) in symmetric_points:
-                points_full.append([xi, yi])
-                bz_full.append(bz)
-
-        points_full = np.array(points_full)
-        bz_full = np.array(bz_full)
-
-        # Remove duplicates (points on axes counted multiple times)
-        points_full_tuple = [tuple(p) for p in points_full]
-        unique_points, unique_indices = np.unique(np.array(points_full_tuple), axis=0, return_index=True)
-
-        points_full = np.array(unique_points)
-        bz_full = bz_full[unique_indices]
-
-        # Sort by y, then by x
-        points_full = points_full[np.lexsort((points_full[:, 0], points_full[:, 1]))]
-        # Reorder bz_full to match sorted points
-        sort_idx = np.lexsort((points_full[:, 0], points_full[:, 1]))
-        bz_full = bz_full[sort_idx]
-
-        print(f"  Total unique points after symmetry: {len(points_full)}", flush=True)
-        print("Done!", flush=True)
-
-        header_text = f"""% Model:              uCyclo_v2
-% Version:            Cyclotron Optimizer v0.1
-% Date:               {datetime.date.today()}
-% Dimension:          2
-% Nodes:              {len(bz_full)}
-% Expressions:        1
-% Description:        Magnetic flux density, z-component
-% Length unit:        m
-% x                   y                    Bz (T)
-"""
-
-        points_m = points_full * 1e-3  # mm to m for OPAL
-        data = np.column_stack((points_m, bz_full))
-
-        print("Writing Midplane field...", flush=True)
-
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        with open(output_path, "w") as _of:
-            _of.write(header_text)
-            for _d in data:
-                _of.write(f"{_d[0]}            {_d[1]}            {_d[2]}\n")
-        print("Done!", flush=True)
-
-    return 0
+    return field
 
 
-# def save_median_plane_field(config: CyclotronConfig,
-#                             cyclotron_id=None,
-#                             rank=0,
-#                             comm=None):
-#
-#     # TODO: If cyclotron_id is None: delete all radia objects and rebuild/solve the cyclotron
-#
-#     # TODO: Get limits and spacing (and filename?) from config
-#
-#     # TODO: Exploit symmetry!
-#
-#     # Create a list of points to evaluate in Radia
-#     # Create x and y coordinate arrays
-#     xmin = ymin = -400  # -400
-#     xmax = ymax = 400  # 400
-#     dxy = 0.5
-#
-#     x = np.arange(xmin, xmax + dxy / 2, dxy)  # +dxy/2 for floating point safety
-#     y = np.arange(ymin, ymax + dxy / 2, dxy)
-#
-#     # Create mesh grid
-#     xx, yy = np.meshgrid(x, y)
-#
-#     # Stack into (N, 2) array
-#     points = np.column_stack([xx.ravel(), yy.ravel()])
-#
-#     # Sort by y, then by x
-#     points = points[np.lexsort((points[:, 0], points[:, 1]))]
-#     points = np.column_stack((points, np.zeros(len(points))))
-#
-#     if rank <= 0:
-#         print("Calculating Midplane field...", flush=True)
-#
-#     # Note: For some reason, Radia only returns results on rank 0.
-#     # So we have to either bcast the results to other ranks or restrict
-#     # the rest of the function to rank 0.
-#     bz = np.array(rad.Fld(cyclotron_id, 'bz', points.tolist()))
-#
-#     if rank <= 0:
-#         print("Done!", flush=True)
-#         # print(points.tolist(), flush=True)
-#         # print(bz, flush=True)
-#         # print(len(bz), flush=True)
-#
-#         header_text = f"""% Model:              uCyclo_v2
-# % Version:            Cyclotron Optimizer v0.1
-# % Date:               {datetime.date.today()}
-# % Dimension:          2
-# % Nodes:              {len(bz)}
-# % Expressions:        1
-# % Description:        Magnetic flux density, z-component
-# % Length unit:        m
-# % x                   y                    Bz (T)
-# """
-#
-#         points *= 1e-3  # mm to m for OPAL
-#         data = np.column_stack((points, bz))
-#
-#         print("Writing Midplane field...", flush=True)
-#         with open(r"output/midplane_field.dat", "w") as _of:
-#             _of.write(header_text)
-#             for _d in data:
-#                 _of.write(f"{_d[0]}            {_d[1]}            {_d[2]}\n")
-#         print("Done!", flush=True)
-#
-#     return 0
-
-
+# ---------------------------------------------------------------------------
+# Solver
+# ---------------------------------------------------------------------------
 class ReusableCyclotronSolver:
     """Stateful cyclotron solver that enables coil-current reuse.
 
@@ -757,6 +452,11 @@ class ReusableCyclotronSolver:
         self._coils = None
         self._cyclotron = None
         self._im = None          # interaction matrix (rad.RlxPre handle)
+
+    @property
+    def cyclotron(self) -> Optional[BaseRadiaComponent]:
+        """The assembled cyclotron component (iron + coils), or None before build()."""
+        return self._cyclotron
 
     def build(self, pole_shape, coil_current):
         """Full (re)build from scratch (new shims), then solve."""
@@ -814,18 +514,19 @@ class ReusableCyclotronSolver:
         self._cyclotron = BaseRadiaComponent.containerize([*self._iron_subs, self._coils])
         cid = self._cyclotron.id
 
-        if self.rank <= 0 and self.verbosity >= 1:
+        say = self.rank <= 0 and self.verbosity >= 1
+        if say:
             print("Building Interaction Matrix...", flush=True)
             t0 = time.time()
         self._im = rad.RlxPre(cid)
-        if self.rank <= 0 and self.verbosity >= 1:
+        if say:
             print(f"Done! Assembling took {time.time() - t0} s.", flush=True)
             print("Solving...", flush=True)
             t0 = time.time()
         zerom = 'ZeroM->True' if zero_magnetization else 'ZeroM->False'
         result = rad.RlxAuto(self._im, self.config.simulation.precision,
                              self.config.simulation.iterations, 9, zerom, 'omega->0.3')
-        if self.rank <= 0 and self.verbosity >= 1:
+        if say:
             print(f"Done! Auto-Relaxation took {time.time() - t0} s", flush=True)
             print(f"target={self.config.simulation.precision}: "
                   f"iter={result[3]:.0f}, misfitM={result[0]:.6e}", flush=True)
@@ -833,16 +534,19 @@ class ReusableCyclotronSolver:
         converged = (result[0] <= self.config.simulation.precision)
         misfit = float(result[0])
 
-        num_angles = self.config.field_evaluation.num_points_circle
-        if self.config.field_evaluation.iso_method != "seo":
-            bz_values = get_median_plane_field_rz(
-                cid, self.radii_mm, num_angles,
-                use_symmetry=self.config.field_evaluation.use_symmetry,
-                rank=self.rank, comm=self.comm)
+        fe = self.config.field_evaluation
+        if fe.iso_method != "seo":
+            bz_values = get_field_rz(
+                self._cyclotron, self.radii_mm, fe.num_points_circle,
+                use_symmetry=fe.use_symmetry,
+                rank=self.rank, comm=self.comm, verbosity=self.verbosity)
         else:
-            bz_values = get_median_plane_field_2d(
-                self.config, cid, limit=400, resolution=1.0,
-                rank=self.rank, comm=self.comm)
+            bz_values = get_median_plane_field(
+                self._cyclotron,
+                limit_mm=fe.median_plane_limit_mm,
+                resolution_mm=fe.median_plane_resolution_mm,
+                use_symmetry=fe.use_symmetry,
+                rank=self.rank, comm=self.comm, verbosity=self.verbosity)
 
         return self.radii_mm, bz_values, converged, misfit
 
@@ -853,69 +557,27 @@ def evaluate_radii_parallel(config: CyclotronConfig,
                             rank: int = 0,
                             comm=None,
                             verbosity=1):
-    """
-    Evaluate B-field at multiple radii using single rad.Fld() call for all points.
+    """Build the cyclotron, relax, and evaluate the field for the isochronism method.
 
-    All processes execute this in parallel (Radia MPI handles parallelization).
-    Only rank 0 receives field results from Radia.
+    Thin wrapper around ReusableCyclotronSolver.build() (single source of truth
+    for the build -> RlxPre -> RlxAuto -> query sequence). All processes execute
+    this collectively (Radia MPI handles parallelization); only rank 0 receives
+    field results from Radia.
 
     :param config: CyclotronConfig object
     :param pole_shape: a PoleShape instance
     :param radii_mm: List of radii to evaluate (mm)
     :param rank: MPI rank (0 for sequential)
-    :param verbosity
-    :return: Tuple of (radii_mm, bz_values, converged_flag, cyclotron_id, misfit)
-                Note: bz_values is None on non-rank-0 processes; misfit is the achieved
-                relaxation misfit (result[0]), valid on all ranks.
+    :param comm: MPI communicator
+    :param verbosity: 0 silent, 1 normal, 2 debug
+    :return: Tuple (radii_mm, bz_values, converged, cyclotron, misfit).
+        bz_values is an RZFieldGrid (circle/gordon) or a PyPATools Field (seo)
+        on rank 0, None on other ranks; cyclotron is the assembled
+        BaseRadiaComponent (use .id for the radia object id); misfit is the
+        achieved relaxation misfit (valid on all ranks).
     """
-    if isinstance(radii_mm, np.ndarray):
-        radii_mm = radii_mm.tolist()
-
-    if not isinstance(radii_mm, list):
-        radii_mm = [radii_mm]
-
-    # Clear previous Radia objects
-    rad.UtiDelAll()
-
-    # Build geometry
-    cyclotron = build_geometry(config, pole_shape, rank=rank, comm=comm, verbosity=verbosity).id
-
-    if rank <=0 and verbosity >= 1:
-        print("Building Interaction Matrix...", flush=True)
-        t0 = time.time()
-    im_id = rad.RlxPre(cyclotron)
-    if rank <=0 and verbosity >= 1:
-        print(f"Done! Assembling took {time.time()- t0} s.", flush=True)
-
-    if rank <=0 and verbosity >= 1:
-        print("Solving...", flush=True)
-        t0 = time.time()
-    result = rad.RlxAuto(im_id, config.simulation.precision, config.simulation.iterations,
-                         9, 'ZeroM->False', 'omega->0.3')
-    if rank <=0 and verbosity >= 1:
-        print(f"Done! Auto-Relaxation took {time.time() - t0} s", flush=True)
-        print("Result:", result, flush=True)
-        print(f"\ntarget={config.simulation.precision}: iter={result[3]:.0f}, misfitM={result[0]:.6e}")
-
-    converged = (result[0] <= config.simulation.precision)  # Note: first result item is precision reached
-    misfit = float(result[0])  # achieved relaxation misfit (for the optimizer's convergence gate)
-
-    # Query all radii at once with single rad.Fld() call
-    num_angles = config.field_evaluation.num_points_circle
-
-    if config.field_evaluation.iso_method != "seo":
-        bz_values = get_median_plane_field_rz(cyclotron,
-                                              radii_mm,
-                                              num_angles,
-                                              use_symmetry=config.field_evaluation.use_symmetry,
-                                              rank=rank,
-                                              comm=comm)
-    else:
-        bz_values = get_median_plane_field_2d(config,
-                                              cyclotron,
-                                              limit=400,  #
-                                              resolution=1.0,  # resolution in x and y (mm)
-                                              rank=rank,
-                                              comm=comm)
-
-    return radii_mm, bz_values, converged, cyclotron, misfit
+    solver = ReusableCyclotronSolver(config, radii_mm, rank=rank, comm=comm,
+                                     verbosity=verbosity)
+    radii_out, bz_values, converged, misfit = solver.build(
+        pole_shape, config.coil.current_A)
+    return radii_out, bz_values, converged, solver.cyclotron, misfit
