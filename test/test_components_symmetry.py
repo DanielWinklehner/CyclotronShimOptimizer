@@ -4,10 +4,10 @@ import _testenv  # noqa: F401
 
 import numpy as np
 
-import geometry.components as components
+import cyclotron_optimizer.geometry.components as components
 from _radia_stub import RadiaStub
-from geometry.components import BaseRadiaComponent, MagnetizedComponent
-from geometry.symmetry import canonical_symmetry_set, collect_field_symmetries
+from cyclotron_optimizer.geometry.components import BaseRadiaComponent, MagnetizedComponent
+from cyclotron_optimizer.geometry.symmetry import canonical_symmetry_set, collect_field_symmetries
 
 SYMS = [
     ("perp", [0, 0, 0], [1, -1, 0]),

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cyclotron-optimizer"
+version = "0.2.0"
+description = "Radia-based compact-cyclotron design, field evaluation, and shim optimization"
+requires-python = ">=3.11"
+# Heavy scientific deps (radia/RadiaCUDA, gmsh, cupy, mpi4py, PyPATools,
+# PyCentralRegion, PyRadia) are managed by the radiacuda2 conda environment
+# and are intentionally NOT declared here -- install this package editable
+# into that environment: pip install -e . --no-deps
+dependencies = [
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "pyyaml",
+]
+
+[tool.setuptools.packages.find]
+include = ["cyclotron_optimizer*"]

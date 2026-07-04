@@ -10,7 +10,7 @@ import _testenv  # noqa: F401
 import numpy as np
 
 from PyPATools.field import Field
-from visualization.field_maps import (
+from cyclotron_optimizer.visualization.field_maps import (
     _field_plane_mm,
     build_field_plane,
     plot_median_plane_field,

@@ -1,290 +1,166 @@
 # Cyclotron Optimizer
 
-A three-phase optimization framework for cyclotron magnet design, featuring MPI parallelization, 
-[Radia](https://github.com/ochubar/Radia)  magnetostatics integration, and component-based geometry generation with intelligent radial segmentation.
-This program can calculate the magnetic field for a given geometry (only round, 4-hill isochronous cyclotrons for now)
-display magnetic fields and isochronism and optimize the shims (top and side) for maximum isochronism.
+A library-first framework for compact-cyclotron magnet design: GPU-accelerated
+[RadiaCUDA](https://github.com/DanielWinklehner/RadiaCUDA) magnetostatics,
+component-based geometry (gmsh-OCC / STP tet meshing), symmetry-exploiting
+field evaluation, isochronism analysis (circle / Gordon / SEO tracking), and
+DFO-LS shim optimization.
 
-This code was written for the [IsoDAR](https://www.nevis.columbia.edu/isodar/) project.
+Written for the [IsoDAR](https://www.nevis.columbia.edu/isodar/) project.
+Currently Windows-only (tested on Win 11) with a single CUDA GPU.
 
-Note: Currently this code only runs in Windows (tested on Win 11).
+## Quick start
 
-## Overview
-
-This project optimizes cyclotron pole geometry to achieve isochronism (frequency flatness across the acceleration radius) by intelligently varying:
-
-- **Top shims**: Vertical displacement at each radius (Phase 1)
-- **Side shims**: Angular displacement at each radius (Phase 2)  
-- **Coil current**: RF drive amplitude for target frequency (Phase 3)
-
-Advanced features include:
-- **Magnetization caching**: Warm-starts subsequent solves via Radia's interaction matrix reuse
-- **MPI parallelization**: Distributed objective function evaluation
-- **Component-based geometry**: Modular architecture with automatic segmentation handling
-- **Real-time visualization**: Live optimization progress plots
-
-## Requirements
-
-### System Requirements
-- Python 3.8.x (Note: 3.8 is mandatory for now as the radia binary was compiled for 3.8)
-- Radia (magnetostatics solver) - included in `/radialib`
-- MPI runtime (optional, for parallel execution)
-
-### Python Dependencies
-
-```
-numpy~=1.24.4
-scipy~=1.10.1
-matplotlib~=3.7.3
-sympy~=1.13.3
-tqdm~=4.67.1
-scikit-optimize~=0.10.2
-mpi4py~=4.0.0 (optional, for MPI support)
-yaml~=0.2.5
-pyyaml~=6.0.2
-```
-
-### Installation
+The package installs editable into the `radiacuda2` conda environment (which
+provides radia/RadiaCUDA, gmsh, cupy, mpi4py, PyPATools, PyRadia):
 
 ```bash
-# Clone repository
-git clone https://github.com/DanielWinklehner/CyclotronShimOptimizer.git
-cd cyclotron_optimizer
-
-# Install dependencies
-pip install -r requirements.txt
-```
-OR
-
-Using Anaconda (recommended): 
-```bash
-conda env create -n <env_name> -f environment.yml
+pip install -e . --no-deps
 ```
 
-## Capabilities
-
-### Optimization Features
-
-- **Three-Phase Workflow**
-  - Phase 1: Optimize top shims for frequency flatness
-  - Phase 2: Optimize side shims (top shims fixed) for improved flatness
-  - Phase 3: Optimize coil current for target RF frequency
-
-- **Multi-Start Nelder-Mead**
-  - Configurable number of random restarts per phase
-  - Early stopping via plateau detection
-  - Normalized parameter space [0, 1]
-  - Bounded optimization with physical constraints
-
-- **Objective Function**
-  - Flatness metric: `σ(frequencies)` across acceleration radius
-  - Regularization term: `λ × ||x_norm||_L2` to minimize excessive shimming
-  - MPI-distributed evaluation across worker ranks
-
-### Geometry Features
-
-- **Component-Based Design**
-  - Modular components: yoke, lids, pole base, shims, coils
-  - Automatic material assignment and drawing attributes
-  - Symmetry operations: 8-fold (4-fold in-plane + 2-fold z)
-
-- **Intelligent Radial Segmentation**
-  - Interpolation-based workaround for Radia's segmentation limitations
-  - Per-radius elevation and angular offset support
-  - Fine mesh generation at optimization scale
-
-- **Complex Geometry Handling**
-  - Angled surface cuts for sloped shimming
-  - Boundary segment detection for mismatched arc lengths
-  - Degenerate polygon filtering (< 0.001 mm²)
-  - 3D plane/line intersections via SymPy
-
-### Magnetization Caching
-
-- **Automatic Cache Management**
-  - Parameter signature hashing (MD5) for validity checking
-  - Tracks: coil current, yoke geometry, lid geometry, pole base geometry
-  - Stale cache automatic invalidation
-
-- **Warm-Start Solving**
-  - Extract yoke magnetizations after base solve
-  - Use as external field source in subsequent solves
-  - Radia `RlxAuto(..., 'ZeroM->False')` prevents matrix reset
-  - 2-5× speedup on convergence
-
-### B-H Curves
-BH curves can be loaded from a file in the radialib folder. Users can add their own BH curves there. The format is 
-comma-separated value, the units are T (mu_0 * A / m) and T. 
-The corresponding Radia function is: 
-
-```
-MatSatIsoTab(...)
-    MatSatIsoTab([[H1,M1],[H2,M2],...]) creates a nonlinear isotropic magnetic material with the M versus H curve defined by the list of pairs [[H1,M1],[H2,M2],...] in Tesla.
-```
-
-If the "bh_filename" entry is omitted from the config file, the default setup is used
-
-```
-MatSatIsoFrm(...)
-    MatSatIsoFrm([ksi1,ms1],[ksi2,ms2],[ksi3,ms3]) creates a nonlinear isotropic magnetic material with the M versus H curve defined by the formula M = ms1*tanh(ksi1*H/ms1) + ms2*tanh(ksi2*H/ms2) + ms3*tanh(ksi3*H/ms3), where H is the magnitude of the magnetic field strength vector (in Tesla). The parameters [ksi3,ms3] and [ksi2,ms2] may be omitted; in such a case the corresponding terms in the formula will be omitted too.
-```
-
-with [ksi1,ms1],[ksi2,ms2],[ksi3,ms3] given by the user in the config file.
-
-## Core Implementation
-
-### Architecture
-
-```
-┌─ config.yml (CyclotronConfig)
-│
-├─ main.py
-│  └─ Timer, MPI initialization
-│
-├─ CyclotronOptimizer (optimizer.py)
-│  ├─ Phase 1: optimize_phase(top)
-│  ├─ Phase 2: optimize_phase(side)
-│  └─ Phase 3: optimize_coil_final()
-│
-├─ evaluate_cyclotron_objective_simplified() (objective_function.py)
-│  ├─ Reconstruct pole geometry
-│  ├─ Solve magnetostatics (all ranks)
-│  ├─ Calculate revolution frequencies (rank 0)
-│  └─ Compute flatness + regularization
-│
-├─ evaluate_radii_parallel() (field_calculator.py)
-│  ├─ Build geometry (build_geometry)
-│  ├─ Create interaction matrix (rad.RlxPre)
-│  ├─ Solve with warm-start (rad.RlxAuto)
-│  └─ Query B-field at all radii (single rad.Fld call)
-│
-├─ RadiaCache (magnetization_cache.py)
-│  ├─ Compute parameter signature
-│  ├─ Save/load pickle files
-│  └─ Apply cached magnetizations
-│
-└─ GeometricComponent hierarchy (components.py)
-   ├─ AnnularWedgeComponent (yoke, lids, pole)
-   ├─ LidUpperComponent (tapered upper lid)
-   ├─ TopShimComponent (top surface shims)
-   ├─ SideShimComponent (side surface shims)
-   └─ CoilComponent (RF coils)
-```
-
-## Usage Example
-
-### Running Optimization
-
-**2. Single-process (no MPI):**
-
-```bash
-python main.py --optimize --config <config_file_name> --verbosity 1
-```
-
-**3. With MPI (4 processes):**
-
-```bash
-mpiexec -n 4 python main.py --optimize --config <config_file_name> --verbosity 1
-```
-
-**4. With magnetization caching (first run):**
-
-```bash
-mpiexec -n 4 python main.py --optimize --config <config_file_name> --cached --verbosity 1
-```
-
-This creates cache on first run; subsequent runs use warm-start.
-
-**5. Geometry visualization only:**
-
-```bash
-python main.py --geo_test --config <config_file_name> --verbosity 2
-```
-
-Opens OpenGL viewer of current geometry.
-
-### Output Files
-
-```
-output/
-├── radia_cache/
-│   └── magnetizations_{MD5_SIGNATURE}.pkl
-├── cyclotron_pole.txt
-├── optimization_diagnostics_{TIMESTAMP}.csv
-└── plots/
-    ├── isochronism_results.png
-    └── frequency_deviation.png
-```
-
-**Diagnostics CSV columns:**
-```
-phase, iteration, multistart, nelder_iter, avg_frequency_mhz, 
-flatness, regularization, objective, side_param_0, ..., top_param_0, ...
-```
-
-Note: For troubleshooting, each function call appears twice in the CSV: Once before the solve and field calculation and 
-once after. This is so one can look up the shim values for which a solve failed. The "before" lines are indicated by a 
--1 in the "objective" column.
-
-## Python API Example
+Project scripts import the package; the runtime lifecycle (radia/MPI init
+ordering, environment quirks) is handled by the `Session` facade:
 
 ```python
-from config_io.config import CyclotronConfig
-from geometry.pole_shape import PoleShape
-from geometry.geometry import build_geometry
-from simulation.field_calculator import evaluate_radii_parallel
-import numpy as np
+import cyclotron_optimizer as co
 
-# Load configuration
-config = CyclotronConfig.from_yaml('config.yml')
+with co.Session("examples/config_muon_smaller.yml") as s:
+    model = s.build()                 # defaults (shims, radii, current) from config
+    model.solve()                     # mesh + assemble + relax (GPU)
+    iso = model.isochronism()         # circle / gordon / seo per config
+    fmap = model.median_plane_field(resolution_mm=2.0, gpu_precision="single")
+    if s.is_root:
+        print(f"mean f = {iso['mean_freq_mhz']:.4f} MHz "
+              f"({iso['percent_dev']:.3f} % dev)")
+        fmap.save("output/midplane.comsol")
+    model.show(field=fmap)            # PyVista viewer + field overlay
+```
 
-# Create pole geometry with custom shims
-pole_shape = PoleShape(
-    n_segments=14,
-    side_offsets=np.array([5.0] * 15),  # 5° at all radii
-    top_offsets=np.array([7.0] * 15)     # 7 mm at all radii
-)
+Ready-made workflow scripts live in `examples/` (each takes an optional
+config path argument):
 
-# Build geometry (rank 0, no MPI)
-cyclotron_id, pole_id = build_geometry(
-    config, 
-    pole_shape,
-    rank=0,
-    verbosity=1
-)
+```bash
+python examples/view_geometry.py        # geometry only, no solve
+python examples/solve_and_plot.py       # solve + isochronism + field overlay
+python examples/export_fieldmaps.py     # midplane + 3D bore field maps
+python examples/optimize_shims.py       # DFO-LS shim optimization
+```
 
-# Evaluate B-field
-radii_mm = np.linspace(50, 400, 50)
-radii_out, bz_values, converged, cyclotron, misfit = evaluate_radii_parallel(
-    config,
-    pole_shape,
-    radii_mm.tolist(),
-    rank=0
-)
+The legacy all-in-one flow (full analysis + plots + comparison maps) remains
+available as `python -m cyclotron_optimizer.api --config <yml> [--optimize]`.
 
-# bz_values is an RZFieldGrid (circle/gordon) or a PyPATools Field (seo);
-# cyclotron is the assembled geometry component (cyclotron.id = radia id)
-print(f"Convergence: {converged}")
-print(f"B-field range: {bz_values.bz.min():.4f} to {bz_values.bz.max():.4f} T")
+**MPI contract**: every `Session`/`CyclotronModel` method is collective and
+returns data on rank 0 only -- write scripts top-to-bottom as if
+single-process and guard only prints/saves with `session.is_root`. Note that
+on a single-GPU machine `mpiexec` does NOT speed up GPU solves (radia's
+relaxation runs on rank 0; extra ranks idle); multi-rank helps only the
+CPU-cluster mode (`use_gpu={"assembly": False, ...}` distributes the
+interaction-matrix assembly).
+
+## Machine configuration (component-based)
+
+A machine is a list of components with named materials and symmetries
+(`examples/config_muon_smaller.yml` is the reference):
+
+```yaml
+materials:
+  iron: {type: bh_file, file: "../resources/dillinger_steel.csv"}
+
+symmetries:
+  cyclotron_8fold:
+    - [perp, [0, 0, 0], [1, -1, 0]]
+    - [perp, [0, 0, 0], [1, 0, 0]]
+    - [perp, [0, 0, 0], [0, 1, 0]]
+    - [para, [0, 0, 0], [0, 0, 1]]
+
+components:
+  - {name: yoke, kind: stp, file: "../resources/uCyclo_v2_YokeWall.stp",
+     material: iron, symmetry: cyclotron_8fold, mesh: {max_size: 50}}
+  - {name: pole, kind: pole, material: iron, symmetry: cyclotron_8fold,
+     shimmed: true, mesh: {max_size: 50},
+     params: {inner_radius_mm: 50.0, outer_radius_mm: 400.0, height_mm: 230.0,
+              half_angle_deg: 10.0, pole_zs: -285.0}}
+  - {name: coils, kind: racetrack_pair, symmetry: cyclotron_8fold,
+     params: {radius_min_mm: 460.0, radius_max_mm: 574.5, height_mm: 123.5,
+              midplane_dist: 55, current_A: 15368, num_segments: 25}}
+```
+
+- `kind` selects a registered builder (`stp`, `wedge`, `lid_upper`, `pole`,
+  `wedge_pair`, `racetrack_pair`); adding a part is a YAML entry plus, at
+  most, one new builder in `geometry/geometry.py`.
+- `symmetry` names the component's FIELD symmetry: applied as radia
+  `TrfZer*` mirrors for magnetized parts, only DECLARED (metadata for the
+  field-map folding) for current sources. Components with `symmetry: null`
+  (e.g. the extraction channel) are evaluated unfolded automatically.
+- **Coils are always built full-size** (both coils of the pair): radia
+  symmetry transforms on current sources force a full CPU fallback on the
+  GPU field path (RadiaCUDA issue #16).
+- `shimmed: true` marks the pole whose shape follows the `PoleShape` shim
+  offsets; the solver rebuilds only it (and the coils) per optimizer iterate,
+  reusing the static yoke/lids meshes.
+- Relative file paths resolve against the YAML's own directory, so a config
+  travels with its project folder.
+- Legacy fixed-section configs still load (adapted internally to the same
+  component description).
+
+Workflow settings (field evaluation radii/methods, relaxation precision,
+optimizer hyperparameters, visualization) live in the remaining config
+sections; most have per-call overrides on the `CyclotronModel` methods.
+
+## GPU / precision control
+
+`use_gpu` is accepted everywhere as a bool, or granular per stage:
+
+```python
+model = s.build(use_gpu={"assembly": True,     # interaction matrix (RlxPre)
+                         "relaxation": True,   # RlxAuto method 9 (CUDA) vs 4
+                         "field": True})       # rad.Fld evaluations
+```
+
+Field maps additionally accept `gpu_precision="single"` (fp32 kernel,
+~16x faster, visualization-grade ~1e-4; keep the default `"double"` for
+anything feeding tracking).
+
+## B-H curves
+
+BH curves load from CSV (comma-separated, units T (mu_0*H) and T) referenced
+by the config's `materials:` section; `resources/` ships the BH curves (`dillinger_steel.csv`, `COMSOL_1010_BH_T_A-m.csv`).
+A `sat_iso_frm` material type exposes Radia's `MatSatIsoFrm` formula
+alternative.
+
+## Repository layout
+
+```
+cyclotron_optimizer/     the installable package
+  session.py             Session / CyclotronModel facade
+  api.py                 legacy full-analysis workflow + CLI
+  config_io/             two-schema config loading (components + legacy)
+  geometry/              component builders, symmetry algebra, gmsh meshing
+  simulation/            field evaluation/export, solver, diagnostics
+  optimization/          DFO-LS / Nelder-Mead shim optimization
+  visualization/         plots, field maps, PyVista overlays
+examples/                machine configs + workflow scripts
+test/                    test suite (python test/run_tests.py)
+scripts/                 one-off verification/dev scripts
+resources/               STP geometry files
+resources/               STP geometry + BH curve data
 ```
 
 ## Troubleshooting
 
 | Issue | Solution |
 |-------|----------|
-| `ImportError: No module named 'radia'` | Check `RADIA_PATH` in `main.py`, verify radialib present |
-| Radia convergence failures | Increase `simulation.iterations`, reduce `precision` |
-| Memory exhaustion | Reduce `segmentation` factors, fewer `field_evaluation.n_eval_pts` |
-| Slow optimization | Enable `--cached` flag, reduce `n_initial_points` |
-| MPI rank sync errors | Ensure all ranks have identical config.yml |
+| `ImportError: No module named 'radia'` | Run inside the `radiacuda2` env (RadiaCUDA installs `radia.pyd`) |
+| Radia convergence failures | Increase `simulation.iterations`, relax `precision` |
+| `rad.Fld` unexpectedly slow | Check for the CPU-fallback warning (GPU gate accepts only `b`/`bx`/`by`/`bz`) |
+| `mpiexec -n N` not faster | Expected for GPU solves (rank-0 relaxation); use ranks for CPU assembly only |
+| MPI rank sync errors | All ranks must load the identical config |
 
 ## Citation
 
-If you use this optimizer in published work, please cite:
-
 ```bibtex
-@software{cyclotron_optimizer_2024,
-  title={Cyclotron Optimizer: MPI-Parallel Magnet Design Framework},
+@software{cyclotron_optimizer_2026,
+  title={Cyclotron Optimizer: GPU-Accelerated Cyclotron Magnet Design Framework},
   author={Daniel Winklehner},
   year={2026},
   url={https://github.com/DanielWinklehner/CyclotronShimOptimizer}
@@ -293,10 +169,5 @@ If you use this optimizer in published work, please cite:
 
 ## Contact & Support
 
-For issues, questions, or contributions:
 - **Issues**: GitHub Issues tracker
-- **Email**: [winklehn@mit.edu]
-
----
-
-**Last Updated**: January 22, 2026  
+- **Email**: winklehn@mit.edu

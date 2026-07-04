@@ -6,3 +6,5 @@ generate_md.py
 # Python build artifacts
 __pycache__/
 *.py[cod]
+/scripts/
+/cyclotron_optimizer.egg-info/

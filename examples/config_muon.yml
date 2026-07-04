@@ -1,0 +1,151 @@
+# Muon cyclotron (860 mm yoke) machine configuration -- component-based schema.
+# Migrated from the legacy config_muon.yml (fully programmatic gmsh-OCC
+# geometry, no STP files). Legacy mesh sizes were unset; 50/25 mm defaults
+# match the other machines.
+
+particle_species: "muon"
+max_machine_size_mm: 860.0
+seed: 42
+
+# ---------------------------------------------------------------------------
+# Machine description
+# ---------------------------------------------------------------------------
+materials:
+  iron:
+    type: bh_file
+    file: "../resources/dillinger_steel.csv"  # relative to this yml
+
+symmetries:
+  cyclotron_8fold:
+    - [perp, [0, 0, 0], [1, -1, 0]]   # mirror across x=y diagonal
+    - [perp, [0, 0, 0], [1, 0, 0]]    # mirror across x=0 plane
+    - [perp, [0, 0, 0], [0, 1, 0]]    # mirror across y=0 plane
+    - [para, [0, 0, 0], [0, 0, 1]]    # mirror across z=0 plane
+
+components:
+  - name: yoke
+    kind: wedge
+    material: iron
+    symmetry: cyclotron_8fold
+    mesh: {max_size: 50}
+    params:
+      inner_radius_mm: 696.5
+      outer_radius_mm: 860.0
+      height_mm: 188.5
+      z_offset_mm: 0.0
+      end_ang_deg: 45.0
+      include_window: true
+      window_width_mm: 300.0
+
+  - name: lid_lower
+    kind: wedge
+    material: iron
+    symmetry: cyclotron_8fold
+    mesh: {max_size: 50}
+    params:
+      inner_radius_mm: 400.0
+      outer_radius_mm: 860.0
+      height_mm: 96.5
+      z_offset_mm: -188.5              # below the yoke wall
+      end_ang_deg: 45.0
+
+  - name: lid_upper
+    kind: lid_upper
+    material: iron
+    symmetry: cyclotron_8fold
+    mesh: {max_size: 50}
+    params:
+      inner_radius_mm: 165.0
+      outer_radius_mm_1: 860.0
+      outer_radius_mm_2: 787.0
+      height_mm: 80.0
+      z_offset_mm: -285.0              # -(yoke 188.5 + lid_lower 96.5)
+      end_ang_deg: 45.0
+      seg_theta: 1
+
+  - name: pole
+    kind: pole
+    material: iron
+    symmetry: cyclotron_8fold
+    shimmed: true                      # shape follows the PoleShape shims
+    mesh: {max_size: 25}
+    params:
+      inner_radius_mm: 50.0
+      outer_radius_mm: 400.0
+      height_mm: 230.0                 # 235 originally, but top shim is min 5 mm
+      half_angle_deg: 10.0             # 20 deg full angle
+      pole_zs: -285.0
+
+  # Full-size +/-z coil pair, NO radia symmetry transforms: symmetrized
+  # current sources force a full CPU fallback on the GPU field path
+  # (RadiaCUDA issue #16). The symmetry below is only DECLARED metadata for
+  # the field-map folding, which is exact for the physically complete pair.
+  - name: coils
+    kind: racetrack_pair
+    symmetry: cyclotron_8fold
+    params:                            # names match CoilConfig (live current source)
+      radius_min_mm: 460.0
+      radius_max_mm: 674.5
+      height_mm: 123.5
+      midplane_dist: 55
+      current_A: 18000                 # Amp-turns (initial; optimizer overrides)
+      num_segments: 25
+
+# ---------------------------------------------------------------------------
+# Shim parametrization (initial/default shape; optimizers pass their own)
+# ---------------------------------------------------------------------------
+side_shim:
+  include: true
+  num_rad_segments: 14
+  angular_resolution_deg: 1.25
+  default_offset_deg: 5.0
+  # Best so far:
+  side_offsets_deg: [9.401, 6.186, 5.979, 6.112, 6.252, 6.689, 6.807, 5.854, 5.306, 5.0, 5.12, 5.422, 6.65, 9.05, 10.64]
+  segmentation: [3, 1, 20]
+
+top_shim:
+  include: true
+  num_rad_segments: 14
+  angular_resolution_deg: 1.25
+  default_offset_mm: 5.0
+  # Best so far:
+  top_offsets_mm: [7.511, 5.0, 6.231, 7.765, 9.859, 9.871, 11.736, 14.1, 14.5, 16.9, 17.0, 17.0, 17.0, 17.0, 17.0]
+  segmentation: [3, 1, 1]
+
+# ---------------------------------------------------------------------------
+# Workflow sections
+# ---------------------------------------------------------------------------
+field_evaluation:
+  num_points_circle: 360
+  radius_min_mm: 75.0
+  radius_max_mm: 350.0
+  n_eval_pts: 12
+  use_symmetry: true
+
+simulation:
+  precision: 0.0001
+  iterations: 5000
+
+optimization:
+  target_frequency_mhz: 42
+  frequency_tolerance_mhz: 0.001
+  max_iterations: 100
+  coil_current_min_A: 25000
+  coil_current_max_A: 45000
+  side_shim_min_deg: 5
+  side_shim_max_deg: 15
+  top_shim_min_mm: 5
+  top_shim_max_mm: 20
+  num_workers: 1
+  n_initial_points: 1
+  reference_coil_current: 35000  # operating-band value (was 18000) so shims tune near the real saturation state
+  regularization_weight: 0.0
+  convergence_penalty_weight: 1.0
+  random_init: false
+  opt_top: false
+  opt_side: false
+  opt_coil: true
+  optimizer: 'nelder-mead'
+
+visualization:
+  show_opengl: true

@@ -4,7 +4,7 @@ import _testenv  # noqa: F401  (sys.path / env setup)
 
 import numpy as np
 
-from geometry.symmetry import (
+from cyclotron_optimizer.geometry.symmetry import (
     azimuthal_fold,
     azimuthal_sector,
     canonical_symmetry,

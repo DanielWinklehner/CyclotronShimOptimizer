@@ -16,6 +16,9 @@ class RadiaStub:
         self.deleted = []     # ids passed to UtiDel
         self.containers = {}  # container id -> list of member ids
         self.fields = {}      # object id -> callable((N, 3) array) -> (N, 3) array
+        self.magnetizations = {}  # leaf id -> [mx, my, mz] (ObjM)
+        self.m_step = 0.0     # ObjM values grow by this per RlxAuto (tests
+                              # exercise the perturbative delta-M convergence)
 
     # -- object management -------------------------------------------------
     def _new_id(self):
@@ -37,6 +40,41 @@ class RadiaStub:
     def UtiDelAll(self):
         self.calls.append(("UtiDelAll",))
         return 0
+
+    def ObjRaceTrk(self, center, radii, straights, height, nseg, jdens, mode, axis):
+        oid = self._new_id()
+        self.calls.append(("ObjRaceTrk", tuple(center), tuple(radii), height,
+                           nseg, jdens, oid))
+        return oid
+
+    # -- relaxation (recorded; instantly "converged") ------------------------
+    def RlxPre(self, oid, srcobj=0, use_gpu=True):
+        im = self._new_id()
+        self.calls.append(("RlxPre", oid, im, use_gpu, srcobj))
+        return im
+
+    def RlxAuto(self, im, precision, iterations, method, *options):
+        self.calls.append(("RlxAuto", im, precision, iterations, method, options))
+        if self.m_step:
+            for mid, m in self.magnetizations.items():
+                self.magnetizations[mid] = [m[0] + self.m_step, m[1], m[2]]
+        return [0.5 * precision, 0.0, 0.0, 7.0]  # converged: misfit = prec/2
+
+    def RlxUpdSrc(self, im):
+        self.calls.append(("RlxUpdSrc", im))
+        return 0
+
+    def ObjM(self, oid):
+        self.calls.append(("ObjM", oid))
+        members = self.containers.get(oid, [oid])
+        out = []
+        for mid in members:
+            for leaf, m in ([(m2, self.magnetizations.get(m2, [0.0, 0.0, 0.0]))
+                             for m2 in self.containers[mid]]
+                            if mid in self.containers
+                            else [(mid, self.magnetizations.get(mid, [0.0, 0.0, 0.0]))]):
+                out.append([[0.0, 0.0, 0.0], list(m)])
+        return out
 
     # -- transforms / attributes (recorded only) ----------------------------
     def TrfZerPerp(self, oid, point, normal):
