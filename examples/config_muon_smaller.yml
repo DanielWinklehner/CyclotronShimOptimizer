@@ -41,7 +41,7 @@ components:
     file: "../resources/uCyclo_v2_YokeWall.stp"
     material: iron
     symmetry: cyclotron_8fold
-    mesh: {max_size: 50}
+    mesh: {max_size: 60}
     mesh_group: iron
 
   - name: lid_lower
@@ -57,7 +57,7 @@ components:
     file: "../resources/uCyclo_v2_LidUpper.stp"
     material: iron
     symmetry: cyclotron_8fold
-    mesh: {max_size: 50}
+    mesh: {max_size: 40}
     mesh_group: iron
 
 #  - name: pole
@@ -72,13 +72,13 @@ components:
     material: iron
     symmetry: cyclotron_8fold
     shimmed: true                    # shape follows the PoleShape shims
-    mesh: {max_size: 30}
+    mesh: {max_size: 25}
     mesh_group: iron
     params:
       inner_radius_mm: 50.0
       outer_radius_mm: 400.0
       height_mm: 235.0
-      half_angle_deg: 15.0             # half-wedge; full pole = 30 deg
+      half_angle_deg: 15.0           # half-wedge; full pole = 30 deg
       pole_zs: -285.0                # -(yoke 188.5 + lid_lower 96.5)
       cylindrical_faces: true        # exact rim/bore cylinder patches (required
                                      # so fragment can merge them with the lid CAD)
@@ -116,16 +116,16 @@ side_shim:
   include: true
   num_rad_segments: 14
   angular_resolution_deg: 2.5
-  default_offset_deg: 0.0
-  side_offsets_deg: [0.508060939923, 0.268477357517, 0.436617667869, 2.584107127607, 3.066780216206, 3.71878354723, 2.380032674047, 0.523226584839, 0.0, 0.432610851746, 0.830951485545, 1.643234287427, 1.66867669368, 2.721763013636, 6.102593035254]
+#  default_offset_deg: 0.0
+#  side_offsets_deg: [0.508060939923, 0.268477357517, 0.436617667869, 2.584107127607, 3.066780216206, 3.71878354723, 2.380032674047, 0.523226584839, 0.0, 0.432610851746, 0.830951485545, 1.643234287427, 1.66867669368, 2.721763013636, 6.102593035254]
   segmentation: [3, 1, 20]
 
 top_shim:
   include: true
   num_rad_segments: 14
   angular_resolution_deg: 1.25
-  default_offset_mm: 0.0
-  top_offsets_mm: [0.0, 0.0, 0.873, 1.809, 2.711, 5.969, 6.965, 11.039, 12.79, 13.739, 13.884, 15.0, 15.0, 15.0, 15.0]
+#  default_offset_mm: 0.0
+#  top_offsets_mm: [0.0, 0.0, 0.873, 1.809, 2.711, 5.969, 6.965, 11.039, 12.79, 13.739, 13.884, 15.0, 15.0, 15.0, 15.0]
   segmentation: [3, 1, 1]
 
 # ---------------------------------------------------------------------------

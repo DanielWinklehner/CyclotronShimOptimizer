@@ -22,6 +22,10 @@ with co.Session(CONFIG) as s:
                                    verbosity=s.verbosity)
     result = optimizer.optimize()
 
+    print(result['best_side_shims'])
+    print(result['best_side_shims'])
+    print(result['optimal_coil'])
+
     best_shape = PoleShape(s.config.side_shim.num_rad_segments,
                            side_offsets=result['best_side_shims'],
                            top_offsets=result['best_top_shims'])
