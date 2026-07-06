@@ -140,15 +140,11 @@ class Session:
         return np.linspace(fe.radius_min_mm, fe.radius_max_mm, fe.n_eval_pts)
 
     def default_pole_shape(self) -> PoleShape:
-        """PoleShape from the config's shim settings (same logic as main.py)."""
+        """PoleShape from the config's shim settings (side and top handled
+        independently -- see PoleShape.from_shim_configs)."""
         config = self._require_config()
-        if config.side_shim.side_offsets_deg is None:
-            return PoleShape(config.side_shim.num_rad_segments,
-                             default_offset_deg=config.side_shim.default_offset_deg,
-                             default_offset_mm=config.top_shim.default_offset_mm)
-        return PoleShape(config.side_shim.num_rad_segments,
-                         side_offsets=np.array(config.side_shim.side_offsets_deg),
-                         top_offsets=np.array(config.top_shim.top_offsets_mm))
+        return PoleShape.from_shim_configs(config.side_shim.num_rad_segments,
+                                           config.side_shim, config.top_shim)
 
     # ------------------------------------------------------------------
     # Model construction / geometry-only workflows

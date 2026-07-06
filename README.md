@@ -98,6 +98,11 @@ components:
 - `shimmed: true` marks the pole whose shape follows the `PoleShape` shim
   offsets; the solver rebuilds only it (and the coils) per optimizer iterate,
   reusing the static yoke/lids meshes.
+- The pole's `half_angle_deg` is the **half**-wedge extent — the full pole
+  spans `2 x half_angle_deg` (10.0 -> a 20 deg pole). The `side_shim` offsets
+  are likewise **half-angles** added to that half-wedge, so a side offset of
+  `X` deg widens the full pole by `2 x X` (X on each radial face). `top_shim`
+  offsets are per-radial-boundary top-shim heights in mm.
 - Relative file paths resolve against the YAML's own directory, so a config
   travels with its project folder.
 - Legacy fixed-section configs still load (adapted internally to the same

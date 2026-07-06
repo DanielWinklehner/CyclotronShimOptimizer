@@ -471,7 +471,7 @@ def save_median_plane_field(config: CyclotronConfig,
     )
 
     if rank <= 0:
-        path = output_path or fe.median_plane_field_output or "output/midplane_field.comsol"
+        path = output_path or "output/midplane_field.comsol"
         if verbosity >= 1:
             print(f"Writing median-plane field to '{path}'...", flush=True)
         kwargs = {}
@@ -509,7 +509,7 @@ def save_bore_field(config: CyclotronConfig,
                          label="Radia B-field (bore)")
 
     if rank <= 0:
-        path = output_path or fe.bore_field_output or "output/bore_field.comsol"
+        path = output_path or "output/bore_field.comsol"
         if verbosity >= 1:
             print(f"Writing bore field to '{path}'...", flush=True)
         kwargs = {}
@@ -666,7 +666,12 @@ class ReusableCyclotronSolver:
             self._main_subs = None
             self._perturb_subs = None
             if self._pole is not None:
-                self._pole[1].dispose(deep=True)
+                # mesh_group: the pole entry is a LIST of (spec, comp) for the
+                # whole conforming group (rebuilt together per iterate)
+                pole_entries = (self._pole if isinstance(self._pole, list)
+                                else [self._pole])
+                for _spec, comp in pole_entries:
+                    comp.dispose(deep=True)
                 self._pole = None
             # The retained iron magnetization belongs to the OLD pole shape;
             # zero it so the relaxed result matches a from-scratch build.

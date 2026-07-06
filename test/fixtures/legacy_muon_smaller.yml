@@ -9,7 +9,6 @@ geometry:
   yoke_build_angle_deg: 45.0
   angular_resolution: 15  # Number of segments to approximate arcs
   use_gmsh_occ_pole: true
-  save_stp_files: false
 
 # Field evaluation
 field_evaluation:
@@ -18,8 +17,6 @@ field_evaluation:
   radius_max_mm: 350.0
   n_eval_pts: 36  # >= shim params (30)
   use_symmetry: true  # Exploit 8-fold symmetry
-  save_median_plane_field:  false
-  save_bore_field: false
   iso_method: "gordon"  # can be "circle" (default), "seo", or "gordon"
 
 # Geometry Parameters
@@ -58,8 +55,8 @@ pole:
   outer_radius_mm: 400.0
   inner_radius_mm: 50.0
   max_mesh_size: 50
-  height_mm: 230.0  # 235 originally, but top shim is min 5 mm
-  full_angle_deg: 20.0  # 25 originally, but side shim is min 5 deg
+  height_mm: 235.0
+  full_angle_deg: 30.0
   angular_resolution_deg: 2.5  # Angular segment length for arc approximation (deg)
   segmentation: [10, 1, 15]  # Number of [r, theta, z] segments (cylindrical)
 #  stp_filename: "D:\\MIT Dropbox\\Daniel Winklehner\\Projects\\Muon Reacceleration\\CAD\\uCyclo_v2\\uCyclo_v2_ShimmedPole.stp"
@@ -69,18 +66,18 @@ side_shim:
   include: true
   num_rad_segments: 14  # number of radial segments along the pole edge
   angular_resolution_deg: 2.5  # Angular segment length for arc approximation (deg)
-  default_offset_deg: 5.0  # deg
+  default_offset_deg: 0.0
 #  side_offsets_deg: [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
-  side_offsets_deg: [5.508060939922671, 5.268477357516903, 5.436617667869364, 7.5841071276073055, 8.066780216206357, 8.718783547230036, 7.380032674047312, 5.523226584838598, 5.0, 5.432610851746398, 5.830951485545202, 6.643234287427298, 6.668676693680339, 7.721763013636222, 11.102593035254122]
+  side_offsets_deg: [0.508060939923, 0.268477357517, 0.436617667869, 2.584107127607, 3.066780216206, 3.71878354723, 2.380032674047, 0.523226584839, 0.0, 0.432610851746, 0.830951485545, 1.643234287427, 1.66867669368, 2.721763013636, 6.102593035254]
   segmentation: [3, 1, 20]  # Number of [r, theta, z] segments (cylindrical)
 
 top_shim:
   include: true
   num_rad_segments: 14  # number of radial segments along the pole edge (keep same as side for now!)
   angular_resolution_deg: 1.25 # Angular segment length for arc approximation (deg)
-  default_offset_mm: 5.0  # mm
+  default_offset_mm: 0.0
 #  top_offsets_mm: [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
-  top_offsets_mm: [5.0,5.0,5.873,6.809,7.711,10.969,11.965,16.039,17.790,18.739,18.884,20.0,20.0,20.0,20.0]
+  top_offsets_mm: [0.0, 0.0, 0.873, 1.809, 2.711, 5.969, 6.965, 11.039, 12.79, 13.739, 13.884, 15.0, 15.0, 15.0, 15.0]
   segmentation: [3, 1, 1]  # Number of [r, theta, z] subdivisions (note that arc approximation already segments in theta)
 # --- #
 

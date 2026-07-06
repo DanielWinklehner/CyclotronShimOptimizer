@@ -19,7 +19,20 @@ visualization, side_shim/top_shim) are common to both schemas.
 
 import yaml
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as _dc_fields
+
+
+def _from_dict(cls, d):
+    """Construct a config dataclass, IGNORING unknown keys.
+
+    Keeps parsing tolerant when fields are removed from the schema (e.g. the
+    export/output side-effect flags, now driven by explicit script-level API
+    calls, not the config) so older or external ymls that still carry those
+    keys load without error.
+    """
+    d = d or {}
+    valid = {f.name for f in _dc_fields(cls)}
+    return cls(**{k: v for k, v in d.items() if k in valid})
 from typing import Dict, Any, List, Optional
 
 
@@ -58,6 +71,14 @@ class ComponentSpec:
         (rad.RlxPre srcobj), optionally iterating main <-> perturbative.
         Field evaluation is unaffected (the component stays a top-level
         field source with its own symmetry). See ReusableCyclotronSolver.
+    :param mesh_group: OPT-IN conforming meshing. Components sharing a
+        mesh_group name are built into ONE gmsh model, boolean-FRAGMENTED
+        (touching surfaces become a single shared triangulation -- no
+        non-conforming contact interfaces, the cause of the refined-mesh
+        relaxation floor) and meshed together with per-component sizes;
+        the tets are then split back per component, so materials/symmetry/
+        perturbative semantics are unchanged. If the group contains the
+        shimmed pole, the WHOLE group is rebuilt per optimizer iterate.
     """
     name: str
     kind: str
@@ -69,6 +90,7 @@ class ComponentSpec:
     params: Dict[str, Any] = field(default_factory=dict)
     shimmed: bool = False
     perturbative: bool = False
+    mesh_group: Optional[str] = None
 
 
 @dataclass
@@ -78,7 +100,6 @@ class GeometryConfig:
     angular_resolution: int = 15
     use_gmsh_occ_pole: Optional[bool] = False
     use_gmsh_occ_yoke: Optional[bool] = False
-    save_stp_files: Optional[bool] = False
 
 @dataclass
 class FieldEvaluationConfig:
@@ -87,10 +108,6 @@ class FieldEvaluationConfig:
     radius_max_mm: float
     n_eval_pts: int
     use_symmetry: bool = True
-    save_median_plane_field: Optional[bool] = False
-    median_plane_field_output: Optional[str] = None
-    save_bore_field: Optional[bool] = False
-    bore_field_output: Optional[str] = None
     iso_method: Optional[str] = "circle"
     # Median-plane map extent/resolution (seo isochronism input + midplane save)
     median_plane_limit_mm: float = 400.0
@@ -112,7 +129,6 @@ class YokeConfig:
     window_width_mm: float = 0.0
     max_mesh_size: float = 50.0
     stp_filename: Optional[str] = None
-    stp_output: Optional[str] = None
 
 
 @dataclass
@@ -123,7 +139,6 @@ class LidLowerConfig:
     segmentation: List[int] = field(default_factory=list)
     max_mesh_size: float = 50.0
     stp_filename: Optional[str] = None
-    stp_output: Optional[str] = None
 
 
 @dataclass
@@ -138,7 +153,6 @@ class LidUpperConfig:
     cut_out_rf_stem_hole: bool = False
     max_mesh_size: float = 50.0
     stp_filename: Optional[str] = None
-    stp_output: Optional[str] = None
 
 
 @dataclass
@@ -154,7 +168,6 @@ class ExtractChannelConfig:
     end_ang_deg: Optional[float] = 0
     use_extract_chan: Optional[bool] = False
     stp_filename: Optional[str] = None
-    stp_output: Optional[str] = None
 
 
 @dataclass
@@ -167,15 +180,17 @@ class PoleConfig:
     segmentation: List[int] = field(default_factory=list)
     max_mesh_size: float = 50.0
     stp_filename: Optional[str] = None
-    stp_output: Optional[str] = None
 
 
 @dataclass
 class SideShimConfig:
     num_rad_segments: int
     angular_resolution_deg: float
-    default_offset_deg: float
     segmentation: List[int]
+    # Fallback side half-angle offset when side_offsets_deg is omitted. The
+    # shimmed pole is one OCC solid now, so offsets are deltas from the base
+    # pole with no minimum -- default 0 (no shim).
+    default_offset_deg: Optional[float] = 0.0
     side_offsets_deg: Optional[List[float]] = None
     include: Optional[bool] = True
 
@@ -184,8 +199,8 @@ class SideShimConfig:
 class TopShimConfig:
     num_rad_segments: int
     angular_resolution_deg: float
-    default_offset_mm: float
     segmentation: List[int]
+    default_offset_mm: Optional[float] = 0.0
     top_offsets_mm:  Optional[List[float]] = None
     include: Optional[bool] = True
 
@@ -376,8 +391,8 @@ class CyclotronConfig:
                 seed=data.get('seed', 42),
                 particle_species=data.get('particle_species', 'muon'),
                 max_machine_size_mm=data.get('max_machine_size_mm', 860.0),
-                geometry=GeometryConfig(**data['geometry']),
-                field_evaluation=FieldEvaluationConfig(**data['field_evaluation']),
+                geometry=_from_dict(GeometryConfig, data.get('geometry')),
+                field_evaluation=_from_dict(FieldEvaluationConfig, data['field_evaluation']),
                 yoke=YokeConfig(**data['yoke']),
                 lid_lower=LidLowerConfig(**data['lid_lower']),
                 lid_upper=LidUpperConfig(**data['lid_upper']),
@@ -410,10 +425,15 @@ class CyclotronConfig:
              'saturation_curve_m': self.material.saturation_curve_m,
              'linear_curve_m': self.material.linear_curve_m}
         )}
-        self.symmetries_def = {'cyclotron_8fold': [
-            [kind, list(point), list(normal)]
-            for kind, point, normal in DEFAULT_CYCLOTRON_SYMMETRIES
-        ]}
+        self.symmetries_def = {
+            'cyclotron_8fold': [
+                [kind, list(point), list(normal)]
+                for kind, point, normal in DEFAULT_CYCLOTRON_SYMMETRIES
+            ],
+            # median-plane mirror only (e.g. the extraction channel: breaks
+            # the azimuthal 8-fold but is exactly z-symmetric)
+            'median_z': [['para', [0, 0, 0], [0, 0, 1]]],
+        }
 
         build_ang = self.geometry.yoke_build_angle_deg
         pole_zs = -(self.yoke.height_mm + self.lid_lower.height_mm)
@@ -467,18 +487,20 @@ class CyclotronConfig:
                 pole_zs=pole_zs)))
 
         ec = self.extract_channel
+        # Single wedge ABOVE the median plane + exact para-z mirror (the
+        # channel's environment is z-symmetric): replaces the old wedge_pair,
+        # halving the channel's relax elements.
         specs.append(ComponentSpec(
-            name='extract_channel', kind='wedge_pair',
+            name='extract_channel', kind='wedge',
             enabled=bool(ec.use_extract_chan), file=ec.stp_filename,
-            material='iron', symmetry=None,
+            material='iron', symmetry='median_z',
             mesh={'max_size': ec.max_mesh_size},
             params=dict(inner_radius_mm=ec.inner_radius_mm,
                         outer_radius_mm=ec.outer_radius_mm,
                         height_mm=ec.height_mm,
-                        channel_width_mm=ec.channel_width_mm,
+                        z_offset_mm=ec.height_mm + ec.channel_width_mm / 2.0,
                         start_ang_deg=ec.start_ang_deg,
-                        end_ang_deg=ec.end_ang_deg,
-                        window_width_mm=ec.window_width_mm)))
+                        end_ang_deg=ec.end_ang_deg)))
 
         specs.append(ComponentSpec(
             name='coils', kind='racetrack_pair', symmetry='cyclotron_8fold',
@@ -509,7 +531,8 @@ class CyclotronConfig:
                 material=entry.get('material'), symmetry=entry.get('symmetry'),
                 mesh=entry.get('mesh') or {}, params=entry.get('params') or {},
                 shimmed=entry.get('shimmed', False),
-                perturbative=entry.get('perturbative', False)))
+                perturbative=entry.get('perturbative', False),
+                mesh_group=entry.get('mesh_group')))
 
         names = [s.name for s in specs]
         if len(set(names)) != len(names):
@@ -558,8 +581,8 @@ class CyclotronConfig:
                 seed=data.get('seed', 42),
                 particle_species=data.get('particle_species', 'muon'),
                 max_machine_size_mm=data.get('max_machine_size_mm', 860.0),
-                geometry=GeometryConfig(**(data.get('geometry') or {})),
-                field_evaluation=FieldEvaluationConfig(**data['field_evaluation']),
+                geometry=_from_dict(GeometryConfig, data.get('geometry')),
+                field_evaluation=_from_dict(FieldEvaluationConfig, data['field_evaluation']),
                 yoke=YokeConfig(),
                 lid_lower=LidLowerConfig(),
                 lid_upper=LidUpperConfig(),
@@ -591,7 +614,6 @@ class CyclotronConfig:
                 'angular_resolution': self.geometry.angular_resolution,
                 'use_gmsh_occ_pole': self.geometry.use_gmsh_occ_pole,
                 'use_gmsh_occ_yoke': self.geometry.use_gmsh_occ_yoke,
-                'save_stp_files': self.geometry.save_stp_files,
             },
             'field_evaluation': {
                 'num_points_circle': self.field_evaluation.num_points_circle,
@@ -599,10 +621,6 @@ class CyclotronConfig:
                 'radius_max_mm': self.field_evaluation.radius_max_mm,
                 'n_eval_pts': self.field_evaluation.n_eval_pts,
                 'use_symmetry':  self.field_evaluation.use_symmetry,
-                'save_median_plane_field': self.field_evaluation.save_median_plane_field,
-                'median_plane_field_output': self.field_evaluation.median_plane_field_output,
-                'save_bore_field': self.field_evaluation.save_bore_field,
-                'bore_field_output': self.field_evaluation.bore_field_output,
                 'iso_method': self.field_evaluation.iso_method,
                 'median_plane_limit_mm': self.field_evaluation.median_plane_limit_mm,
                 'median_plane_resolution_mm': self.field_evaluation.median_plane_resolution_mm,
@@ -619,8 +637,6 @@ class CyclotronConfig:
                 'window_width_mm': self.yoke.window_width_mm,
                 'max_mesh_size': self.yoke.max_mesh_size,
                 'stp_filename': self.yoke.stp_filename,
-                'stp_output': self.yoke.stp_output,
-
             },
             'lid_lower': {
                 'outer_radius_mm': self.lid_lower.outer_radius_mm,
@@ -629,8 +645,6 @@ class CyclotronConfig:
                 'segmentation': self.lid_lower.segmentation,
                 'max_mesh_size': self.lid_lower.max_mesh_size,
                 'stp_filename': self.lid_lower.stp_filename,
-                'stp_output': self.lid_lower.stp_output,
-
             },
             'lid_upper': {
                 'outer_radius_mm_1': self.lid_upper.outer_radius_mm_1,
@@ -643,8 +657,6 @@ class CyclotronConfig:
                 'cut_out_rf_stem_hole': self.lid_upper.cut_out_rf_stem_hole,
                 'max_mesh_size': self.lid_upper.max_mesh_size,
                 'stp_filename': self.lid_upper.stp_filename,
-                'stp_output': self.lid_upper.stp_output,
-
             },
             'extract_channel': {
                 'outer_radius_mm': self.extract_channel.outer_radius_mm,
@@ -658,8 +670,6 @@ class CyclotronConfig:
                 'end_ang_deg': self.extract_channel.end_ang_deg,
                 'use_extract_chan': self.extract_channel.use_extract_chan,
                 'stp_filename': self.extract_channel.stp_filename,
-                'stp_output': self.extract_channel.stp_output,
-
             },
             'pole': {
                 'outer_radius_mm': self.pole.outer_radius_mm,
@@ -669,8 +679,6 @@ class CyclotronConfig:
                 'segmentation': self.pole.segmentation,
                 'max_mesh_size': self.pole.max_mesh_size,
                 'stp_filename': self.pole.stp_filename,
-                'stp_output': self.pole.stp_output,
-
             },
             'coil': {
                 'radius_min_mm': self.coil.radius_min_mm,

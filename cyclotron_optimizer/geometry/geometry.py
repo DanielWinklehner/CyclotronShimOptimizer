@@ -2,8 +2,11 @@
 
 Every machine part is a ComponentSpec (name / kind / params / material /
 symmetry / mesh / file), and each ``kind`` maps to a builder in the registry
-below ('stp', 'wedge', 'lid_upper', 'pole', 'wedge_pair', 'racetrack_pair').
-Adding a part is a YAML entry plus -- at most -- one registered builder.
+below ('stp', 'wedge', 'lid_upper', 'pole', 'swept_polygon',
+'racetrack_pair'). Adding a part is a YAML entry plus -- at most -- one
+registered builder. A mirrored piece (e.g. the extraction channel wedge
+straddling the median plane) is a single component plus a 'para' symmetry
+(e.g. 'median_z') -- the old 'wedge_pair' kind is gone.
 
 Assembly groups the enabled magnetized components by their named symmetry:
 each group is containerized and its symmetry set applied (TrfZer*); groups
@@ -173,14 +176,8 @@ def _kind_lid_upper(spec: ComponentSpec, ctx: BuildContext) -> MagnetizedCompone
                               **spec.params)
 
 
-@register_builder("pole")
-def _kind_pole(spec: ComponentSpec, ctx: BuildContext) -> MagnetizedComponent:
-    """The (optionally shimmed) pole: STP file or gmsh-OCC with shim offsets."""
-    if spec.file:
-        return _from_stp(spec.file, spec.mesh.get("max_size"), spec.name,
-                         ctx.material(spec), comm=ctx.comm,
-                         min_mesh_size=spec.mesh.get("min_size"))
-
+def _pole_offsets(spec: ComponentSpec, ctx: BuildContext):
+    """Resolve the pole's shim offsets from the BuildContext's PoleShape."""
     pole_shape = ctx.pole_shape
     if pole_shape is None:
         raise ValueError(f"Component {spec.name!r} (programmatic pole) needs a "
@@ -191,7 +188,18 @@ def _kind_pole(spec: ComponentSpec, ctx: BuildContext) -> MagnetizedComponent:
            else np.zeros(n_segs + 1))
     side = (pole_shape.get_side_offsets_deg() if cfg.side_shim.include
             else np.zeros(n_segs + 1))
+    return top, side
 
+
+@register_builder("pole")
+def _kind_pole(spec: ComponentSpec, ctx: BuildContext) -> MagnetizedComponent:
+    """The (optionally shimmed) pole: STP file or gmsh-OCC with shim offsets."""
+    if spec.file:
+        return _from_stp(spec.file, spec.mesh.get("max_size"), spec.name,
+                         ctx.material(spec), comm=ctx.comm,
+                         min_mesh_size=spec.mesh.get("min_size"))
+
+    top, side = _pole_offsets(spec, ctx)
     return gb.build_pole(model_name=spec.name,
                          top_offsets_mm=top, side_offsets_deg=side,
                          max_mesh_size=spec.mesh.get("max_size"),
@@ -200,29 +208,23 @@ def _kind_pole(spec: ComponentSpec, ctx: BuildContext) -> MagnetizedComponent:
                          **spec.params)
 
 
-@register_builder("wedge_pair")
-def _kind_wedge_pair(spec: ComponentSpec, ctx: BuildContext) -> MagnetizedComponent:
-    """Mirrored wedge pair straddling a horizontal channel (extraction channel)."""
-    mat = ctx.material(spec)
-    mesh = spec.mesh.get("max_size")
+@register_builder("swept_polygon")
+def _kind_swept_polygon(spec: ComponentSpec, ctx: BuildContext) -> MagnetizedComponent:
+    """Solid-of-revolution sector: 2D polygon (N,2) swept about an axis.
+
+    params: polygon (list of [x, y] in the start-plane local frame: x =
+    distance from the axis, y = along the axis), axis ([ax, ay, az]),
+    start_angle_deg, end_angle_deg, axis_point (optional, default origin).
+    """
     if spec.file:
-        parts = [
-            _from_stp(spec.file, mesh, f"{spec.name}_1", mat, comm=ctx.comm),
-            _from_stp(spec.file, mesh, f"{spec.name}_2", mat, comm=ctx.comm),
-        ]
-    else:
-        params = dict(spec.params)
-        channel_width = params.pop("channel_width_mm")
-        height = params["height_mm"]
-        common = dict(max_mesh_size=mesh, min_mesh_size=spec.mesh.get("min_size"),
-                      material=mat, comm=ctx.comm, **params)
-        parts = [
-            gb.build_wedge(z_offset_mm=height + channel_width / 2.0,
-                           model_name=f"{spec.name}_1", **common),
-            gb.build_wedge(z_offset_mm=-channel_width / 2.0,
-                           model_name=f"{spec.name}_2", **common),
-        ]
-    return MagnetizedComponent.containerize(parts)
+        return _from_stp(spec.file, spec.mesh.get("max_size"), spec.name,
+                         ctx.material(spec), comm=ctx.comm,
+                         min_mesh_size=spec.mesh.get("min_size"))
+    return gb.build_swept_polygon(model_name=spec.name,
+                                  max_mesh_size=spec.mesh.get("max_size"),
+                                  min_mesh_size=spec.mesh.get("min_size"),
+                                  material=ctx.material(spec), comm=ctx.comm,
+                                  **spec.params)
 
 
 @register_builder("racetrack_pair")
@@ -255,12 +257,128 @@ def _kind_racetrack_pair(spec: ComponentSpec, ctx: BuildContext) -> CurrentCarry
 
 
 # ---------------------------------------------------------------------------
+# Conforming mesh groups (opt-in via ComponentSpec.mesh_group)
+# ---------------------------------------------------------------------------
+def _group_occ_entry(spec: ComponentSpec, ctx: BuildContext) -> dict:
+    """Turn a grouped ComponentSpec into a build_conforming_group entry."""
+    mesh_max = spec.mesh.get("max_size")
+    if mesh_max is None:
+        raise ValueError(f"Component {spec.name!r} is in mesh_group "
+                         f"{spec.mesh_group!r} and needs mesh.max_size")
+    entry = {"name": spec.name, "mesh_max": mesh_max,
+             "mesh_min": spec.mesh.get("min_size")}
+    if spec.file:
+        entry["stp_path"] = spec.file
+        return entry
+    p = dict(spec.params)
+    if spec.kind == "wedge":
+        entry["occ"] = gb.occ_wedge_callable(**p)
+    elif spec.kind == "lid_upper":
+        entry["occ"] = gb.occ_lid_upper_callable(**p)
+    elif spec.kind == "pole":
+        top, side = _pole_offsets(spec, ctx)
+        entry["occ"] = gb.occ_pole_callable(top_offsets_mm=top,
+                                            side_offsets_deg=side, **p)
+    elif spec.kind == "swept_polygon":
+        entry["occ"] = gb.occ_swept_polygon_callable(**p)
+    else:
+        raise ValueError(f"Component kind {spec.kind!r} ({spec.name!r}) is "
+                         "not supported in a mesh_group yet")
+    return entry
+
+
+def _build_mesh_group(group_name: str, specs: List[ComponentSpec],
+                      ctx: BuildContext, *, rank: int = 0,
+                      verbosity: int = 1) -> List[Tuple[ComponentSpec, BaseRadiaComponent]]:
+    """Build a conforming mesh group: one gmsh model, fragmented, meshed
+    together, split back into per-component MagnetizedComponents."""
+    from cyclotron_optimizer.geometry.components import build_conforming_group
+
+    if verbosity >= 1 and rank <= 0:
+        print(f"Building mesh group '{group_name}' (conforming interfaces): "
+              f"{[s.name for s in specs]}...", flush=True)
+    entries = [_group_occ_entry(s, ctx) for s in specs]
+    tets_by_name = build_conforming_group(entries, group_name=group_name,
+                                          comm=ctx.comm)
+    out: List[Tuple[ComponentSpec, BaseRadiaComponent]] = []
+    for spec in specs:
+        mat = ctx.material(spec)
+        comp = MagnetizedComponent.from_tet_coords(
+            tets_by_name[spec.name], material=mat, color=IRON_COLOR,
+            apply_mat=mat is not None, apply_color=True)
+        out.append((spec, comp))
+    return out
+
+
+def export_iron_stp(config: CyclotronConfig, path, pole_shape=None, *,
+                    include_disabled: bool = False, comm=None) -> None:
+    """Export ALL (enabled) magnetized components as ONE fragmented STEP file.
+
+    This is the gold-standard geometry contract: the exact conforming solids
+    the mesh-group build meshes (same OCC model, same fragment — including
+    the shimmed pole at the CURRENT PoleShape and `cylindrical_faces`), for
+    import into COMSOL etc. Touching parts arrive pre-imprinted (shared
+    interfaces); volume conservation through the fragment is checked.
+
+    Works for grouped and ungrouped configs alike (export always fragments).
+    """
+    from cyclotron_optimizer.geometry.components import build_conforming_group
+
+    materials = build_materials(config)
+    ctx = BuildContext(config, materials, pole_shape=pole_shape, comm=comm)
+    entries = []
+    for spec in config.components:
+        if spec.kind in CURRENT_KINDS:
+            continue
+        if not spec.enabled and not include_disabled:
+            continue
+        e = dict(_group_occ_entry_lenient(spec, ctx))
+        entries.append(e)
+    if not entries:
+        raise ValueError("No magnetized components to export")
+    build_conforming_group(entries, group_name="stp_export", comm=comm,
+                           export_stp_path=path, mesh=False)
+
+
+def export_component_stp(config: CyclotronConfig, name: str, path,
+                         pole_shape=None, *, comm=None) -> None:
+    """Export a single component's geometry as a STEP file (e.g. the shimmed
+    OCC pole at the current PoleShape, for external gold-standard runs)."""
+    from cyclotron_optimizer.geometry.components import build_conforming_group
+
+    spec = config.component(name)
+    materials = build_materials(config)
+    ctx = BuildContext(config, materials, pole_shape=pole_shape, comm=comm)
+    entry = _group_occ_entry_lenient(spec, ctx)
+    build_conforming_group([entry], group_name=f"stp_export_{name}",
+                           comm=comm, export_stp_path=path, mesh=False)
+
+
+def _group_occ_entry_lenient(spec: ComponentSpec, ctx: BuildContext) -> dict:
+    """_group_occ_entry, but tolerating a missing mesh.max_size (export-only
+    paths never mesh, so the size is irrelevant)."""
+    if spec.mesh.get("max_size") is None:
+        spec = ComponentSpec(**{**spec.__dict__,
+                                "mesh": {**spec.mesh, "max_size": 1000.0}})
+    return _group_occ_entry(spec, ctx)
+
+
+# ---------------------------------------------------------------------------
 # Orchestration (the solver's reuse levels)
 # ---------------------------------------------------------------------------
 def _is_rebuildable(spec: ComponentSpec) -> bool:
     """Shim-dependent components (rebuilt per PoleShape): shimmed and not
     file-based (an STP pole has a frozen shape and counts as static)."""
     return spec.enabled and spec.shimmed and not spec.file
+
+
+def _rebuildable_group(config: CyclotronConfig) -> Optional[str]:
+    """The mesh_group that contains the rebuildable (shimmed) component, if
+    any: that ENTIRE group is rebuilt per iterate in build_pole_part."""
+    for spec in config.components:
+        if _is_rebuildable(spec) and spec.mesh_group:
+            return spec.mesh_group
+    return None
 
 
 def build_static_iron_parts(
@@ -278,10 +396,25 @@ def build_static_iron_parts(
     say = verbosity >= 1 and rank <= 0
     materials = build_materials(config)
     ctx = BuildContext(config, materials, comm=comm)
+    deferred_group = _rebuildable_group(config)
 
     parts: List[Tuple[ComponentSpec, BaseRadiaComponent]] = []
+    built_groups: set = set()
     for spec in config.components:
         if not spec.enabled or spec.kind in CURRENT_KINDS or _is_rebuildable(spec):
+            continue
+        if spec.mesh_group:
+            if spec.mesh_group == deferred_group:
+                # rebuilt together with the shimmed pole per iterate
+                continue
+            if spec.mesh_group in built_groups:
+                continue
+            group_specs = [s for s in config.components
+                           if s.enabled and s.mesh_group == spec.mesh_group
+                           and s.kind not in CURRENT_KINDS]
+            parts.extend(_build_mesh_group(spec.mesh_group, group_specs, ctx,
+                                           rank=rank, verbosity=verbosity))
+            built_groups.add(spec.mesh_group)
             continue
         if say:
             print(f"Building static component '{spec.name}' (kind {spec.kind})...",
@@ -298,7 +431,13 @@ def build_pole_part(
     comm=None,
     materials: Optional[Dict[str, RadiaMaterial]] = None,
 ) -> Optional[Tuple[ComponentSpec, BaseRadiaComponent]]:
-    """Build the shim-dependent pole (None when the config has none)."""
+    """Build the shim-dependent pole (None when the config has none).
+
+    Returns a single ``(spec, component)`` tuple, EXCEPT when the pole is in
+    a mesh_group: then the whole group is rebuilt per iterate (conforming
+    interfaces need joint meshing) and a LIST of ``(spec, component)`` for
+    all group members is returned. assemble_iron accepts both forms.
+    """
     rebuildable = [s for s in config.components if _is_rebuildable(s)]
     if not rebuildable:
         return None
@@ -309,6 +448,11 @@ def build_pole_part(
     if materials is None:
         materials = build_materials(config)
     ctx = BuildContext(config, materials, pole_shape=pole_shape, comm=comm)
+    if spec.mesh_group:
+        group_specs = [s for s in config.components
+                       if s.enabled and s.mesh_group == spec.mesh_group
+                       and s.kind not in CURRENT_KINDS]
+        return _build_mesh_group(spec.mesh_group, group_specs, ctx)
     return spec, build_component(spec, ctx)
 
 
@@ -337,7 +481,10 @@ def assemble_iron(
 
     entries = list(static_parts["parts"])
     if pole_entry is not None:
-        entries.append(pole_entry)
+        if isinstance(pole_entry, list):  # mesh_group: pole + its group
+            entries.extend(pole_entry)
+        else:
+            entries.append(pole_entry)
 
     groups: Dict[Tuple[Optional[str], bool], List[BaseRadiaComponent]] = {}
     for spec, comp in entries:

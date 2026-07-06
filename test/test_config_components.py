@@ -42,13 +42,15 @@ def test_legacy_adapter_produces_component_specs():
 
     pole = cfg.component("pole")
     assert pole.kind == "pole" and pole.shimmed and pole.file is None
-    assert pole.params["half_angle_deg"] == 10.0
+    assert pole.params["half_angle_deg"] == 15.0  # half-wedge; full pole 30 deg
     assert pole.params["pole_zs"] == -(188.5 + 96.5)
 
     channel = cfg.component("extract_channel")
-    assert channel.kind == "wedge_pair"
+    assert channel.kind == "wedge"  # single wedge + para-z median mirror
     assert channel.enabled == cfg.extract_channel.use_extract_chan
-    assert channel.symmetry is None
+    assert channel.symmetry == "median_z"
+    assert channel.params["z_offset_mm"] == (
+        cfg.extract_channel.height_mm + cfg.extract_channel.channel_width_mm / 2.0)
 
     coils = cfg.component("coils")
     assert coils.kind == "racetrack_pair"
@@ -70,7 +72,7 @@ def test_component_yaml_parses_and_reverse_fills_legacy():
     assert cfg.coil.current_A == 15368          # solver's live current source
     assert cfg.coil.radius_min_mm == 460.0
     assert cfg.pole.outer_radius_mm == 400.0    # physics preconditioner
-    assert cfg.pole.full_angle_deg == 20.0
+    assert cfg.pole.full_angle_deg == 30.0
     assert cfg.extract_channel.use_extract_chan is True
     assert cfg.material.bh_filename and os.path.exists(cfg.material.bh_filename)
 

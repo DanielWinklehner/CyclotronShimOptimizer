@@ -24,10 +24,7 @@ from cyclotron_optimizer.config_io.config import CyclotronConfig
 
 from cyclotron_optimizer.geometry.geometry import build_geometry
 from cyclotron_optimizer.geometry.pole_shape import PoleShape
-from cyclotron_optimizer.geometry.inventor_export import InventorPoleExporter
-
-from cyclotron_optimizer.simulation.field_calculator import (evaluate_radii_parallel, get_median_plane_field,
-                                          save_median_plane_field, save_bore_field)
+from cyclotron_optimizer.simulation.field_calculator import (evaluate_radii_parallel, get_median_plane_field)
 from cyclotron_optimizer.visualization.plots import plot_isochronism_results, plot_isochronism_metric, plot_final_summary
 from cyclotron_optimizer.visualization.field_maps import plot_median_plane_field, show_model_with_median_plane_field
 from cyclotron_optimizer.core.species import IonSpecies
@@ -137,14 +134,9 @@ def run(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = F
             print(f"Creating pole shape with {config.side_shim.num_rad_segments} segments", flush=True)
 
         if side_offsets is None or top_offsets is None:
-            if config.side_shim.side_offsets_deg is None:
-                pole_shape = PoleShape(config.side_shim.num_rad_segments,
-                                       default_offset_deg=config.side_shim.default_offset_deg,
-                                       default_offset_mm=config.top_shim.default_offset_mm)
-            else:
-                pole_shape = PoleShape(config.side_shim.num_rad_segments,
-                                       side_offsets=np.array(config.side_shim.side_offsets_deg),
-                                       top_offsets=np.array(config.top_shim.top_offsets_mm))
+            pole_shape = PoleShape.from_shim_configs(
+                config.side_shim.num_rad_segments,
+                config.side_shim, config.top_shim)
         else:
             pole_shape = PoleShape(config.side_shim.num_rad_segments,
                                    side_offsets=side_offsets,
@@ -164,15 +156,8 @@ def run(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = F
 
         if rank <= 0:
             ObjDrwPyVista(cyclotron_vis.id)
-            # rad.ObjDrwOpenGL(cyclotron_vis)
-
-            # After optimization
-            # exporter = InventorPoleExporter(config, rank=rank, verbosity=verbosity)
-            #
-            # macro_file = exporter.export_macro(
-            #     pole_shape=pole_shape,
-            #     output_path='output/cyclotron_pole.txt'
-            # )
+            # Inventor VBA / STP export are script-level actions -- see
+            # examples/export_inventor.py and examples/export_stp.py.
 
         comm.Barrier()
 
@@ -202,15 +187,9 @@ def run(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = F
             rank=rank, comm=comm
         )
 
-        if config.field_evaluation.save_median_plane_field:
-            save_median_plane_field(config, cyclotron,
-                                    output_path=config.field_evaluation.median_plane_field_output,
-                                    rank=rank, comm=comm)
-
-        if config.field_evaluation.save_bore_field:
-            save_bore_field(config, cyclotron,
-                            output_path=config.field_evaluation.bore_field_output,
-                            rank=rank, comm=comm)
+        # Field-map export is a script-level action, not a config side-effect:
+        # call Session/CyclotronModel.save_median_plane_field(path) /
+        # save_bore_field(path) explicitly (see examples/export_fieldmaps.py).
 
         # if rank <= 0 and verbosity >= 1:
         #     if len(bz_values) > 0:

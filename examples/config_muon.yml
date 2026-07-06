@@ -72,8 +72,8 @@ components:
     params:
       inner_radius_mm: 50.0
       outer_radius_mm: 400.0
-      height_mm: 230.0                 # 235 originally, but top shim is min 5 mm
-      half_angle_deg: 10.0             # 20 deg full angle
+      height_mm: 235.0
+      half_angle_deg: 15.0             # half-wedge; full pole = 30 deg
       pole_zs: -285.0
 
   # Full-size +/-z coil pair, NO radia symmetry transforms: symmetrized
@@ -98,18 +98,18 @@ side_shim:
   include: true
   num_rad_segments: 14
   angular_resolution_deg: 1.25
-  default_offset_deg: 5.0
+  default_offset_deg: 0.0
   # Best so far:
-  side_offsets_deg: [9.401, 6.186, 5.979, 6.112, 6.252, 6.689, 6.807, 5.854, 5.306, 5.0, 5.12, 5.422, 6.65, 9.05, 10.64]
+  side_offsets_deg: [4.401, 1.186, 0.979, 1.112, 1.252, 1.689, 1.807, 0.854, 0.306, 0.0, 0.12, 0.422, 1.65, 4.05, 5.64]
   segmentation: [3, 1, 20]
 
 top_shim:
   include: true
   num_rad_segments: 14
   angular_resolution_deg: 1.25
-  default_offset_mm: 5.0
+  default_offset_mm: 0.0
   # Best so far:
-  top_offsets_mm: [7.511, 5.0, 6.231, 7.765, 9.859, 9.871, 11.736, 14.1, 14.5, 16.9, 17.0, 17.0, 17.0, 17.0, 17.0]
+  top_offsets_mm: [2.511, 0.0, 1.231, 2.765, 4.859, 4.871, 6.736, 9.1, 9.5, 11.9, 12.0, 12.0, 12.0, 12.0, 12.0]
   segmentation: [3, 1, 1]
 
 # ---------------------------------------------------------------------------

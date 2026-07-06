@@ -32,6 +32,8 @@ symmetries:
     - [perp, [0, 0, 0], [1, 0, 0]]    # mirror across x=0 plane
     - [perp, [0, 0, 0], [0, 1, 0]]    # mirror across y=0 plane
     - [para, [0, 0, 0], [0, 0, 1]]    # mirror across z=0 plane
+  median_z:                           # median-plane mirror only (extraction channel)
+    - [para, [0, 0, 0], [0, 0, 1]]
 
 components:
   - name: yoke
@@ -40,6 +42,7 @@ components:
     material: iron
     symmetry: cyclotron_8fold
     mesh: {max_size: 50}
+    mesh_group: iron
 
   - name: lid_lower
     kind: stp
@@ -47,6 +50,7 @@ components:
     material: iron
     symmetry: cyclotron_8fold
     mesh: {max_size: 50}
+    mesh_group: iron
 
   - name: lid_upper
     kind: stp
@@ -54,38 +58,45 @@ components:
     material: iron
     symmetry: cyclotron_8fold
     mesh: {max_size: 50}
+    mesh_group: iron
+
+#  - name: pole
+#    kind: stp
+#    file: "../resources/uCyclo_v2_ShimmedPole.stp"
+#    material: iron
+#    symmetry: cyclotron_8fold
+#    mesh: {max_size: 30}
 
   - name: pole
     kind: pole
     material: iron
     symmetry: cyclotron_8fold
     shimmed: true                    # shape follows the PoleShape shims
-    mesh: {max_size: 25}
+    mesh: {max_size: 30}
+    mesh_group: iron
     params:
       inner_radius_mm: 50.0
       outer_radius_mm: 400.0
-      height_mm: 230.0               # 235 originally, but top shim is min 5 mm
-      half_angle_deg: 10.0           # 20 deg full angle
+      height_mm: 235.0
+      half_angle_deg: 15.0             # half-wedge; full pole = 30 deg
       pole_zs: -285.0                # -(yoke 188.5 + lid_lower 96.5)
+      cylindrical_faces: true        # exact rim/bore cylinder patches (required
+                                     # so fragment can merge them with the lid CAD)
 
   - name: extract_channel
-    kind: wedge_pair
+    kind: wedge
     enabled: false
     material: iron
-    symmetry: null                   # breaks the 8-fold symmetry -> not folded
-    perturbative: true               # excluded from the main relax; solved in
-                                     # the frozen machine field (stage 1); set
-                                     # simulation.perturb_iterations > 0 for
-                                     # main<->channel back-reaction cycles
+    symmetry: median_z               # median plane mirror
+    perturbative: true               # solved in the frozen machine field (stage 1)
     mesh: {max_size: 20}
     params:
       inner_radius_mm: 276.0
       outer_radius_mm: 287.0
       height_mm: 20
-      channel_width_mm: 12.5
+      z_offset_mm: -6.25             # -channel_half_width (12.5/2)
       start_ang_deg: 35
       end_ang_deg: 55
-      window_width_mm: 0
 
   - name: coils
     kind: racetrack_pair
@@ -105,16 +116,16 @@ side_shim:
   include: true
   num_rad_segments: 14
   angular_resolution_deg: 2.5
-  default_offset_deg: 5.0
-  side_offsets_deg: [5.508060939922671, 5.268477357516903, 5.436617667869364, 7.5841071276073055, 8.066780216206357, 8.718783547230036, 7.380032674047312, 5.523226584838598, 5.0, 5.432610851746398, 5.830951485545202, 6.643234287427298, 6.668676693680339, 7.721763013636222, 11.102593035254122]
+  default_offset_deg: 0.0
+  side_offsets_deg: [0.508060939923, 0.268477357517, 0.436617667869, 2.584107127607, 3.066780216206, 3.71878354723, 2.380032674047, 0.523226584839, 0.0, 0.432610851746, 0.830951485545, 1.643234287427, 1.66867669368, 2.721763013636, 6.102593035254]
   segmentation: [3, 1, 20]
 
 top_shim:
   include: true
   num_rad_segments: 14
   angular_resolution_deg: 1.25
-  default_offset_mm: 5.0
-  top_offsets_mm: [5.0, 5.0, 5.873, 6.809, 7.711, 10.969, 11.965, 16.039, 17.790, 18.739, 18.884, 20.0, 20.0, 20.0, 20.0]
+  default_offset_mm: 0.0
+  top_offsets_mm: [0.0, 0.0, 0.873, 1.809, 2.711, 5.969, 6.965, 11.039, 12.79, 13.739, 13.884, 15.0, 15.0, 15.0, 15.0]
   segmentation: [3, 1, 1]
 
 # ---------------------------------------------------------------------------
@@ -126,14 +137,12 @@ field_evaluation:
   radius_max_mm: 350.0
   n_eval_pts: 36
   use_symmetry: true
-  save_median_plane_field: false
-  save_bore_field: false
   iso_method: "gordon"               # "circle" | "gordon" | "seo"
 
 simulation:
   precision: 0.0001
   iterations: 50000
-  relax_method: 11       # override the 9-GPU/10-CPU auto choice
+  relax_method: 11        # override the 9-GPU/10-CPU auto choice
   # anderson: true        # Anderson-accelerated relaxation (default off;
   #                       # ~3x fewer iterations on well-conditioned models,
   #                       # can stall above the plain floor on fine tet meshes)

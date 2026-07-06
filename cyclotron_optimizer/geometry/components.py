@@ -807,6 +807,38 @@ class MagnetizedComponent(BaseRadiaComponent):
         return container
 
     @classmethod
+    def from_tet_coords(
+        cls,
+        tet_coords: List[List[List[float]]],
+        *,
+        symmetries: Optional[SymmetryInput] = None,
+        material: Optional[RadiaMaterial] = None,
+        color: Optional[Sequence[float]] = None,
+        apply_sym: bool = False,
+        apply_mat: bool = False,
+        apply_color: bool = False,
+    ) -> "MagnetizedComponent":
+        """Build the component from an explicit tet vertex list (the common
+        tail of from_stp / from_gmsh_occ / build_conforming_group)."""
+        if not tet_coords:
+            raise RadiaComponentError("No tetrahedra to convert into radia objects.")
+        tet_ids = [_tet_to_polyhedron(t) for t in tet_coords]
+        container_id = _validate_radia_id(_call_radia("ObjCnt", tet_ids), "container_id")
+        comp = cls(
+            container_id,
+            child_ids=tet_ids,
+            is_container=True,
+            symmetries=symmetries,
+            material=material,
+            color=color,
+            apply_sym=apply_sym,
+            apply_mat=apply_mat,
+            apply_color=apply_color,
+        )
+        comp._tet_coords = tet_coords
+        return comp
+
+    @classmethod
     def from_stp(
         cls,
         stp_path: Union[str, Path],
@@ -859,25 +891,11 @@ class MagnetizedComponent(BaseRadiaComponent):
         if comm is not None:
             tet_coords = comm.bcast(tet_coords, root=0)
 
-        if not tet_coords:
-            raise RadiaComponentError("No tetrahedra converted into radia objects.")
-
-        tet_ids = [_tet_to_polyhedron(t) for t in tet_coords]
-        container_id = _validate_radia_id(_call_radia("ObjCnt", tet_ids), "container_id")
-
-        comp = cls(
-            container_id,
-            child_ids=tet_ids,
-            is_container=True,
-            symmetries=symmetries,
-            material=material,
-            color=color,
-            apply_sym=apply_sym,
-            apply_mat=apply_mat,
-            apply_color=apply_color,
+        return cls.from_tet_coords(
+            tet_coords or [],
+            symmetries=symmetries, material=material, color=color,
+            apply_sym=apply_sym, apply_mat=apply_mat, apply_color=apply_color,
         )
-        comp._tet_coords = tet_coords
-        return comp
 
     @classmethod
     def from_gmsh_occ(
@@ -938,22 +956,215 @@ class MagnetizedComponent(BaseRadiaComponent):
         if not tet_coords:
             raise RadiaComponentError(f"No tetrahedra generated for '{model_name}'.")
 
-        tet_ids = [_tet_to_polyhedron(t) for t in tet_coords]
-        container_id = _validate_radia_id(_call_radia("ObjCnt", tet_ids), "container_id")
-
-        comp = cls(
-            container_id,
-            child_ids=tet_ids,
-            is_container=True,
-            symmetries=symmetries,
-            material=material,
-            color=color,
-            apply_sym=apply_sym,
-            apply_mat=apply_mat,
-            apply_color=apply_color,
+        return cls.from_tet_coords(
+            tet_coords,
+            symmetries=symmetries, material=material, color=color,
+            apply_sym=apply_sym, apply_mat=apply_mat, apply_color=apply_color,
         )
-        comp._tet_coords = tet_coords
-        return comp
+
+
+# -----------------------------
+# Conforming mesh groups (opt-in via ComponentSpec.mesh_group)
+# -----------------------------
+def build_conforming_group(
+    entries: List[Dict[str, Any]],
+    *,
+    group_name: str = "group",
+    comm: Any = None,
+    gmsh_verbosity: int = 3,
+    export_stp_path: Optional[Union[str, Path]] = None,
+    mesh: bool = True,
+) -> Dict[str, List[List[List[float]]]]:
+    """Mesh several touching components in ONE gmsh model with CONFORMING
+    interfaces, and return per-component tet vertex lists.
+
+    Each entry: ``{"name": str, "stp_path": str | None, "occ": callable |
+    None, "mesh_max": float, "mesh_min": float | None}`` — exactly one of
+    stp_path / occ per entry. All volumes are boolean-FRAGMENTED against
+    each other, so shared (touching) surfaces become single entities with a
+    single triangulation: tets on both sides share faces node-for-node.
+    This removes the non-conforming contact interfaces that make radia's
+    center-collocation equations inconsistent on refined meshes (see
+    scripts/perturb_study/FLOOR_ANALYSIS.md).
+
+    Per-component mesh sizes are applied on each part's boundary points,
+    LARGEST first, so points on shared interfaces end up with the smallest
+    adjoining size (gmsh grades outward from there). Volumes overlapping in
+    the CAD (not merely touching) are an error.
+
+    ``export_stp_path``: write the FRAGMENTED (conforming) geometry to a
+    STEP file — the exact solids the mesh is generated from, for external
+    gold-standard runs (COMSOL imports one file with the interfaces already
+    imprinted). ``mesh=False`` skips meshing entirely (export-only call;
+    returns empty tet lists).
+
+    MPI-safe like the other factories: rank 0 meshes, the dict of tet lists
+    is broadcast.
+    """
+    try:
+        import gmsh
+    except Exception as exc:  # pragma: no cover
+        raise RadiaComponentError("gmsh is required for build_conforming_group(...).") from exc
+
+    comm = _resolve_comm(comm)
+    rank = comm.Get_rank() if comm is not None else 0
+
+    result: Optional[Dict[str, List[List[List[float]]]]] = None
+    if rank <= 0:
+        gmsh.initialize()
+        try:
+            gmsh.option.setNumber("General.Verbosity", gmsh_verbosity)
+            _pin_gmsh_determinism()
+            gmsh.model.add(f"mesh_group_{group_name}")
+
+            owner_of: Dict[int, str] = {}
+            for e in entries:
+                before = {t for _d, t in gmsh.model.occ.getEntities(3)}
+                if e.get("stp_path"):
+                    gmsh.model.occ.importShapes(str(e["stp_path"]))
+                elif e.get("occ") is not None:
+                    e["occ"]()
+                else:
+                    raise RadiaComponentError(
+                        f"mesh_group '{group_name}': entry '{e['name']}' has "
+                        "neither stp_path nor occ builder")
+                after = {t for _d, t in gmsh.model.occ.getEntities(3)}
+                new = after - before
+                if not new:
+                    raise RadiaComponentError(
+                        f"mesh_group '{group_name}': entry '{e['name']}' "
+                        "added no OCC volume")
+                for t in new:
+                    owner_of[t] = e["name"]
+
+            # Fragment everything against everything: conforming interfaces.
+            # OCC may emit BOPAlgo_AlertFaceBuilderUnusedEdges here (unused
+            # intersection edges while merging coincident faces) -- benign
+            # per se, but we VERIFY the invariant that would break if the
+            # imprint actually failed: per-component volume conservation.
+            vol_in = {e["name"]: 0.0 for e in entries}
+            for t, n in owner_of.items():
+                vol_in[n] += gmsh.model.occ.getMass(3, t)
+            in_tags = sorted(owner_of)
+            if len(in_tags) > 1:
+                _out, out_map = gmsh.model.occ.fragment(
+                    [(3, t) for t in in_tags], [])
+                new_owner: Dict[int, str] = {}
+                for in_tag, images in zip(in_tags, out_map):
+                    for d, t in images:
+                        if d != 3:
+                            continue
+                        prev = new_owner.get(t)
+                        if prev is not None and prev != owner_of[in_tag]:
+                            raise RadiaComponentError(
+                                f"mesh_group '{group_name}': components "
+                                f"'{prev}' and '{owner_of[in_tag]}' OVERLAP "
+                                "(fragment produced a shared piece); fix the "
+                                "geometry so parts only touch")
+                        new_owner[t] = owner_of[in_tag]
+                owner_of = new_owner
+
+                vol_out = {e["name"]: 0.0 for e in entries}
+                for t, n in owner_of.items():
+                    vol_out[n] += gmsh.model.occ.getMass(3, t)
+                for n, vi in vol_in.items():
+                    vo = vol_out[n]
+                    rel = abs(vo - vi) / max(abs(vi), 1e-30)
+                    if rel > 1e-3:
+                        raise RadiaComponentError(
+                            f"mesh_group '{group_name}': fragment changed the "
+                            f"volume of '{n}' by {rel:.2e} relative "
+                            f"({vi:.6g} -> {vo:.6g} mm^3) -- the boolean "
+                            "imprint failed; inspect the CAD contact")
+                    if rel > 1e-6:
+                        print(f"[mesh_group {group_name}] WARNING: volume of "
+                              f"'{n}' shifted by {rel:.2e} relative in the "
+                              f"fragment ({vi:.6g} -> {vo:.6g} mm^3)",
+                              flush=True)
+                print(f"[mesh_group {group_name}] volume conservation OK "
+                      f"(max rel dev "
+                      f"{max(abs(vol_out[n] - vol_in[n]) / max(abs(vol_in[n]), 1e-30) for n in vol_in):.1e})",
+                      flush=True)
+            gmsh.model.occ.synchronize()
+
+            # Diagnostics: surfaces adjacent to volumes of DIFFERENT owners
+            # are the conforming interfaces. If an expected contact reports
+            # none, the surfaces did not geometrically coincide (e.g. an
+            # approximated face against a true cylinder) and the contact is
+            # still non-conforming.
+            shared: Dict[tuple, int] = {}
+            for _d, s in gmsh.model.getEntities(2):
+                up, _down = gmsh.model.getAdjacencies(2, s)
+                owners = {owner_of.get(int(v)) for v in up}
+                owners.discard(None)
+                if len(owners) > 1:
+                    key = tuple(sorted(owners))
+                    shared[key] = shared.get(key, 0) + 1
+            msg = (", ".join(f"{a}~{b}: {n}" for (a, b), n in sorted(shared.items()))
+                   if shared else "NONE FOUND")
+            print(f"[mesh_group {group_name}] conforming interface surfaces: {msg}",
+                  flush=True)
+
+            if export_stp_path is not None:
+                out = str(export_stp_path)
+                gmsh.write(out)
+                print(f"[mesh_group {group_name}] fragmented geometry "
+                      f"exported: {out}", flush=True)
+
+            if not mesh:
+                result = {e["name"]: [] for e in entries}
+            else:
+                # Per-part sizes: apply on boundary points, largest size
+                # first, so shared-interface points keep the smallest
+                # adjoining size.
+                sizes = {e["name"]: float(e["mesh_max"]) for e in entries}
+                mins = [float(e["mesh_min"]) for e in entries
+                        if e.get("mesh_min") is not None]
+                gmsh.option.setNumber("Mesh.MeshSizeMax", max(sizes.values()))
+                gmsh.option.setNumber("Mesh.MeshSizeMin",
+                                      min(mins) if mins else 1.0)
+                for e in sorted(entries, key=lambda x: -float(x["mesh_max"])):
+                    vol_tags = [(3, t) for t, n in owner_of.items()
+                                if n == e["name"]]
+                    pts = gmsh.model.getBoundary(vol_tags, combined=False,
+                                                 oriented=False, recursive=True)
+                    pts = [(d, t) for d, t in pts if d == 0]
+                    if pts:
+                        gmsh.model.mesh.setSize(pts, float(e["mesh_max"]))
+
+                gmsh.model.mesh.generate(3)
+
+                # Split the tets back per component by volume tag.
+                node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
+                nodes: Dict[int, List[float]] = {}
+                for i, tag in enumerate(node_tags):
+                    j = 3 * i
+                    nodes[int(tag)] = [float(node_coords[j]),
+                                       float(node_coords[j + 1]),
+                                       float(node_coords[j + 2])]
+                result = {e["name"]: [] for e in entries}
+                for t in sorted(owner_of):
+                    name = owner_of[t]
+                    etypes, _etags, enodes = gmsh.model.mesh.getElements(3, t)
+                    for et, conn in zip(etypes, enodes):
+                        if int(et) != 4:
+                            continue
+                        for i in range(0, len(conn), 4):
+                            result[name].append(
+                                [nodes[int(c)] for c in conn[i:i + 4]])
+        finally:
+            gmsh.finalize()
+
+    if comm is not None:
+        result = comm.bcast(result, root=0)
+
+    assert result is not None
+    if mesh:
+        empty = [n for n, tets in result.items() if not tets]
+        if empty:
+            raise RadiaComponentError(
+                f"mesh_group '{group_name}': no tets generated for {empty}")
+    return result
 
 
 # -----------------------------
