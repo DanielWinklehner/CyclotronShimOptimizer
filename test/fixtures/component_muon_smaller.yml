@@ -1,0 +1,144 @@
+# FROZEN test fixture: the component-based schema as migrated from the
+# legacy config (must stay equivalent to fixtures/legacy_muon_smaller.yml --
+# the schema-equivalence tests compare the two). The LIVE example config
+# (examples/config_muon_smaller.yml) is a workflow file the user tunes
+# freely; do NOT assert against it beyond parseability.
+
+particle_species: "muon"
+max_machine_size_mm: 700.0
+seed: 42
+
+materials:
+  iron:
+    type: bh_file
+    file: "../../resources/dillinger_steel.csv"  # relative to this yml
+
+symmetries:
+  cyclotron_8fold:
+    - [perp, [0, 0, 0], [1, -1, 0]]   # mirror across x=y diagonal
+    - [perp, [0, 0, 0], [1, 0, 0]]    # mirror across x=0 plane
+    - [perp, [0, 0, 0], [0, 1, 0]]    # mirror across y=0 plane
+    - [para, [0, 0, 0], [0, 0, 1]]    # mirror across z=0 plane
+  median_z:
+    - [para, [0, 0, 0], [0, 0, 1]]
+
+components:
+  - name: yoke
+    kind: stp
+    file: "../../resources/uCyclo_v2_YokeWall.stp"
+    material: iron
+    symmetry: cyclotron_8fold
+    mesh: {max_size: 50}
+
+  - name: lid_lower
+    kind: stp
+    file: "../../resources/uCyclo_v2_LidLower.stp"
+    material: iron
+    symmetry: cyclotron_8fold
+    mesh: {max_size: 50}
+
+  - name: lid_upper
+    kind: stp
+    file: "../../resources/uCyclo_v2_LidUpper.stp"
+    material: iron
+    symmetry: cyclotron_8fold
+    mesh: {max_size: 50}
+
+  - name: pole
+    kind: pole
+    material: iron
+    symmetry: cyclotron_8fold
+    shimmed: true
+    mesh: {max_size: 50}
+    params:
+      inner_radius_mm: 50.0
+      outer_radius_mm: 400.0
+      height_mm: 235.0
+      half_angle_deg: 15.0             # half-wedge; full pole = 30 deg
+      pole_zs: -285.0
+
+  - name: extract_channel
+    kind: wedge
+    enabled: true
+    material: iron
+    symmetry: median_z
+    mesh: {max_size: 20}
+    params:
+      inner_radius_mm: 276.0
+      outer_radius_mm: 287.0
+      height_mm: 20
+      z_offset_mm: 26.25
+      start_ang_deg: 35
+      end_ang_deg: 55
+
+  - name: coils
+    kind: racetrack_pair
+    symmetry: cyclotron_8fold
+    params:
+      radius_min_mm: 460.0
+      radius_max_mm: 574.5
+      height_mm: 123.5
+      midplane_dist: 55
+      current_A: 15368
+      num_segments: 25
+
+side_shim:
+  include: true
+  num_rad_segments: 14
+  angular_resolution_deg: 2.5
+  default_offset_deg: 0.0
+  side_offsets_deg: [0.508060939923, 0.268477357517, 0.436617667869, 2.584107127607, 3.066780216206, 3.71878354723, 2.380032674047, 0.523226584839, 0.0, 0.432610851746, 0.830951485545, 1.643234287427, 1.66867669368, 2.721763013636, 6.102593035254]
+  segmentation: [3, 1, 20]
+
+top_shim:
+  include: true
+  num_rad_segments: 14
+  angular_resolution_deg: 1.25
+  default_offset_mm: 0.0
+  top_offsets_mm: [0.0, 0.0, 0.873, 1.809, 2.711, 5.969, 6.965, 11.039, 12.79, 13.739, 13.884, 15.0, 15.0, 15.0, 15.0]
+  segmentation: [3, 1, 1]
+
+field_evaluation:
+  num_points_circle: 360
+  radius_min_mm: 75.0
+  radius_max_mm: 350.0
+  n_eval_pts: 36
+  use_symmetry: true
+  iso_method: "gordon"
+
+simulation:
+  precision: 0.0001
+  iterations: 10000
+
+optimization:
+  target_frequency_mhz: 42
+  frequency_tolerance_mhz: 0.001
+  max_iterations: 300
+  coil_current_min_A: 10000
+  coil_current_max_A: 30000
+  side_shim_min_deg: 5
+  side_shim_max_deg: 15
+  top_shim_min_mm: 5
+  top_shim_max_mm: 20
+  num_workers: 1
+  n_initial_points: 1
+  reference_coil_current: 15368
+  regularization_weight: 0.0
+  convergence_penalty_weight: 1.0
+  precondition: true
+  coil_match_tol_mhz: 0.1
+  random_init: false
+  opt_top: true
+  opt_side: true
+  opt_coil: true
+  optimizer: 'dfo-ls'
+  dfols_rhobeg: 0.1
+  dfols_rhoend: 0.03
+  dfols_maxfun: null
+  dfols_objfun_has_noise: false
+  dfols_seek_global_minimum: false
+
+visualization:
+  show_opengl: false
+  show_median_plane_field: false
+  field_map_resolution_mm: 2.0

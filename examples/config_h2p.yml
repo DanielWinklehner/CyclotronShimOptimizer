@@ -1,0 +1,166 @@
+# H2+ cyclotron machine configuration -- component-based schema.
+# Migrated from the legacy config_h2p.yml (fully programmatic gmsh-OCC
+# geometry, no STP files).
+
+particle_species: "H2_1+"
+max_machine_size_mm: 860.0
+seed: 42
+
+# ---------------------------------------------------------------------------
+# Machine description
+# ---------------------------------------------------------------------------
+materials:
+  iron:
+    type: bh_file
+    file: "../resources/dillinger_steel.csv"  # relative to this yml
+
+symmetries:
+  cyclotron_8fold:
+    - [perp, [0, 0, 0], [1, -1, 0]]   # mirror across x=y diagonal
+    - [perp, [0, 0, 0], [1, 0, 0]]    # mirror across x=0 plane
+    - [perp, [0, 0, 0], [0, 1, 0]]    # mirror across y=0 plane
+    - [para, [0, 0, 0], [0, 0, 1]]    # mirror across z=0 plane
+
+components:
+  - name: yoke
+    kind: wedge
+    material: iron
+    symmetry: cyclotron_8fold
+    mesh: {max_size: 50}
+    params:
+      inner_radius_mm: 696.5
+      outer_radius_mm: 860.0
+      height_mm: 188.5
+      z_offset_mm: 0.0
+      end_ang_deg: 45.0
+      include_window: true
+      window_width_mm: 300.0
+
+  - name: lid_lower
+    kind: wedge
+    material: iron
+    symmetry: cyclotron_8fold
+    mesh: {max_size: 50}
+    params:
+      inner_radius_mm: 400.0
+      outer_radius_mm: 860.0
+      height_mm: 96.5
+      z_offset_mm: -188.5              # below the yoke wall
+      end_ang_deg: 45.0
+
+  - name: lid_upper
+    kind: lid_upper
+    material: iron
+    symmetry: cyclotron_8fold
+    mesh: {max_size: 50}
+    params:
+      inner_radius_mm: 165.0           # should this be 156? was 165
+      outer_radius_mm_1: 860.0
+      outer_radius_mm_2: 787.0
+      height_mm: 80.0
+      z_offset_mm: -285.0              # -(yoke 188.5 + lid_lower 96.5)
+      end_ang_deg: 45.0
+      seg_theta: 8
+
+  - name: pole
+    kind: pole
+    material: iron
+    symmetry: cyclotron_8fold
+    shimmed: true                      # shape follows the PoleShape shims
+    mesh: {max_size: 25}
+    params:
+      inner_radius_mm: 50.0
+      outer_radius_mm: 400.0
+      height_mm: 235.0
+      half_angle_deg: 15.0             # half-wedge; full pole = 30 deg
+      pole_zs: -285.0
+
+  - name: extract_channel
+    kind: wedge_pair
+    enabled: false
+    material: iron
+    symmetry: null                     # breaks the 8-fold symmetry -> not folded
+    mesh: {max_size: 20}
+    params:
+      inner_radius_mm: 276.0
+      outer_radius_mm: 287.0
+      height_mm: 20
+      channel_width_mm: 12.5
+      start_ang_deg: 35
+      end_ang_deg: 55
+      window_width_mm: 0
+
+  # Full-size +/-z coil pair, NO radia symmetry transforms: symmetrized
+  # current sources force a full CPU fallback on the GPU field path
+  # (RadiaCUDA issue #16). The symmetry below is only DECLARED metadata for
+  # the field-map folding, which is exact for the physically complete pair.
+  - name: coils
+    kind: racetrack_pair
+    symmetry: cyclotron_8fold
+    params:                            # names match CoilConfig (live current source)
+      radius_min_mm: 460.0
+      radius_max_mm: 674.5
+      height_mm: 123.5
+      midplane_dist: 55
+      current_A: -132496               # Amp-turns (initial; optimizer overrides)
+      num_segments: 25
+
+# ---------------------------------------------------------------------------
+# Shim parametrization (initial/default shape; optimizers pass their own)
+# ---------------------------------------------------------------------------
+side_shim:
+  include: true
+  num_rad_segments: 14
+  angular_resolution_deg: 1.25
+  default_offset_deg: 0.0
+  # Best so far:
+  side_offsets_deg: [2.094361390353, 0.163280106077, 0.134112285249, 0.1, 0.116618896064, 0.268190564885, 0.501573646883, 0.713531175144, 0.732937509861, 0.240467647756, 0.122723018452, 0.852793554185, 1.743871948963, 1.936798859169, 2.299915828773]
+  segmentation: [3, 1, 20]
+
+top_shim:
+  include: true
+  num_rad_segments: 14
+  angular_resolution_deg: 1.25
+  default_offset_mm: 0.0
+  # Best so far:
+  top_offsets_mm: [1.775590119431, 2.214769019456, 2.276484962485, 2.17888248536, 1.55315737062, 1.521650224219, 1.327321032034, 1.412527459606, 2.121682589644, 1.888974168345, 1.220084490272, 2.052889291693, 3.171469027763, 3.895433362261, 4.222144117912]
+  segmentation: [3, 1, 1]
+
+# ---------------------------------------------------------------------------
+# Workflow sections
+# ---------------------------------------------------------------------------
+field_evaluation:
+  num_points_circle: 360
+  radius_min_mm: 75.0
+  radius_max_mm: 350.0
+  n_eval_pts: 12
+  use_symmetry: true
+  iso_method: "seo"                    # "circle" | "gordon" | "seo"
+
+simulation:
+  precision: 0.0001
+  iterations: 3000
+
+optimization:
+  target_frequency_mhz: 8.2
+  frequency_tolerance_mhz: 0.001
+  max_iterations: 100
+  coil_current_min_A: 10000
+  coil_current_max_A: 200000
+  side_shim_min_deg: 5
+  side_shim_max_deg: 15
+  top_shim_min_mm: 5
+  top_shim_max_mm: 20
+  num_workers: 1
+  n_initial_points: 1
+  reference_coil_current: 134000
+  regularization_weight: 0.0
+  convergence_penalty_weight: 1.0
+  random_init: false
+  opt_top: false
+  opt_side: false
+  opt_coil: true
+  optimizer: 'nelder-mead'
+
+visualization:
+  show_opengl: false
