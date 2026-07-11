@@ -139,8 +139,11 @@ optimization:
   num_workers: 1
   n_initial_points: 1
   reference_coil_current: 35000  # operating-band value (was 18000) so shims tune near the real saturation state
-  regularization_weight: 0.0
+  regularization_weight: 0.0       # MAGNITUDE penalty (shrinks all offsets to 0)
   convergence_penalty_weight: 1.0
+  smoothness_weight: 0.0           # second-difference roughness penalty on the shim
+                                   # profile (0 = current behavior; tune with the knee
+                                   # of examples/l_curve_smoothness.py, start ~0.1)
   random_init: false
   opt_top: false
   opt_side: false

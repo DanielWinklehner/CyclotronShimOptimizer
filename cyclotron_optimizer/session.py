@@ -28,6 +28,7 @@ Typical script:
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Optional, Union
 
@@ -46,6 +47,46 @@ from cyclotron_optimizer.simulation.field_calculator import (
     get_median_plane_field,
     symmetric_axis,
 )
+
+_DPI_AWARE_SET = False
+
+
+def _ensure_dpi_aware():
+    """Make the process per-monitor DPI-aware on Windows before the 3D viewer
+    opens, so VTK/pyvista render at NATIVE resolution (crisp) instead of being
+    bitmap-upscaled by the OS on a scaled high-DPI display.
+
+    The canonical implementation now lives in RadiaCUDA (PyRadia.ensure_dpi_aware,
+    which its own ObjDrwPyVista viewer also calls); we delegate to it so there is
+    a single source of truth. The inline fallback keeps this working with an
+    older PyRadia that predates the helper. Must run before the render window is
+    created; idempotent and a no-op off Windows / if already set.
+    """
+    try:
+        from PyRadia import ensure_dpi_aware
+    except Exception:
+        ensure_dpi_aware = None
+    if ensure_dpi_aware is not None:
+        ensure_dpi_aware()
+        return
+
+    # Fallback (older PyRadia without the helper): same logic inline.
+    # -4 = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 (matches Qt6/PySide6).
+    global _DPI_AWARE_SET
+    if _DPI_AWARE_SET or sys.platform != "win32":
+        return
+    _DPI_AWARE_SET = True
+    import ctypes
+    for setter in (
+        lambda: ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)),
+        lambda: ctypes.windll.shcore.SetProcessDpiAwareness(2),   # PER_MONITOR
+        lambda: ctypes.windll.user32.SetProcessDPIAware(),        # system-aware
+    ):
+        try:
+            setter()
+            return
+        except Exception:
+            continue
 
 ConfigLike = Union[CyclotronConfig, str, Path, None]
 
@@ -417,6 +458,10 @@ class CyclotronModel:
             median_plane_field()); None shows the bare model.
         """
         from cyclotron_optimizer.geometry.geometry import build_geometry
+
+        # Crisp rendering on scaled high-DPI Windows displays (see helper docs).
+        # Must precede the pyvista/VTK render window created in the viewers below.
+        _ensure_dpi_aware()
 
         s = self._session
         display = build_geometry(self.config, self._pole_shape, rank=s.rank,

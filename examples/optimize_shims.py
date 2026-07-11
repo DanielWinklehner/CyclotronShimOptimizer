@@ -23,7 +23,7 @@ with co.Session(CONFIG) as s:
     result = optimizer.optimize()
 
     print(result['best_side_shims'])
-    print(result['best_side_shims'])
+    print(result['best_top_shims'])
     print(result['optimal_coil'])
 
     best_shape = PoleShape(s.config.side_shim.num_rad_segments,
