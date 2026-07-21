@@ -898,6 +898,84 @@ class MagnetizedComponent(BaseRadiaComponent):
         )
 
     @classmethod
+    def from_stp_structured(
+        cls,
+        stp_path: Union[str, Path],
+        *,
+        structure: Optional[Dict[str, Any]] = None,
+        mesh_size_min: Optional[float] = None,
+        mesh_size_max: Optional[float] = None,
+        model_name: Optional[str] = None,
+        comm: Any = None,
+        symmetries: Optional[SymmetryInput] = None,
+        material: Optional[RadiaMaterial] = None,
+        color: Optional[Sequence[float]] = None,
+        apply_sym: bool = False,
+        apply_mat: bool = False,
+        apply_color: bool = False,
+        gmsh_verbosity: int = 2,
+    ) -> "MagnetizedComponent":
+        """Structured polar-grid discretization of an STP solid.
+
+        The solid is OCC-fragmented into annular rings snapped to its own
+        CAD radii / z-planes; clean interior rings become analytic
+        annular-sector PRISM elements (rad.ObjPolyhdr), everything touching
+        true CAD detail becomes a conforming tet SKIN. Structured cores
+        condition the relaxation far better at a fraction of the element
+        count (see geometry/structured.py and RECMAG_GPU_PLAN.md).
+
+        MPI-safe like from_stp: rank 0 slices/meshes, the payload is
+        broadcast, every rank builds identical radia ids.
+        """
+        from cyclotron_optimizer.geometry import structured as _st
+
+        path = Path(stp_path)
+        if not path.exists():
+            raise FileNotFoundError(f"STP file not found: {path}")
+
+        comm = _resolve_comm(comm)
+        rank = comm.Get_rank() if comm is not None else 0
+
+        payload: Optional[Dict[str, Any]] = None
+        if rank <= 0:
+            payload = _st.slice_stp_polar(
+                str(path),
+                structure=structure,
+                mesh_size_max=mesh_size_max,
+                mesh_size_min=mesh_size_min,
+                model_name=model_name or path.stem,
+                gmsh_verbosity=gmsh_verbosity,
+            )
+        if comm is not None:
+            payload = comm.bcast(payload, root=0)
+        assert payload is not None
+
+        prism_ids, cell_defs = _st.emit_prism_cells(payload)
+        skin_ids = [_tet_to_polyhedron(t) for t in payload["skin_tets"]]
+        child_ids = prism_ids + skin_ids
+        if not child_ids:
+            raise RadiaComponentError(
+                f"Structured slicing of '{path.name}' produced no elements.")
+
+        container_id = _validate_radia_id(_call_radia("ObjCnt", child_ids),
+                                          "container_id")
+        comp = cls(
+            container_id,
+            child_ids=child_ids,
+            is_container=True,
+            symmetries=symmetries,
+            material=material,
+            color=color,
+            apply_sym=apply_sym,
+            apply_mat=apply_mat,
+            apply_color=apply_color,
+        )
+        comp._tet_coords = payload["skin_tets"]
+        comp._structured_cells = cell_defs
+        comp._structured_stats = payload["stats"]
+        return comp
+
+    @classmethod
     def from_gmsh_occ(
         cls,
         occ_builder: Callable[[], None],

@@ -140,9 +140,31 @@ def _from_stp(stp_filename, max_mesh_size, model_name, material, *, comm=None,
 # ---------------------------------------------------------------------------
 @register_builder("stp")
 def _kind_stp(spec: ComponentSpec, ctx: BuildContext) -> MagnetizedComponent:
-    """Tet-meshed magnetized part from an STP file."""
+    """Magnetized part from an STP file: tet-meshed, or -- with a
+    `structure:` block -- polar-grid structured (prism core + tet skin)."""
     if not spec.file:
         raise ValueError(f"Component {spec.name!r} (kind 'stp') needs a file")
+    if spec.structure is not None:
+        if spec.mesh_group:
+            raise ValueError(
+                f"Component {spec.name!r}: structure + mesh_group is not "
+                "supported yet -- a structured component must (for now) be "
+                "built standalone. NOTE: taking a structured part out of a "
+                "mesh_group makes its contacts non-conforming; validate the "
+                "solve (m11 residual) before adopting for production.")
+        mat = ctx.material(spec)
+        return MagnetizedComponent.from_stp_structured(
+            spec.file,
+            structure=spec.structure,
+            mesh_size_max=spec.mesh.get("max_size"),
+            mesh_size_min=spec.mesh.get("min_size"),
+            model_name=spec.name,
+            comm=ctx.comm,
+            material=mat,
+            color=IRON_COLOR,
+            apply_mat=mat is not None,
+            apply_color=True,
+        )
     return _from_stp(spec.file, spec.mesh.get("max_size"), spec.name,
                      ctx.material(spec), comm=ctx.comm,
                      min_mesh_size=spec.mesh.get("min_size"))
@@ -261,6 +283,10 @@ def _kind_racetrack_pair(spec: ComponentSpec, ctx: BuildContext) -> CurrentCarry
 # ---------------------------------------------------------------------------
 def _group_occ_entry(spec: ComponentSpec, ctx: BuildContext) -> dict:
     """Turn a grouped ComponentSpec into a build_conforming_group entry."""
+    if spec.structure is not None:
+        raise ValueError(
+            f"Component {spec.name!r}: structure + mesh_group is not "
+            "supported yet -- remove one of the two")
     mesh_max = spec.mesh.get("max_size")
     if mesh_max is None:
         raise ValueError(f"Component {spec.name!r} is in mesh_group "
@@ -355,11 +381,16 @@ def export_component_stp(config: CyclotronConfig, name: str, path,
 
 
 def _group_occ_entry_lenient(spec: ComponentSpec, ctx: BuildContext) -> dict:
-    """_group_occ_entry, but tolerating a missing mesh.max_size (export-only
-    paths never mesh, so the size is irrelevant)."""
+    """_group_occ_entry, but tolerating a missing mesh.max_size and a
+    `structure:` block (export-only paths never mesh or discretize -- the
+    exported geometry of a structured component is still just its STP)."""
+    overrides = {}
     if spec.mesh.get("max_size") is None:
-        spec = ComponentSpec(**{**spec.__dict__,
-                                "mesh": {**spec.mesh, "max_size": 1000.0}})
+        overrides["mesh"] = {**spec.mesh, "max_size": 1000.0}
+    if spec.structure is not None:
+        overrides["structure"] = None
+    if overrides:
+        spec = ComponentSpec(**{**spec.__dict__, **overrides})
     return _group_occ_entry(spec, ctx)
 
 

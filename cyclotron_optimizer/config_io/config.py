@@ -90,6 +90,13 @@ class ComponentSpec:
     params: Dict[str, Any] = field(default_factory=dict)
     shimmed: bool = False
     perturbative: bool = False
+    # Structured polar-grid discretization for STP components (Option C):
+    # e.g. {'type': 'polar_grid', 'dr_mm': 120, 'dz_mm': 120,
+    # 'dtheta_deg': 5, 'chords_per_cell': 2, 'theta_span_deg': [0, 45]}.
+    # Clean revolved rings become analytic prism elements, CAD detail
+    # becomes a conforming tet skin (geometry/structured.py). Not yet
+    # supported together with mesh_group.
+    structure: Optional[Dict[str, Any]] = None
     mesh_group: Optional[str] = None
 
 
@@ -563,7 +570,8 @@ class CyclotronConfig:
                 mesh=entry.get('mesh') or {}, params=entry.get('params') or {},
                 shimmed=entry.get('shimmed', False),
                 perturbative=entry.get('perturbative', False),
-                mesh_group=entry.get('mesh_group')))
+                mesh_group=entry.get('mesh_group'),
+                structure=entry.get('structure')))
 
         names = [s.name for s in specs]
         if len(set(names)) != len(names):
