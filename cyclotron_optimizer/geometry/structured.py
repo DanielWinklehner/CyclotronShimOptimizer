@@ -78,6 +78,7 @@ import hashlib
 import math
 import os
 import pickle
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -533,49 +534,81 @@ def _classify_worker(payload):
         gmsh.finalize()
 
 
-# Launcher/MPI env vars that a spawned worker must NOT inherit: under an
-# mpirun/mpiexec (Hydra/PMI) job the child would otherwise try to register
-# with the process manager as an MPI rank and abort ("PMI_Get_appnum
-# returned -1"). Stripped so any MPI_Init in a worker (mpi4py auto-init on
-# import, or a radia extension) starts as a harmless standalone singleton.
-_MPI_ENV_PREFIXES = ("PMI_", "PMI2_", "PMIX_", "HYDRA_", "I_MPI_",
-                     "MPICH_", "OMPI_", "MPIEXEC_", "MPIR_")
+def _run_classify_shard(in_path: str, out_path: str) -> None:
+    """Subprocess entry point: classify one shard from a pickled payload and
+    write the resulting core (i,j,k) list. Runs in a CLEAN process that
+    imports only this package + gmsh (via _classify_worker) -- crucially NOT
+    the caller's __main__, which typically does ``from mpi4py import MPI``
+    and auto-inits MPI. That is what keeps the workers decoupled from the
+    parent's MPI job."""
+    with open(in_path, "rb") as fh:
+        payload = pickle.load(fh)
+    result = _classify_worker(payload)
+    with open(out_path, "wb") as fh:
+        pickle.dump(result, fh)
+
+
+# Worker bootstrap: load THIS file as a standalone module BY PATH (not via
+# `import cyclotron_optimizer...`, whose package __init__ imports radia and
+# spins up a CUDA context). structured.py's only module-level imports are
+# stdlib; the package imports it does need are lazy/in-function and none are
+# on the classification path -- so a worker is radia-free AND mpi4py-free,
+# hence never initialises MPI. argv: <structured.py> <in.pkl> <out.pkl>.
+_WORKER_CODE = (
+    "import importlib.util as u, sys;"
+    "sp=u.spec_from_file_location('_structured_worker', sys.argv[1]);"
+    "m=u.module_from_spec(sp); sp.loader.exec_module(m);"
+    "m._run_classify_shard(sys.argv[2], sys.argv[3])")
+
+_THIS_FILE = os.path.abspath(__file__)
 
 
 def _classify_parallel(stp_path, grid, cand, sp, n_workers, margin_deg,
                        skin_mm, log):
-    """Classify candidate cells across `n_workers` spawned processes, each
-    with its own gmsh session + STP import. Returns the merged core set.
-    Round-robin shards for load balance; a set-union merge is order-
-    independent, so the result is identical to the serial classifier.
+    """Classify candidate cells across `n_workers` clean SUBPROCESSES; the
+    merged (set-union) core is identical to the serial classifier.
 
-    Workers are spawned with the launcher's MPI/PMI environment stripped
-    (see _MPI_ENV_PREFIXES) and mpi4py auto-init disabled, so this is safe
-    under mpirun (the workers do no MPI; only rank 0 spawns them, and the
-    other ranks idle-wait the broadcast). The parent's env is restored
-    immediately after the pool closes, before any later MPI use."""
-    import multiprocessing as mp
+    Subprocesses loading this file by path, NOT a multiprocessing.Pool: a
+    spawned Pool worker re-imports the caller's __main__, which pulls in
+    radia + mpi4py and auto-inits MPI -- under an mpirun/PMI launcher that
+    MPI_Init tries to join the job and aborts/hangs, while disabling it
+    breaks radia's MPI_Comm_rank. The path-loaded worker touches neither
+    __main__ nor the package __init__, so it never initialises MPI at all.
+    The process-manager (PMI/Hydra) env is still dropped as belt-and-braces
+    (KEEP I_MPI_*: dropping I_MPI_FABRICS re-triggers the OFI init abort).
+    Only rank 0 runs this; the parent's own env is untouched (a copy goes to
+    the children)."""
+    import shutil
+    import subprocess
+    import tempfile
     cells_idx = [(i, j, k) for (i, j, k, _dil) in cand]
     shards = [s for s in (cells_idx[w::n_workers] for w in range(n_workers))
               if s]
-    args = [(stp_path, grid, margin_deg, skin_mm, sp, s) for s in shards]
-    ctx = mp.get_context("spawn")
-
-    saved = {k: os.environ.pop(k) for k in list(os.environ)
-             if k.startswith(_MPI_ENV_PREFIXES)}
-    prev_rc = os.environ.get("MPI4PY_RC_INITIALIZE")
-    os.environ["MPI4PY_RC_INITIALIZE"] = "0"
+    env = dict(os.environ)
+    for k in list(env):
+        if k.startswith(("PMI_", "PMI2_", "PMIX_", "HYDRA_")):
+            env.pop(k)
+    tmp = tempfile.mkdtemp(prefix="structured_classify_")
+    jobs = []
+    for idx, shard in enumerate(shards):
+        inp = os.path.join(tmp, f"in_{idx}.pkl")
+        outp = os.path.join(tmp, f"out_{idx}.pkl")
+        with open(inp, "wb") as fh:
+            pickle.dump((stp_path, grid, margin_deg, skin_mm, sp, shard), fh)
+        jobs.append((inp, outp))
     core = set()
     try:
-        with ctx.Pool(len(shards)) as pool:      # children inherit env here
-            for sub in pool.map(_classify_worker, args):
-                core.update(sub)
+        procs = [subprocess.Popen([sys.executable, "-c", _WORKER_CODE,
+                                   _THIS_FILE, inp, outp], env=env)
+                 for inp, outp in jobs]
+        rcs = [p.wait() for p in procs]
+        if any(rc != 0 for rc in rcs):
+            raise RuntimeError(f"classify worker exit codes {rcs}")
+        for _inp, outp in jobs:
+            with open(outp, "rb") as fh:
+                core.update(pickle.load(fh))
     finally:
-        os.environ.update(saved)
-        if prev_rc is None:
-            os.environ.pop("MPI4PY_RC_INITIALIZE", None)
-        else:
-            os.environ["MPI4PY_RC_INITIALIZE"] = prev_rc
+        shutil.rmtree(tmp, ignore_errors=True)
     return core
 
 
