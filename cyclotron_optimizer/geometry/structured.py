@@ -91,14 +91,35 @@ __all__ = [
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CACHE_DIR = _REPO_ROOT / "output" / "structured_cache"
-_CACHE_VERSION = 3   # bump on any algorithm change that alters payloads
-                     # (v3: envelope-cut slicing; v2 payloads must not shadow)
+_CACHE_VERSION = 4   # bump on any algorithm change that alters payloads
+                     # (v3: envelope-cut slicing; 4: multi-volume shared-face
+                     # double-count fix in the classifier)
 
 # Point-sampling classification tuning -----------------------------------
 _SAMPLE_CAP = 9            # max sample points per dimension per cell
 _SAMPLE_POINT_BUDGET = 250000   # nominal isInside calls/member before the
                                 # lattice is uniformly coarsened (spec:
                                 # margins, not density, carry the safety)
+_MAX_CLASSIFY_WORKERS = 8       # cap on classification worker processes
+_MIN_PARALLEL_CANDIDATES = 500  # below this, process-spawn overhead is not
+                                # worth it -- classify serially (also keeps
+                                # the small synthetic unit tests single-proc)
+
+
+def _auto_workers() -> int:
+    """Default classification worker count: this node's usable cores,
+    capped. gmsh isInside (the slice bottleneck) is single-threaded, so the
+    one-time classification fans out over spawned processes. Only rank 0
+    builds, and the other MPI ranks idle-wait on the broadcast, so using
+    this node's cores does not contend with live MPI work. Override via the
+    STRUCTURED_CLASSIFY_WORKERS env var or the classify_workers argument."""
+    env = os.environ.get("STRUCTURED_CLASSIFY_WORKERS")
+    if env is not None:
+        try:
+            return max(1, int(env))
+        except ValueError:
+            pass
+    return max(1, min((os.cpu_count() or 1) - 2, _MAX_CLASSIFY_WORKERS))
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +181,8 @@ def _merge_structure(structure: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if bad:
             raise ValueError(f"Unknown core_clip keys {sorted(bad)}; "
                              f"known: {sorted(_CLIP_KEYS)}")
+    if float(out["sample_spacing_mm"]) <= 0.0:
+        raise ValueError("sample_spacing_mm must be > 0")
     return out
 
 
@@ -354,10 +377,15 @@ def _lattice_points(dil: Cell, spacing: float
 
 def _batch_covered(gmsh, vols: Sequence[int],
                    coords: List[float]) -> Tuple[int, int]:
-    """(# of coords inside the UNION of vols, # isInside calls). The
-    member's volumes are pairwise disjoint (group-imprinted), so per-point
-    union membership == the sum of per-volume counts; short-circuit across
-    volumes once every point is accounted for."""
+    """(sum of per-volume isInside counts, # isInside calls), short-
+    circuiting once the running sum reaches the point count.
+
+    For ONE volume this is the exact union count. For SEVERAL it is an
+    UPPER bound on the union count: a point on a shared internal face is
+    inside (counts for) both adjacent sub-volumes, so the sum can exceed
+    the true number of covered points. It therefore only supports the
+    reject direction (sum < n  =>  some point is genuinely outside);
+    confirmation of a multi-volume cell needs _all_covered."""
     n = len(coords) // 3
     cov = calls = 0
     for v in vols:
@@ -368,31 +396,171 @@ def _batch_covered(gmsh, vols: Sequence[int],
     return cov, calls
 
 
-def _cell_is_core(gmsh, vols: Sequence[int], dil: Cell,
-                  spacing: float) -> Tuple[bool, int]:
-    """Core iff EVERY lattice point of the dilated cell is inside the
-    member. A coarse 3^3 batch rejects most exterior cells in one call;
-    the finer remainder confirms the rest. Same classification as a full
-    per-point sweep of the identical lattice, far fewer round-trips.
-    Returns (is_core, n_isInside_calls)."""
-    coarse, fine = _lattice_points(dil, spacing)
-    nc = len(coarse) // 3
-    cov, calls = _batch_covered(gmsh, vols, coarse)
-    if cov < nc:
-        return False, calls
-    if fine:
-        nf = len(fine) // 3
-        cov, c2 = _batch_covered(gmsh, vols, fine)
-        calls += c2
-        if cov < nf:
+def _all_covered(gmsh, vols: Sequence[int],
+                 coords: List[float]) -> Tuple[bool, int]:
+    """Exact per-point union test: True iff every point is inside at least
+    one volume. Short-circuits on the first uncovered point. Used only for
+    multi-volume members, where _batch_covered's sum double-counts points
+    on shared internal faces and could mask a genuinely-outside point."""
+    n = len(coords) // 3
+    calls = 0
+    for p in range(n):
+        b = 3 * p
+        pt = coords[b:b + 3]
+        hit = False
+        for v in vols:
+            calls += 1
+            if gmsh.model.isInside(3, v, pt):
+                hit = True
+                break
+        if not hit:
             return False, calls
     return True, calls
 
 
+def _cell_is_core(gmsh, vols: Sequence[int], dil: Cell,
+                  spacing: float) -> Tuple[bool, int]:
+    """Core iff EVERY lattice point of the dilated cell is inside the
+    member's volume(s). A coarse 3^3 pass rejects most exterior cells
+    before the finer remainder. For a single volume the batched sum is the
+    exact union count; for several it is an upper bound (reject-only), so a
+    passing multi-volume cell is confirmed exactly per point (no shared-
+    face double-count). Returns (is_core, n_isInside_calls)."""
+    if not vols:
+        return False, 0
+    single = len(vols) == 1
+    coarse, fine = _lattice_points(dil, spacing)
+    calls = 0
+    for coords in (coarse, fine):
+        if not coords:
+            continue
+        n = len(coords) // 3
+        cov, c = _batch_covered(gmsh, vols, coords)
+        calls += c
+        if cov < n:
+            return False, calls              # sum >= true union: safe reject
+        if not single:
+            ok, c2 = _all_covered(gmsh, vols, coords)
+            calls += c2
+            if not ok:
+                return False, calls
+    return True, calls
+
+
+def _sector_bbox(a: float, b: float, ta_deg: float, tb_deg: float,
+                 za: float, zb: float) -> Tuple[float, ...]:
+    """Cartesian axis-aligned bbox (xlo,xhi,ylo,yhi,zlo,zhi) of an annular
+    sector, for cheap per-cell volume pruning. Includes cardinal-angle
+    extrema that fall inside [ta,tb]."""
+    angs = [ta_deg, tb_deg]
+    c = 0.0
+    while c <= 360.0:
+        if ta_deg < c < tb_deg:
+            angs.append(c)
+        c += 90.0
+    xs: List[float] = []
+    ys: List[float] = []
+    for r in (a, b):
+        for th in angs:
+            t = math.radians(th)
+            xs.append(r * math.cos(t))
+            ys.append(r * math.sin(t))
+    return (min(xs), max(xs), min(ys), max(ys), za, zb)
+
+
+def _bbox_overlap(c: Tuple[float, ...], vb: Sequence[float],
+                  tol: float = 0.5) -> bool:
+    """Overlap of a sector bbox c=(xlo,xhi,ylo,yhi,zlo,zhi) with a gmsh
+    bounding box vb=(xmin,ymin,zmin,xmax,ymax,zmax). Conservative (tol
+    grows the box) -- over-inclusion only costs a wasted isInside test,
+    under-inclusion would wrongly drop a volume."""
+    return not (c[1] < vb[0] - tol or vb[3] < c[0] - tol
+                or c[3] < vb[1] - tol or vb[4] < c[2] - tol
+                or c[5] < vb[2] - tol or vb[5] < c[4] - tol)
+
+
+def _classify_cells_serial(gmsh, vols, cand, sp):
+    """The isInside classification loop against a live gmsh session."""
+    vol_bb = {v: gmsh.model.getBoundingBox(3, v) for v in vols}
+    core = set()
+    total = 0
+    for i, j, k, dil in cand:
+        # prune volumes whose bbox cannot contain this cell (e.g. deep core
+        # cells never touch the VP insert's shallow bbox) -- fewer isInside
+        # calls, and a cell outside every volume is exterior
+        cbb = _sector_bbox(*dil)
+        rel = [v for v in vols if _bbox_overlap(cbb, vol_bb[v])]
+        if not rel:
+            continue
+        ok, calls = _cell_is_core(gmsh, rel, dil, sp)
+        total += calls
+        if ok:
+            core.add((i, j, k))
+    return core, total
+
+
+def _classify_worker(payload):
+    """Top-level (picklable) process worker: import the member STP into a
+    fresh gmsh session and classify an assigned shard of candidate cells.
+    Independent of the parent's gmsh state -- only reads the STP for
+    isInside occupancy (imprint-invariant); the authoritative grid is
+    passed in, never recomputed, so shards stay index-consistent."""
+    stp_path, grid, margin_deg, skin_mm, sp, shard = payload
+    r_edges, r_anchor, z_edges, z_anchor, th_edges, n_theta = grid
+    import gmsh
+    gmsh.initialize()
+    try:
+        gmsh.option.setNumber("General.Terminal", 0)
+        gmsh.model.add("classify_worker")
+        gmsh.model.occ.importShapes(stp_path)
+        gmsh.model.occ.synchronize()
+        vols = [t for _d, t in gmsh.model.occ.getEntities(3)]
+        vol_bb = {v: gmsh.model.getBoundingBox(3, v) for v in vols}
+        out = []
+        for (i, j, k) in shard:
+            dil = _dilated_bounds(i, j, k, r_edges, r_anchor, z_edges,
+                                  z_anchor, th_edges, n_theta,
+                                  margin_deg, skin_mm)
+            cbb = _sector_bbox(*dil)
+            rel = [v for v in vols if _bbox_overlap(cbb, vol_bb[v])]
+            if not rel:
+                continue
+            ok, _c = _cell_is_core(gmsh, rel, dil, sp)
+            if ok:
+                out.append((i, j, k))
+        return out
+    finally:
+        gmsh.finalize()
+
+
+def _classify_parallel(stp_path, grid, cand, sp, n_workers, margin_deg,
+                       skin_mm, log):
+    """Classify candidate cells across `n_workers` spawned processes, each
+    with its own gmsh session + STP import. Returns the merged core set.
+    Round-robin shards for load balance; a set-union merge is order-
+    independent, so the result is identical to the serial classifier."""
+    import multiprocessing as mp
+    cells_idx = [(i, j, k) for (i, j, k, _dil) in cand]
+    shards = [s for s in (cells_idx[w::n_workers] for w in range(n_workers))
+              if s]
+    args = [(stp_path, grid, margin_deg, skin_mm, sp, s) for s in shards]
+    ctx = mp.get_context("spawn")
+    core = set()
+    with ctx.Pool(len(shards)) as pool:
+        for sub in pool.map(_classify_worker, args):
+            core.update(sub)
+    return core
+
+
 def _classify_core_cells(gmsh, vols, r_edges, r_anchor, z_edges, z_anchor,
                          th_edges, n_theta, clip, margin_deg, skin_mm,
-                         spacing, log) -> set:
-    """Return the set of (i,j,k) core cell indices for one member."""
+                         spacing, log, stp_path=None, n_workers=1) -> set:
+    """Return the set of (i,j,k) core cell indices for one member.
+
+    Candidate enumeration + budget coarsening run on the calling process
+    (cheap); the isInside classification is distributed across `n_workers`
+    spawned processes when a reusable STP path is available (the one-time
+    slice's dominant cost), else run serially against the live session."""
     nr, nz = len(r_edges) - 1, len(z_edges) - 1
     cand: List[Tuple[int, int, int, Cell]] = []
     for i in range(nr):
@@ -425,13 +593,19 @@ def _classify_core_cells(gmsh, vols, r_edges, r_anchor, z_edges, z_anchor,
             f"{sp:.0f}mm ({coarse} pts, min 3^3/cell -- margins carry safety)")
     else:
         log(f"sampling {len(cand)} candidates: ~{nominal} pts @ {sp:.0f}mm")
-    core = set()
-    total = 0
-    for i, j, k, dil in cand:
-        ok, calls = _cell_is_core(gmsh, vols, dil, sp)
-        total += calls
-        if ok:
-            core.add((i, j, k))
+
+    grid = (r_edges, r_anchor, z_edges, z_anchor, th_edges, n_theta)
+    if (n_workers > 1 and stp_path
+            and len(cand) >= max(2 * n_workers, _MIN_PARALLEL_CANDIDATES)):
+        try:
+            core = _classify_parallel(stp_path, grid, cand, sp, n_workers,
+                                      margin_deg, skin_mm, log)
+            log(f"classified {len(core)}/{len(cand)} candidates core "
+                f"({n_workers} processes)")
+            return core
+        except Exception as exc:                   # never fail the build
+            log(f"parallel classify failed ({exc!r}); serial fallback")
+    core, total = _classify_cells_serial(gmsh, vols, cand, sp)
     log(f"classified {len(core)}/{len(cand)} candidates core "
         f"({total} isInside calls)")
     return core
@@ -604,7 +778,8 @@ def _cache_store(key: Optional[str], group_name: str, payload: Dict) -> None:
 # The group builder (rank-0 gmsh work)
 # ---------------------------------------------------------------------------
 def _build_group_rank0(entries: List[Dict[str, Any]], group_name: str,
-                       gmsh_verbosity: int) -> Dict[str, Any]:
+                       gmsh_verbosity: int,
+                       classify_workers: int = 1) -> Dict[str, Any]:
     import gmsh
 
     from cyclotron_optimizer.geometry.components import (  # avoid cycle
@@ -725,7 +900,8 @@ def _build_group_rank0(entries: List[Dict[str, Any]], group_name: str,
                   f"; classifying (skin_mm={skin_mm:.1f}, margin={margin:.1f})")
             core = _classify_core_cells(
                 gmsh, vols, r_edges, r_anchor, z_edges, z_anchor, th_edges,
-                n_theta, st["core_clip"], margin, skin_mm, spacing, _mlog)
+                n_theta, st["core_clip"], margin, skin_mm, spacing, _mlog,
+                stp_path=e.get("stp_path"), n_workers=classify_workers)
 
             cells = sorted(
                 [(r_edges[i], r_edges[i + 1], th_edges[j], th_edges[j + 1],
@@ -1032,6 +1208,7 @@ def build_structured_group(
     comm: Any = None,
     gmsh_verbosity: int = 2,
     use_cache: bool = True,
+    classify_workers: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Build a conforming group where members may be structured.
 
@@ -1044,18 +1221,24 @@ def build_structured_group(
     MPI-safe: rank 0 does the gmsh/OCC work, the payload is broadcast.
     Results are cached under output/structured_cache when every entry is
     file-based (digest-keyed: re-slices only when CAD/params change).
+
+    ``classify_workers`` sets the number of processes the (rank-0) isInside
+    classification fans out over (None -> auto from this node's cores; 1 ->
+    serial). Only affects a cache MISS (a fresh slice); identical payload.
     """
     from cyclotron_optimizer.geometry.components import _resolve_comm
 
     comm = _resolve_comm(comm)
     rank = comm.Get_rank() if comm is not None else 0
+    workers = _auto_workers() if classify_workers is None else classify_workers
 
     payload: Optional[Dict[str, Any]] = None
     if rank <= 0:
         key = _group_cache_key(entries) if use_cache else None
         payload = _cache_load(key, group_name)
         if payload is None:
-            payload = _build_group_rank0(entries, group_name, gmsh_verbosity)
+            payload = _build_group_rank0(entries, group_name, gmsh_verbosity,
+                                         classify_workers=workers)
             _cache_store(key, group_name, payload)
     if comm is not None:
         payload = comm.bcast(payload, root=0)
@@ -1075,19 +1258,23 @@ def slice_stp_polar(
     model_name: str = "structured",
     gmsh_verbosity: int = 2,
     use_cache: bool = False,
+    classify_workers: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Slice ONE component (possibly multi-solid) on the calling rank.
 
     Returns the member payload: cells / skin_tets / theta_span /
-    structure / stats.
+    structure / stats. ``classify_workers``: processes for the isInside
+    classification (None -> auto; 1 -> serial).
     """
     entry = {"name": model_name, "stp_path": str(stp_path),
              "mesh_max": mesh_size_max, "mesh_min": mesh_size_min,
              "structure": dict(structure or {})}
+    workers = _auto_workers() if classify_workers is None else classify_workers
     key = _group_cache_key([entry]) if use_cache else None
     payload = _cache_load(key, model_name)
     if payload is None:
-        payload = _build_group_rank0([entry], model_name, gmsh_verbosity)
+        payload = _build_group_rank0([entry], model_name, gmsh_verbosity,
+                                     classify_workers=workers)
         _cache_store(key, model_name, payload)
     return payload["members"][model_name]
 
