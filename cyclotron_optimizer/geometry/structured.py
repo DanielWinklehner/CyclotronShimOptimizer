@@ -533,22 +533,49 @@ def _classify_worker(payload):
         gmsh.finalize()
 
 
+# Launcher/MPI env vars that a spawned worker must NOT inherit: under an
+# mpirun/mpiexec (Hydra/PMI) job the child would otherwise try to register
+# with the process manager as an MPI rank and abort ("PMI_Get_appnum
+# returned -1"). Stripped so any MPI_Init in a worker (mpi4py auto-init on
+# import, or a radia extension) starts as a harmless standalone singleton.
+_MPI_ENV_PREFIXES = ("PMI_", "PMI2_", "PMIX_", "HYDRA_", "I_MPI_",
+                     "MPICH_", "OMPI_", "MPIEXEC_", "MPIR_")
+
+
 def _classify_parallel(stp_path, grid, cand, sp, n_workers, margin_deg,
                        skin_mm, log):
     """Classify candidate cells across `n_workers` spawned processes, each
     with its own gmsh session + STP import. Returns the merged core set.
     Round-robin shards for load balance; a set-union merge is order-
-    independent, so the result is identical to the serial classifier."""
+    independent, so the result is identical to the serial classifier.
+
+    Workers are spawned with the launcher's MPI/PMI environment stripped
+    (see _MPI_ENV_PREFIXES) and mpi4py auto-init disabled, so this is safe
+    under mpirun (the workers do no MPI; only rank 0 spawns them, and the
+    other ranks idle-wait the broadcast). The parent's env is restored
+    immediately after the pool closes, before any later MPI use."""
     import multiprocessing as mp
     cells_idx = [(i, j, k) for (i, j, k, _dil) in cand]
     shards = [s for s in (cells_idx[w::n_workers] for w in range(n_workers))
               if s]
     args = [(stp_path, grid, margin_deg, skin_mm, sp, s) for s in shards]
     ctx = mp.get_context("spawn")
+
+    saved = {k: os.environ.pop(k) for k in list(os.environ)
+             if k.startswith(_MPI_ENV_PREFIXES)}
+    prev_rc = os.environ.get("MPI4PY_RC_INITIALIZE")
+    os.environ["MPI4PY_RC_INITIALIZE"] = "0"
     core = set()
-    with ctx.Pool(len(shards)) as pool:
-        for sub in pool.map(_classify_worker, args):
-            core.update(sub)
+    try:
+        with ctx.Pool(len(shards)) as pool:      # children inherit env here
+            for sub in pool.map(_classify_worker, args):
+                core.update(sub)
+    finally:
+        os.environ.update(saved)
+        if prev_rc is None:
+            os.environ.pop("MPI4PY_RC_INITIALIZE", None)
+        else:
+            os.environ["MPI4PY_RC_INITIALIZE"] = prev_rc
     return core
 
 
