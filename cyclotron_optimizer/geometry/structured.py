@@ -386,40 +386,109 @@ def _apply_thin_skin_demote(gmsh, interior: Dict[int, Cell],
     return len(demote)
 
 
-def _fuse_robust(gmsh, tags: Sequence[int]) -> Tuple[List[int], int]:
-    """Fuse volumes into as few compounds as OCC manages.
+def _show_only(gmsh, tags: Sequence[int]) -> None:
+    """Visibility-mask EVERYTHING (all dims -- rolled-back fuses leave
+    orphan faces that must never reach the mesher), then show the given
+    volumes recursively (their faces/edges/points)."""
+    gmsh.model.setVisibility(gmsh.model.getEntities(), 0)
+    if tags:
+        gmsh.model.setVisibility([(3, t) for t in tags], 1, True)
+    gmsh.option.setNumber("Mesh.MeshOnlyVisible", 1)
 
-    OCC's n-ary fuse can fail on heavily faceted geometry ('Courbes non
-    jointives' on the spiral pole). Recursively bisect on failure so
-    unfusable pieces are isolated (kept separate -- costs some local tets)
-    instead of failing the build. Returns (result_tags, n_failed_joins).
+
+def _try_mesh(gmsh, tags: Sequence[int], dim: int = 3) -> bool:
+    """Try to mesh the given volumes in isolation (visibility-masked)."""
+    _show_only(gmsh, tags)
+    try:
+        gmsh.model.mesh.generate(dim)
+        return True
+    except Exception:
+        return False
+    finally:
+        gmsh.model.mesh.clear()
+
+
+def _heal_volume(gmsh, tag: int) -> List[int]:
+    """occ.healShapes one volume (degenerate/small-edge repair at
+    tolerance level); returns the replacement tag(s). Removes the
+    original if the kernel kept it around."""
+    v_pre = gmsh.model.occ.getMass(3, tag)
+    before = {t for _d, t in gmsh.model.occ.getEntities(3)}
+    healed = gmsh.model.occ.healShapes(
+        [(3, tag)], tolerance=1e-7, fixDegenerated=True,
+        fixSmallEdges=True, fixSmallFaces=True, sewFaces=False,
+        makeSolids=True)
+    gmsh.model.occ.synchronize()
+    after = {t for _d, t in gmsh.model.occ.getEntities(3)}
+    new = sorted({t for d, t in healed if d == 3} & (after - before))
+    if not new:
+        new = sorted(after - before)
+    if tag in after and new:
+        gmsh.model.occ.remove([(3, tag)], recursive=False)
+        gmsh.model.occ.synchronize()
+    if not new:
+        return [tag]        # heal was in-place (or a no-op)
+    v_post = sum(gmsh.model.occ.getMass(3, t) for t in new)
+    if abs(v_post - v_pre) > 1e-6 * max(v_pre, 1e-30):
+        raise RuntimeError(
+            f"healShapes changed the volume of piece {tag} by "
+            f"{abs(v_post - v_pre) / max(v_pre, 1e-30):.2e} relative")
+    return new
+
+
+def _fuse_robust(gmsh, tags: Sequence[int]) -> Tuple[List[int], int]:
+    """Fuse volumes into as few MESHABLE compounds as OCC manages.
+
+    Two OCC failure modes are handled by recursive bisection:
+    - the n-ary fuse itself fails ('Courbes non jointives' on heavily
+      faceted spiral geometry), or
+    - the fuse SUCCEEDS but produces a compound whose shell is broken
+      ('The 1D mesh seems not to be forming a closed loop' -- observed
+      when cross-member imprint edges from the group fragment are fused).
+    Each candidate fusion is therefore performed on COPIES and validated
+    with a cheap 2D mesh test; only a meshable result replaces the
+    originals, otherwise the copies are discarded (rollback) and the set
+    is bisected. Unfusable pieces stay separate (costs some local tets).
+    Returns (result_tags, n_failed_joins).
     """
     failures = 0
 
-    def fuse_call(ts: List[int]) -> List[int]:
-        fused, _fmap = gmsh.model.occ.fuse(
-            [(3, ts[0])], [(3, t) for t in ts[1:]])
-        return [t for d, t in fused if d == 3]
+    def try_fuse(ts: List[int]) -> Optional[List[int]]:
+        copies = gmsh.model.occ.copy([(3, t) for t in ts])
+        try:
+            fused, _fmap = gmsh.model.occ.fuse([copies[0]], copies[1:])
+        except Exception:
+            try:
+                gmsh.model.occ.remove(copies, recursive=True)
+                gmsh.model.occ.synchronize()
+            except Exception:
+                pass
+            return None
+        gmsh.model.occ.synchronize()
+        out = [t for d, t in fused if d == 3]
+        if _try_mesh(gmsh, out, dim=2):
+            # keep the fusion: drop the originals (faces they shared with
+            # other volumes survive; their orphaned boundary is excluded
+            # from meshing by _show_only's all-dims masking)
+            gmsh.model.occ.remove([(3, t) for t in ts], recursive=False)
+            gmsh.model.occ.synchronize()
+            return out
+        gmsh.model.occ.remove([(3, t) for t in out], recursive=True)
+        gmsh.model.occ.synchronize()
+        return None
 
     def rec(ts: List[int]) -> List[int]:
         nonlocal failures
         if len(ts) < 2:
             return list(ts)
-        try:
-            return fuse_call(ts)
-        except Exception:
-            if len(ts) == 2:
-                failures += 1
-                return list(ts)
-            mid = len(ts) // 2
-            a = rec(ts[:mid])
-            b = rec(ts[mid:])
-            if len(a) + len(b) < len(ts):
-                try:
-                    return fuse_call(a + b)
-                except Exception:
-                    failures += 1
-            return a + b
+        got = try_fuse(ts)
+        if got is not None:
+            return got
+        if len(ts) == 2:
+            failures += 1
+            return list(ts)
+        mid = len(ts) // 2
+        return rec(ts[:mid]) + rec(ts[mid:])
 
     out = rec(list(tags))
     gmsh.model.occ.synchronize()
@@ -664,15 +733,74 @@ def _build_group_rank0(entries: List[Dict[str, Any]], group_name: str,
                 "_source_of": source_of,
             }
 
-        # --- 4. per-member skin fuse ------------------------------------
+        # --- 4. PRE-FUSE conformity + contact detection ------------------
+        # Cross-member meshed contacts must be single shared face entities.
+        # This runs on the RAW pieces (simple, boolean-robust geometry)
+        # BEFORE any fuse: fragmenting FUSED compounds proved fragile
+        # (broken 1D curve loops; healShapes mangles them). Only pieces
+        # whose bounding boxes touch another member are fragmented.
+        all_interior = {t for m in interior_by_member.values() for t in m}
+        meshed = sorted(t for t in owner_of if t not in all_interior)
+        owners_meshed = {owner_of[t] for t in meshed}
+        contact_pieces: set = set()
+        shared: Dict[tuple, int] = {}
+        if len(owners_meshed) > 1:
+            boxes = {t: gmsh.model.getBoundingBox(3, t) for t in meshed}
+            tol = 0.1
+
+            def _bb_touch(a, b):
+                return not (a[3] < b[0] - tol or b[3] < a[0] - tol
+                            or a[4] < b[1] - tol or b[4] < a[1] - tol
+                            or a[5] < b[2] - tol or b[5] < a[2] - tol)
+
+            by_owner: Dict[str, List[int]] = {}
+            for t in meshed:
+                by_owner.setdefault(owner_of[t], []).append(t)
+            names = sorted(by_owner)
+            cands: set = set()
+            for i, na in enumerate(names):
+                for nb in names[i + 1:]:
+                    for ta_ in by_owner[na]:
+                        for tb_ in by_owner[nb]:
+                            if _bb_touch(boxes[ta_], boxes[tb_]):
+                                cands.add(ta_)
+                                cands.add(tb_)
+            if cands:
+                _log(f"conformity: fragmenting {len(cands)} cross-member "
+                     "candidate pieces (pre-fuse)...")
+                _refragment(sorted(cands), "pre-fuse conformity")
+                meshed = sorted(t for t in owner_of
+                                if t not in all_interior)
+            # shared-face detection -> contact pieces stay OUT of the
+            # fuses below, so the conforming entities survive verbatim
+            meshed_set = set(meshed)
+            for _d, s in gmsh.model.getEntities(2):
+                up, _down = gmsh.model.getAdjacencies(2, s)
+                owners = {owner_of.get(int(v)) for v in up
+                          if int(v) in meshed_set}
+                owners.discard(None)
+                if len(owners) > 1:
+                    shared[tuple(sorted(owners))] = \
+                        shared.get(tuple(sorted(owners)), 0) + 1
+                    for v in up:
+                        if int(v) in meshed_set:
+                            contact_pieces.add(int(v))
+        msg = (", ".join(f"{a}~{b}: {n}"
+                         for (a, b), n in sorted(shared.items()))
+               if shared else "NONE")
+        _log(f"conforming meshed interfaces: {msg} "
+             f"({len(contact_pieces)} contact pieces kept unfused)")
+
+        # --- 5. per-member skin fuse (contact pieces excluded) -----------
         # Fuse PER SOURCE SOLID (base pole / side shim / VP separately):
         # cross-solid fuses of heavily faceted contact geometry are what
-        # trip OCC's sewing; _fuse_robust isolates any remaining failures.
+        # trip OCC's sewing; _fuse_robust isolates remaining failures.
         for e in entries:
             name = e["name"]
             interior = interior_by_member.get(name, {})
             skin = sorted(t for t, n in owner_of.items()
-                          if n == name and t not in interior)
+                          if n == name and t not in interior
+                          and t not in contact_pieces)
             if len(skin) > 1 and members[name].get("structure") is not None:
                 source_of = members[name].get("_source_of", {})
                 by_src: Dict[int, List[int]] = {}
@@ -697,18 +825,7 @@ def _build_group_rank0(entries: List[Dict[str, Any]], group_name: str,
                 _log(f"{name}: fused {len(skin)} skin pieces -> {len(new)}"
                      + (f" ({n_fail} unfusable joins kept separate)"
                         if n_fail else ""))
-
-        # --- 5. final conformity fragment over MESHED volumes -----------
-        # The fuses may have rebuilt contact faces; meshed contacts must be
-        # single shared entities again. Interior prisms are never meshed,
-        # so they stay out (exact tiling is already guaranteed).
-        all_interior = {t for m in interior_by_member.values() for t in m}
         meshed = sorted(t for t in owner_of if t not in all_interior)
-        owners_meshed = {owner_of[t] for t in meshed}
-        if len(owners_meshed) > 1:
-            _refragment(meshed, "conformity restore")
-            meshed = sorted(t for t in owner_of if t not in all_interior)
-            _log("conformity fragment over meshed volumes done")
 
         # volume conservation per member (interior analytic + meshed OCC)
         for e in entries:
@@ -723,22 +840,6 @@ def _build_group_rank0(entries: List[Dict[str, Any]], group_name: str,
                     f"({rel:.2e} relative)")
             if rel > 1e-6:
                 _log(f"WARNING: {name} volume shifted by {rel:.2e} relative")
-
-        # conforming-interface diagnostic (the acceptance check)
-        shared: Dict[tuple, int] = {}
-        meshed_set = set(meshed)
-        for _d, s in gmsh.model.getEntities(2):
-            up, _down = gmsh.model.getAdjacencies(2, s)
-            owners = {owner_of.get(int(v)) for v in up
-                      if int(v) in meshed_set}
-            owners.discard(None)
-            if len(owners) > 1:
-                key = tuple(sorted(owners))
-                shared[key] = shared.get(key, 0) + 1
-        msg = (", ".join(f"{a}~{b}: {n}"
-                         for (a, b), n in sorted(shared.items()))
-               if shared else "NONE")
-        _log(f"conforming meshed interfaces: {msg}")
 
         # --- 6. mesh the meshed volumes ---------------------------------
         sizes = {e["name"]: float(e["mesh_max"]) for e in entries
@@ -762,13 +863,41 @@ def _build_group_rank0(entries: List[Dict[str, Any]], group_name: str,
             if pts:
                 gmsh.model.mesh.setSize(pts, float(e["mesh_max"]))
 
-        if all_interior:
-            gmsh.model.setVisibility(gmsh.model.getEntities(3), 0, True)
-            gmsh.model.setVisibility([(3, t) for t in meshed], 1, True)
-            gmsh.option.setNumber("Mesh.MeshOnlyVisible", 1)
         if meshed:
             _log(f"meshing {len(meshed)} skin/tet volumes...")
-            gmsh.model.mesh.generate(3)
+            _show_only(gmsh, meshed)
+            try:
+                gmsh.model.mesh.generate(3)
+            except Exception as exc:
+                # Boolean debris (degenerate edges from fuse/fragment on
+                # faceted geometry) can break the 1D/2D mesher. Attribute
+                # the failure per volume, heal the offenders, retry.
+                _log(f"joint mesh failed ({exc}); bisecting per volume "
+                     "and healing offenders...")
+                gmsh.model.mesh.clear()
+                for t in list(meshed):
+                    if _try_mesh(gmsh, [t]):
+                        continue
+                    name = owner_of[t]
+                    _log(f"volume {t} ({name}) fails to mesh; healing...")
+                    new = _heal_volume(gmsh, t)
+                    if t not in new:
+                        owner_of.pop(t, None)
+                        for nt in new:
+                            owner_of[nt] = name
+                        meshed = sorted(t2 for t2 in owner_of
+                                        if t2 not in all_interior)
+                    still_bad = [nt for nt in new
+                                 if not _try_mesh(gmsh, [nt])]
+                    if still_bad:
+                        raise RuntimeError(
+                            f"skin volume(s) {still_bad} of '{name}' "
+                            "cannot be meshed even after healShapes -- "
+                            "inspect the CAD/grid interaction") from exc
+                gmsh.model.mesh.clear()
+                _show_only(gmsh, meshed)
+                gmsh.model.mesh.generate(3)
+                _log("mesh succeeded after healing")
 
         node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
         nodes: Dict[int, List[float]] = {}
