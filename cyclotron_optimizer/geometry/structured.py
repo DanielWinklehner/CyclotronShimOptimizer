@@ -315,41 +315,77 @@ def _sample_counts(dil: Cell, spacing: float) -> Tuple[int, int, int]:
     return nr, nth, nz
 
 
-def _lin_ordered(lo: float, hi: float, n: int, eps: float) -> List[float]:
-    """n points spanning [lo+eps, hi-eps], ORDERED extremes-first so the
-    short-circuit hits likely-outside corners early. eps insets off the
+def _lin(lo: float, hi: float, n: int, eps: float) -> List[float]:
+    """n ascending points spanning [lo+eps, hi-eps]. eps insets off the
     exact boundary (isInside is ambiguous on a CAD surface)."""
     if n <= 1:
         return [0.5 * (lo + hi)]
     step = (hi - lo - 2.0 * eps) / (n - 1)
-    vals = [lo + eps + step * m for m in range(n)]
-    order = [0, n - 1] + [m for m in range(1, n - 1)]
-    return [vals[m] for m in order]
+    return [lo + eps + step * m for m in range(n)]
+
+
+def _lattice_points(dil: Cell, spacing: float
+                    ) -> Tuple[List[float], List[float]]:
+    """Flat cartesian coords for the dilated cell, split into a coarse
+    3-per-dim subset (the cheap batch-1 reject) and the finer remainder
+    (batch-2). Coarse + fine together are the full sample lattice."""
+    a, b, ta, tb, za, zb = dil
+    nr, nth, nz = _sample_counts(dil, spacing)
+    rs = _lin(a, b, nr, 1e-3)
+    zs = _lin(za, zb, nz, 1e-3)
+    ths = _lin(math.radians(ta), math.radians(tb), nth, 1e-6)
+    cs = [(math.cos(t), math.sin(t)) for t in ths]
+
+    def coarse_idx(n):
+        return {0, (n - 1) // 2, n - 1}
+
+    cr, ci, ck = coarse_idx(nr), coarse_idx(nth), coarse_idx(nz)
+    coarse: List[float] = []
+    fine: List[float] = []
+    for ir, rr in enumerate(rs):
+        for it, (co, si) in enumerate(cs):
+            x, y = rr * co, rr * si
+            for iz, zz in enumerate(zs):
+                dst = (coarse if (ir in cr and it in ci and iz in ck)
+                       else fine)
+                dst += (x, y, zz)
+    return coarse, fine
+
+
+def _batch_covered(gmsh, vols: Sequence[int],
+                   coords: List[float]) -> Tuple[int, int]:
+    """(# of coords inside the UNION of vols, # isInside calls). The
+    member's volumes are pairwise disjoint (group-imprinted), so per-point
+    union membership == the sum of per-volume counts; short-circuit across
+    volumes once every point is accounted for."""
+    n = len(coords) // 3
+    cov = calls = 0
+    for v in vols:
+        calls += 1
+        cov += gmsh.model.isInside(3, v, coords)
+        if cov >= n:
+            break
+    return cov, calls
 
 
 def _cell_is_core(gmsh, vols: Sequence[int], dil: Cell,
                   spacing: float) -> Tuple[bool, int]:
-    """Sample the dilated cell; core iff EVERY sample is inside the union
-    of the member's volumes. Short-circuits on the first outside point.
+    """Core iff EVERY lattice point of the dilated cell is inside the
+    member. A coarse 3^3 batch rejects most exterior cells in one call;
+    the finer remainder confirms the rest. Same classification as a full
+    per-point sweep of the identical lattice, far fewer round-trips.
     Returns (is_core, n_isInside_calls)."""
-    a, b, ta, tb, za, zb = dil
-    nr, nth, nz = _sample_counts(dil, spacing)
-    rs = _lin_ordered(a, b, nr, 1e-3)
-    zs = _lin_ordered(za, zb, nz, 1e-3)
-    ths = [math.radians(t) for t in _lin_ordered(ta, tb, nth, 1e-4)]
-    calls = 0
-    for rr in rs:
-        for th in ths:
-            x, y = rr * math.cos(th), rr * math.sin(th)
-            for zz in zs:
-                inside = False
-                for v in vols:
-                    calls += 1
-                    if gmsh.model.isInside(3, v, [x, y, zz]):
-                        inside = True
-                        break
-                if not inside:
-                    return False, calls
+    coarse, fine = _lattice_points(dil, spacing)
+    nc = len(coarse) // 3
+    cov, calls = _batch_covered(gmsh, vols, coarse)
+    if cov < nc:
+        return False, calls
+    if fine:
+        nf = len(fine) // 3
+        cov, c2 = _batch_covered(gmsh, vols, fine)
+        calls += c2
+        if cov < nf:
+            return False, calls
     return True, calls
 
 
