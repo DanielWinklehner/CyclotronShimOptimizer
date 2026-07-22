@@ -145,13 +145,8 @@ def _kind_stp(spec: ComponentSpec, ctx: BuildContext) -> MagnetizedComponent:
     if not spec.file:
         raise ValueError(f"Component {spec.name!r} (kind 'stp') needs a file")
     if spec.structure is not None:
-        if spec.mesh_group:
-            raise ValueError(
-                f"Component {spec.name!r}: structure + mesh_group is not "
-                "supported yet -- a structured component must (for now) be "
-                "built standalone. NOTE: taking a structured part out of a "
-                "mesh_group makes its contacts non-conforming; validate the "
-                "solve (m11 residual) before adopting for production.")
+        # (grouped structured specs are handled by _build_mesh_group's
+        # structured path; this builder only sees ungrouped components)
         mat = ctx.material(spec)
         return MagnetizedComponent.from_stp_structured(
             spec.file,
@@ -282,20 +277,22 @@ def _kind_racetrack_pair(spec: ComponentSpec, ctx: BuildContext) -> CurrentCarry
 # Conforming mesh groups (opt-in via ComponentSpec.mesh_group)
 # ---------------------------------------------------------------------------
 def _group_occ_entry(spec: ComponentSpec, ctx: BuildContext) -> dict:
-    """Turn a grouped ComponentSpec into a build_conforming_group entry."""
-    if spec.structure is not None:
-        raise ValueError(
-            f"Component {spec.name!r}: structure + mesh_group is not "
-            "supported yet -- remove one of the two")
+    """Turn a grouped ComponentSpec into a build_conforming_group /
+    build_structured_group entry."""
     mesh_max = spec.mesh.get("max_size")
     if mesh_max is None:
         raise ValueError(f"Component {spec.name!r} is in mesh_group "
                          f"{spec.mesh_group!r} and needs mesh.max_size")
     entry = {"name": spec.name, "mesh_max": mesh_max,
-             "mesh_min": spec.mesh.get("min_size")}
+             "mesh_min": spec.mesh.get("min_size"),
+             "structure": spec.structure}
     if spec.file:
         entry["stp_path"] = spec.file
         return entry
+    if spec.structure is not None:
+        raise ValueError(
+            f"Component {spec.name!r}: structure currently requires an STP "
+            "file (OCC-callable structured members are a later step)")
     p = dict(spec.params)
     if spec.kind == "wedge":
         entry["occ"] = gb.occ_wedge_callable(**p)
@@ -317,16 +314,40 @@ def _build_mesh_group(group_name: str, specs: List[ComponentSpec],
                       ctx: BuildContext, *, rank: int = 0,
                       verbosity: int = 1) -> List[Tuple[ComponentSpec, BaseRadiaComponent]]:
     """Build a conforming mesh group: one gmsh model, fragmented, meshed
-    together, split back into per-component MagnetizedComponents."""
+    together, split back into per-component MagnetizedComponents.
+
+    If any member carries a `structure:` block the group is built by the
+    structured slicer (prism cores + conforming skins/tet members, see
+    geometry/structured.py); otherwise by the classic all-tet
+    build_conforming_group."""
     from cyclotron_optimizer.geometry.components import build_conforming_group
+    from cyclotron_optimizer.geometry.structured import build_structured_group
 
     if verbosity >= 1 and rank <= 0:
         print(f"Building mesh group '{group_name}' (conforming interfaces): "
               f"{[s.name for s in specs]}...", flush=True)
     entries = [_group_occ_entry(s, ctx) for s in specs]
+    out: List[Tuple[ComponentSpec, BaseRadiaComponent]] = []
+
+    if any(s.structure is not None for s in specs):
+        group = build_structured_group(entries, group_name=group_name,
+                                       comm=ctx.comm)
+        for spec in specs:
+            mat = ctx.material(spec)
+            payload = group["members"][spec.name]
+            if spec.structure is not None:
+                comp = MagnetizedComponent.from_structured_payload(
+                    payload, name=spec.name, material=mat, color=IRON_COLOR,
+                    apply_mat=mat is not None, apply_color=True)
+            else:
+                comp = MagnetizedComponent.from_tet_coords(
+                    payload["skin_tets"], material=mat, color=IRON_COLOR,
+                    apply_mat=mat is not None, apply_color=True)
+            out.append((spec, comp))
+        return out
+
     tets_by_name = build_conforming_group(entries, group_name=group_name,
                                           comm=ctx.comm)
-    out: List[Tuple[ComponentSpec, BaseRadiaComponent]] = []
     for spec in specs:
         mat = ctx.material(spec)
         comp = MagnetizedComponent.from_tet_coords(

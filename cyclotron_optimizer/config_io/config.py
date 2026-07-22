@@ -92,10 +92,14 @@ class ComponentSpec:
     perturbative: bool = False
     # Structured polar-grid discretization for STP components (Option C):
     # e.g. {'type': 'polar_grid', 'dr_mm': 120, 'dz_mm': 120,
-    # 'dtheta_deg': 5, 'chords_per_cell': 2, 'theta_span_deg': [0, 45]}.
-    # Clean revolved rings become analytic prism elements, CAD detail
-    # becomes a conforming tet skin (geometry/structured.py). Not yet
-    # supported together with mesh_group.
+    # 'dtheta_deg': 2.5, 'core_clip': {'z_max': -140},
+    # 'skin_margin_deg': 5, 'theta_span_deg': [0, 45]}.
+    # Clean revolved cells become analytic prism elements; CAD detail,
+    # the core_clip band (shim envelope!) and thin regions become a
+    # conforming tet skin (geometry/structured.py). Works standalone and
+    # inside a mesh_group (structured cores + skins + tet members are
+    # built conforming in one gmsh model, results digest-cached under
+    # output/structured_cache).
     structure: Optional[Dict[str, Any]] = None
     mesh_group: Optional[str] = None
 

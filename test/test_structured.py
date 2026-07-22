@@ -99,7 +99,9 @@ def test_inscribed_deficit_matches_theory():
     sub = math.radians(STRUCT["dtheta_deg"])
     expect = 1.0 - math.sin(sub) / sub
     got = p["stats"]["inscribed_volume_deficit_frac"]
-    assert abs(got - expect) < 1e-12, (got, expect)
+    # 1e-9: the stat mixes the analytic cell volumes with OCC's CAD
+    # volume, which carries ~1e-9 relative STEP round-trip noise
+    assert abs(got - expect) < 1e-9, (got, expect)
 
 
 def test_prism_volume_via_radia_field_parity():
@@ -183,3 +185,85 @@ def test_emit_matches_cell_list():
     rad.UtiDelAll()
     ids, cells = emit_prism_cells(p)
     assert len(ids) == len(cells) == p["stats"]["interior_cells"]
+
+
+# ---------------------------------------------------------------------------
+# v2 rules
+# ---------------------------------------------------------------------------
+def test_core_clip_z():
+    """core_clip z_max demotes the upper layer into the tet skin."""
+    st = dict(STRUCT, core_clip={"z_max": Z1})
+    p = slice_stp_polar(_make_stp(), structure=st, mesh_size_max=25.0,
+                        model_name="test_clip", gmsh_verbosity=0)
+    # layers z 0..40 survive (4 radial bins x 2 layers); z 40..60 demoted
+    assert p["stats"]["interior_cells"] == 4 * 2 * N_THETA, p["stats"]
+    assert p["stats"]["skin_tets"] > 0
+    assert all(zb <= Z1 + 1e-9 for *_r, _z0, zb in p["cells"])
+
+
+def test_theta_margin_span_edges_are_not_walls():
+    """The folded-symmetry span edges must NOT trigger margin demotion:
+    full rings stay fully core even with a large margin."""
+    st = dict(STRUCT, skin_margin_deg=15.0)
+    p = slice_stp_polar(_make_stp(), structure=st, mesh_size_max=25.0,
+                        model_name="test_margin_edge", gmsh_verbosity=0)
+    assert p["stats"]["interior_cells"] == (4 * 2 + 2) * N_THETA, p["stats"]
+
+
+def test_theta_margin_dilates_clipped_band():
+    """An in-span non-core region (here made via core_clip theta_max)
+    dilates by the margin: one extra theta cell per ring is demoted."""
+    st = dict(STRUCT, core_clip={"theta_max_deg": 45.0})
+    p0 = slice_stp_polar(_make_stp(), structure=st, mesh_size_max=25.0,
+                         model_name="test_margin0", gmsh_verbosity=0)
+    st = dict(st, skin_margin_deg=STRUCT["dtheta_deg"])
+    p1 = slice_stp_polar(_make_stp(), structure=st, mesh_size_max=25.0,
+                         model_name="test_margin1", gmsh_verbosity=0)
+    n_rings = 4 * 2 + 2
+    assert p0["stats"]["interior_cells"] == n_rings * (N_THETA // 2), \
+        p0["stats"]
+    assert p1["stats"]["interior_cells"] == n_rings * (N_THETA // 2 - 1), \
+        p1["stats"]
+
+
+def test_structured_group_two_members():
+    """Structured wedge + tet-only ring stacked on top: both members come
+    back with elements and the meshed contact is a conforming interface."""
+    import gmsh
+    from cyclotron_optimizer.geometry.structured import build_structured_group
+
+    fd, ring_path = tempfile.mkstemp(suffix=".stp", prefix="test_ring_")
+    os.close(fd)
+    gmsh.initialize()
+    try:
+        gmsh.option.setNumber("General.Terminal", 0)
+        gmsh.model.add("ring_on_top")
+        occ = gmsh.model.occ
+        outer = occ.addCylinder(0, 0, Z2, 0, 0, 20.0, R1, angle=math.pi / 2)
+        bore = occ.addCylinder(0, 0, Z2 - 1, 0, 0, 22.0, R0)
+        occ.cut([(3, outer)], [(3, bore)])
+        occ.synchronize()
+        gmsh.write(ring_path)
+    finally:
+        gmsh.finalize()
+
+    # clip the wedge's top layer into skin so the contact at z=Z2 is
+    # skin-tet vs tet-member (a MESHED interface that must conform)
+    entries = [
+        {"name": "wedge", "stp_path": _make_stp(), "mesh_max": 25.0,
+         "mesh_min": None, "structure": dict(STRUCT,
+                                             core_clip={"z_max": Z1})},
+        {"name": "ring", "stp_path": ring_path, "mesh_max": 25.0,
+         "mesh_min": None, "structure": None},
+    ]
+    group = build_structured_group(entries, group_name="test_group",
+                                   use_cache=False, gmsh_verbosity=0)
+    w = group["members"]["wedge"]
+    r = group["members"]["ring"]
+    assert w["stats"]["interior_cells"] == 4 * 2 * N_THETA
+    assert len(w["skin_tets"]) > 0
+    assert w["structure"] is not None and r["structure"] is None
+    assert len(r["skin_tets"]) > 0 and not r["cells"]
+    iface = group["group_stats"]["meshed_interfaces"]
+    assert iface.get("ring~wedge", 0) >= 1, iface
+    os.unlink(ring_path)

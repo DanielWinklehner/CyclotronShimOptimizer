@@ -1,60 +1,85 @@
-"""Structured polar-grid slicing of STP solids ("Option C").
+"""Structured polar-grid slicing of STP/OCC solids ("Option C", v2).
 
-Discretizes a revolved-ish iron solid (yoke) loaded from an STP file into
-a STRUCTURED core of annular-sector prisms plus a CONFORMING tetrahedral
-skin, instead of an unstructured all-tet mesh. Structured cores condition
-the relaxation dramatically better at a fraction of the element count
-(see scripts/perturb_study/RECMAG_GPU_PLAN.md and validate_recmag.py) and
-put the 60 MeV machine back inside the GPU's dense-IM element budget.
+Discretizes revolved-ish iron parts into a STRUCTURED core of annular-
+sector prisms plus a CONFORMING tetrahedral skin, instead of an
+unstructured all-tet mesh. Structured cores condition the relaxation far
+better at a fraction of the element count (RECMAG_GPU_PLAN.md,
+validate_recmag.py) and put the 60 MeV machine back inside the GPU's
+dense-IM element budget.
 
-Pipeline (rank 0, inside one gmsh session):
-  1. Import the STP; detect its z-axis cylinder radii and z-plane
-     positions (snap anchors).
-  2. Build the grid edges: anchors + equal-spaced fill to the dr/dz
-     targets. No theta cuts -- rings only; the azimuthal subdivision is
-     purely analytic at emission time.
-  3. Fragment the solid with the cutting surfaces (full cylinders +
-     disks), checking volume conservation.
-  4. Classify every fragment by its own FACE INVENTORY: a clean interior
-     ring has exactly two z-cylinders + two z-planes + the wedge side
-     planes, all snapping to grid edges, and its volume matches the
-     analytic ring volume. Everything else (touches a cone, a tilted
-     cylinder, any true CAD detail) is SKIN.
-     (Deliberately NOT center-of-mass binning: the COM of a thin wide
-     annular sector falls outside its own radial interval.)
-  5. Remove interior rings from the model and tet-mesh only the skin.
+v2 adds (see the memory note structured-stp-slicing):
+  - MESH-GROUP support: several components (structured and/or tet-only)
+    built in ONE gmsh model with conforming contacts
+    (``build_structured_group``, used by geometry._build_mesh_group).
+  - Multi-solid members (e.g. base pole + side shim + VP insert in one
+    STP): the grid is applied to every solid; non-revolved solids simply
+    classify as skin.
+  - ENVELOPE rule ``core_clip``: cylindrical-coordinate bounds outside
+    which no cell may be core (e.g. ``{z_max: -140}`` keeps the pole's
+    gap face, shim range and tip steps in the tet skin).
+  - MARGIN rule ``skin_margin_deg``: per-ring azimuthal dilation -- core
+    cells within the margin of any non-core azimuth (spiral wall, hole)
+    are demoted, so shim-envelope walls stay inside the skin.
+  - DEMOTE-AND-MERGE rule ``min_skin_thickness_mm``: a skin piece
+    thinner than the threshold absorbs its interior neighbor cell(s), so
+    the mesher always has >= a cell of grading room ("remove the
+    adjacent wall").
+  - Payload CACHING keyed by input-file digests + parameters
+    (output/structured_cache/); a frozen config re-slices only when the
+    CAD or the grid changes.
 
-Emission (all ranks, from the broadcast payload): interior rings are
-subdivided azimuthally into single-chord annular-trapezoid prism cells
-built as rad.ObjPolyhdr with vertices ON the true radii (inscribed
-chords; volume deficit ~dtheta^2/6 per cell, reported in the stats --
-dtheta is the ONLY faceting knob).
+Pipeline (rank 0, one gmsh session):
+  1. Import every member (STP or OCC callable); group-fragment all
+     volumes (imprints contacts, detects overlaps) -- the mesh_group
+     contract.
+  2. Per structured member: detect its z-cylinder radii / z-plane
+     anchors, build the grid (anchors + fill), fragment its volumes with
+     SOLID cutting tools, classify every piece by its own FACE INVENTORY
+     (two grid cylinders + two grid z-planes + two grid theta-planes +
+     the analytic sector volume; never center-of-mass binning -- the COM
+     of a wide annular sector falls outside its own radial interval),
+     then apply core_clip, skin_margin_deg and min_skin_thickness_mm.
+  3. Fuse each member's skin pieces into a compound (grid imprints and
+     slivers would otherwise force absurdly fine tets).
+  4. FINAL CONFORMITY FRAGMENT over the MESHED volumes only (skins +
+     tet-only members): re-imprints any contact face the fuses rebuilt,
+     so every meshed contact is a single shared entity again. Interior
+     prisms are never meshed, so no mesh conformity is needed against
+     them -- only the exact volume tiling, which the fragments guarantee.
+  5. One generate(3) with visibility masking; tets split per owner.
 
-Two radia constraints shape the emission (measured, 2026-07-21):
-- ObjPolyhdr (radTPolyhedron) is REQUIRED -- ObjMltExtPgn would build
-  extruded-polygon elements that the GPU interaction-matrix assembly
-  cannot pack (CPU fallback).
-- Cells MUST be CONVEX: radia rejects non-convex polyhedra ("Non-convex
-  polyhedron encountered", one winding orientation) or heap-CRASHES on
-  them (the other orientation). Hence exactly one chord per cell; a
-  multi-chord cell has a reflex inner edge and dies.
+Emission (all ranks, from the broadcast payload): one CONVEX single-
+chord prism per cell via rad.ObjPolyhdr. Two radia constraints
+(measured 2026-07-21): ObjMltExtPgn elements cannot be packed by the GPU
+assembly (CPU fallback), and non-convex polyhedra are rejected or
+heap-crash radia -- hence exactly one chord per cell; dtheta_deg is the
+arc-faceting knob (volume deficit ~ dtheta^2/6).
 
-The structured cells never require the on-plane jitter repair to be off:
-keep rad.FldLenRndSw at its default ('on'); cell centers of structured
-grids lie exactly on neighbor face-extension planes and the deterministic
-AbsRandMagnitude guard is what makes that well-defined.
+Keep rad.FldLenRndSw at its default 'on': structured grids put element
+centers exactly on neighbor face-extension planes; the deterministic
+AbsRandMagnitude repair is what makes that well-defined.
 """
 
 from __future__ import annotations
 
+import hashlib
 import math
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+import os
+import pickle
+import time
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 __all__ = [
+    "build_structured_group",
     "slice_stp_polar",
     "emit_prism_cells",
     "structured_defaults",
 ]
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_CACHE_DIR = _REPO_ROOT / "output" / "structured_cache"
+_CACHE_VERSION = 2   # bump on any algorithm change that alters payloads
 
 
 # ---------------------------------------------------------------------------
@@ -66,13 +91,28 @@ def structured_defaults() -> Dict[str, Any]:
         "dr_mm": 120.0,          # target radial fill spacing between anchors
         "dz_mm": 120.0,          # target axial fill spacing between anchors
         "dtheta_deg": 2.5,       # azimuthal cell size = arc faceting knob
-                                 # (volume deficit ~ dtheta^2/6: 0.03% @ 2.5 deg)
-        "theta_span_deg": (0.0, 45.0),  # azimuthal extent of the folded solid
+                                 # (volume deficit ~ dtheta^2/6: 0.03% @ 2.5)
+        "theta_span_deg": (0.0, 45.0),  # azimuthal extent of the folded part
         "snap": True,            # detect CAD radii / z-planes as grid anchors
         "element": "prism",      # 'prism' (ObjPolyhdr); 'recmag' reserved
         "min_fill_frac": 0.35,   # never place a fill edge closer than this
                                  # fraction of the target to an anchor
+        # v2 rules ---------------------------------------------------------
+        "core_clip": None,       # e.g. {"z_max": -140.0}: cells must lie
+                                 # wholly inside these cylindrical bounds
+                                 # (keys r_min/r_max/z_min/z_max/
+                                 # theta_min_deg/theta_max_deg) to be core
+        "skin_margin_deg": 0.0,  # demote core cells within this azimuth of
+                                 # any non-core position in their ring
+                                 # (shim envelope around spiral walls)
+        "min_skin_thickness_mm": "auto",  # skin thinner than this absorbs
+                                 # its interior neighbor ('auto' =
+                                 # 0.5 * mesh_size_max; None/0 disables)
     }
+
+
+_CLIP_KEYS = {"r_min", "r_max", "z_min", "z_max",
+              "theta_min_deg", "theta_max_deg"}
 
 
 def _merge_structure(structure: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -89,15 +129,23 @@ def _merge_structure(structure: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         raise NotImplementedError(
             "structure.element='recmag' is reserved for a later step; "
             "use 'prism' (same conditioning win, exact annular geometry)")
+    clip = out["core_clip"]
+    if clip is not None:
+        bad = set(clip) - _CLIP_KEYS
+        if bad:
+            raise ValueError(f"Unknown core_clip keys {sorted(bad)}; "
+                             f"known: {sorted(_CLIP_KEYS)}")
     return out
 
 
 # ---------------------------------------------------------------------------
-# Rank-0 gmsh work
+# Geometry helpers (rank-0, inside an initialized gmsh session)
 # ---------------------------------------------------------------------------
 _COINCIDENCE_TOL = 0.05   # mm: snap/dedupe tolerance for detected features
 _THETA_TOL_DEG = 0.01     # deg: snap tolerance for azimuthal cut planes
 _VOL_RTOL = 1e-6          # relative tolerance for the cell volume test
+
+Cell = Tuple[float, float, float, float, float, float]  # a,b,ta,tb,za,zb
 
 
 def _surface_info(gmsh, tag: int) -> Tuple[str, Dict[str, float]]:
@@ -116,17 +164,14 @@ def _surface_info(gmsh, tag: int) -> Tuple[str, Dict[str, float]]:
     if stype == "Cylinder":
         if abs(nz) > 1e-6:
             return ("other", {})           # tilted cylinder
-        # Verify the axis is the z-axis (not just any vertical cylinder):
-        # the normal must be radial at the sample point.
         r = math.hypot(xyz[0], xyz[1])
         if r < 1e-9:
             return ("other", {})
         rhat = (xyz[0] / r, xyz[1] / r)
         radial = abs(n[0] / nn * rhat[0] + n[1] / nn * rhat[1])
         if radial < 1.0 - 1e-6:
-            return ("other", {})           # off-axis cylinder
+            return ("other", {})           # off-axis (bolt-hole) cylinder
         return ("zcyl", {"r": r})
-    # Plane:
     if abs(nz) > 1.0 - 1e-9:
         return ("zplane", {"z": xyz[2]})
     if abs(nz) < 1e-9:
@@ -145,14 +190,9 @@ def _dedupe(vals: Sequence[float], tol: float) -> List[float]:
 
 def _build_edges(anchors: Sequence[float], lo: float, hi: float,
                  target: float, min_fill_frac: float) -> List[float]:
-    """Grid edges: [lo, hi] + interior anchors + equal-spaced fill.
-
-    Fill edges are equally spaced inside each anchor interval, so by
-    construction they keep >= (interval/n)/2 clearance from the anchors;
-    intervals shorter than min_fill_frac*target simply get no fill (one
-    structured layer -- thin but perfectly shaped).
-    """
-    core = [a for a in anchors if lo + _COINCIDENCE_TOL < a < hi - _COINCIDENCE_TOL]
+    """Grid edges: [lo, hi] + interior anchors + equal-spaced fill."""
+    core = [a for a in anchors
+            if lo + _COINCIDENCE_TOL < a < hi - _COINCIDENCE_TOL]
     edges = _dedupe([lo] + core + [hi], _COINCIDENCE_TOL)
     out: List[float] = [edges[0]]
     for a, b in zip(edges, edges[1:]):
@@ -173,6 +213,694 @@ def _snap_to(edges: Sequence[float], v: float) -> Optional[float]:
     return None
 
 
+def _detect_anchors(gmsh, vol_tags: Sequence[int]) -> Tuple[List[float], List[float]]:
+    radii: List[float] = []
+    zplanes: List[float] = []
+    for _d, s in gmsh.model.getBoundary([(3, t) for t in vol_tags],
+                                        combined=False, oriented=False):
+        kind, info = _surface_info(gmsh, s)
+        if kind == "zcyl":
+            radii.append(info["r"])
+        elif kind == "zplane":
+            zplanes.append(info["z"])
+    return (_dedupe(radii, _COINCIDENCE_TOL),
+            _dedupe(zplanes, _COINCIDENCE_TOL))
+
+
+def _make_tools(gmsh, r_edges, z_edges, th_edges, z_lo, z_hi, r_hi):
+    """SOLID cutting tools, each intersecting the iron with exactly one
+    face (surface tools trip BOPAlgo self-intersections). The theta box's
+    x'=0 face contains the axis at theta+90 deg, which for a <=180 deg
+    part never re-enters the material."""
+    tools: List[Tuple[int, int]] = []
+    pad = 2.0
+    zp0, zp1 = z_lo - pad, z_hi + pad
+    big = r_hi + 10.0
+    for r in r_edges[1:-1]:
+        tools.append((3, gmsh.model.occ.addCylinder(
+            0.0, 0.0, zp0, 0.0, 0.0, zp1 - zp0, r)))
+    for z in z_edges[1:-1]:
+        tools.append((3, gmsh.model.occ.addCylinder(
+            0.0, 0.0, zp0, 0.0, 0.0, z - zp0, big)))
+    for th in th_edges[1:-1]:
+        b = gmsh.model.occ.addBox(0.0, 0.0, zp0, big, big, zp1 - zp0)
+        gmsh.model.occ.rotate([(3, b)], 0, 0, 0, 0, 0, 1, math.radians(th))
+        tools.append((3, b))
+    return tools
+
+
+def _classify_piece(gmsh, tag: int, r_edges, z_edges, th_edges) -> Optional[Cell]:
+    """A piece is a clean core cell iff its face inventory is exactly two
+    grid cylinders + two grid z-planes + two grid theta-planes and its
+    volume matches the analytic sector volume."""
+    faces = gmsh.model.getBoundary([(3, tag)], combined=False, oriented=False)
+    cyl_r: List[float] = []
+    pl_z: List[float] = []
+    pl_th: List[float] = []
+    for _fd, f in faces:
+        kind, info = _surface_info(gmsh, f)
+        if kind == "zcyl":
+            r = _snap_to(r_edges, info["r"])
+            if r is None:
+                return None
+            cyl_r.append(r)
+        elif kind == "zplane":
+            z = _snap_to(z_edges, info["z"])
+            if z is None:
+                return None
+            pl_z.append(z)
+        elif kind == "plane":
+            th = info["theta_deg"]
+            got = None
+            for cand in (th - 90.0, th + 90.0):
+                cand %= 360.0
+                for e in th_edges:
+                    if abs(cand - (e % 360.0)) <= _THETA_TOL_DEG:
+                        got = e
+                        break
+                if got is not None:
+                    break
+            if got is None:
+                return None
+            pl_th.append(got)
+        else:
+            return None
+    cyl_r = _dedupe(cyl_r, _COINCIDENCE_TOL)
+    pl_z = _dedupe(pl_z, _COINCIDENCE_TOL)
+    pl_th = _dedupe(pl_th, _THETA_TOL_DEG)
+    if not (len(cyl_r) == 2 and len(pl_z) == 2 and len(pl_th) == 2):
+        return None
+    a, b = cyl_r
+    za, zb = pl_z
+    ta, tb = pl_th
+    v_exp = 0.5 * math.radians(tb - ta) * (b * b - a * a) * (zb - za)
+    v_act = gmsh.model.occ.getMass(3, tag)
+    if abs(v_act - v_exp) > _VOL_RTOL * v_exp:
+        return None
+    return (a, b, ta, tb, za, zb)
+
+
+def _apply_core_clip(interior: Dict[int, Cell], clip: Optional[Dict[str, float]]) -> int:
+    """Demote cells not wholly inside the cylindrical clip bounds."""
+    if not clip:
+        return 0
+    demote = []
+    for tag, (a, b, ta, tb, za, zb) in interior.items():
+        ok = True
+        if "r_min" in clip and a < clip["r_min"] - _COINCIDENCE_TOL:
+            ok = False
+        if "r_max" in clip and b > clip["r_max"] + _COINCIDENCE_TOL:
+            ok = False
+        if "z_min" in clip and za < clip["z_min"] - _COINCIDENCE_TOL:
+            ok = False
+        if "z_max" in clip and zb > clip["z_max"] + _COINCIDENCE_TOL:
+            ok = False
+        if "theta_min_deg" in clip and ta < clip["theta_min_deg"] - _THETA_TOL_DEG:
+            ok = False
+        if "theta_max_deg" in clip and tb > clip["theta_max_deg"] + _THETA_TOL_DEG:
+            ok = False
+        if not ok:
+            demote.append(tag)
+    for tag in demote:
+        del interior[tag]
+    return len(demote)
+
+
+def _apply_theta_margin(interior: Dict[int, Cell], margin_deg: float,
+                        t0: float, dtheta: float, n_theta: int) -> int:
+    """Per-ring 1D dilation along theta: demote core cells within the
+    margin of any IN-SPAN azimuth that is not core (spiral wall, hole,
+    clipped band). Positions beyond the span are the folded symmetry
+    sides, not walls, and do not trigger demotion."""
+    if margin_deg <= 0:
+        return 0
+    m = max(1, int(math.ceil(margin_deg / dtheta - 1e-9)))
+    rings: Dict[Tuple, Dict[int, int]] = {}
+    for tag, (a, b, ta, tb, za, zb) in interior.items():
+        key = (round(a, 4), round(b, 4), round(za, 4), round(zb, 4))
+        idx = int(round((ta - t0) / dtheta))
+        rings.setdefault(key, {})[idx] = tag
+    demote = []
+    for key, occ in rings.items():
+        present = set(occ)
+        for idx, tag in occ.items():
+            for j in range(idx - m, idx + m + 1):
+                if 0 <= j < n_theta and j not in present:
+                    demote.append(tag)
+                    break
+    for tag in demote:
+        del interior[tag]
+    return len(demote)
+
+
+def _apply_thin_skin_demote(gmsh, interior: Dict[int, Cell],
+                            seed_tags: Sequence[int],
+                            thr: float) -> int:
+    """Demote-and-merge: a thin skin piece (thickness estimate 2V/A below
+    thr) absorbs its adjacent interior cell(s) -- 'remove the adjacent
+    wall' so the tet mesher gets >= a cell of grading room.
+
+    Only ORIGINALLY NON-CLEAN pieces (true CAD-shaved fragments) may seed
+    demotion: cells demoted by the clip/margin rules are healthy full
+    grid cells whose 2V/A is small merely because inner-radius cells are
+    azimuthally narrow -- letting them seed would cascade through the
+    whole core (measured)."""
+    if thr <= 0:
+        return 0
+    demote: List[int] = []
+    for s in seed_tags:
+        v = gmsh.model.occ.getMass(3, s)
+        faces = gmsh.model.getBoundary([(3, s)], combined=False,
+                                       oriented=False)
+        area = sum(gmsh.model.occ.getMass(2, f) for _fd, f in faces)
+        if area <= 0 or 2.0 * v / area >= thr:
+            continue
+        for _fd, f in faces:
+            up, _down = gmsh.model.getAdjacencies(2, f)
+            for vol in up:
+                if int(vol) in interior:
+                    demote.append(int(vol))
+    demote = sorted(set(demote))
+    for tag in demote:
+        del interior[tag]
+    return len(demote)
+
+
+def _fuse_robust(gmsh, tags: Sequence[int]) -> Tuple[List[int], int]:
+    """Fuse volumes into as few compounds as OCC manages.
+
+    OCC's n-ary fuse can fail on heavily faceted geometry ('Courbes non
+    jointives' on the spiral pole). Recursively bisect on failure so
+    unfusable pieces are isolated (kept separate -- costs some local tets)
+    instead of failing the build. Returns (result_tags, n_failed_joins).
+    """
+    failures = 0
+
+    def fuse_call(ts: List[int]) -> List[int]:
+        fused, _fmap = gmsh.model.occ.fuse(
+            [(3, ts[0])], [(3, t) for t in ts[1:]])
+        return [t for d, t in fused if d == 3]
+
+    def rec(ts: List[int]) -> List[int]:
+        nonlocal failures
+        if len(ts) < 2:
+            return list(ts)
+        try:
+            return fuse_call(ts)
+        except Exception:
+            if len(ts) == 2:
+                failures += 1
+                return list(ts)
+            mid = len(ts) // 2
+            a = rec(ts[:mid])
+            b = rec(ts[mid:])
+            if len(a) + len(b) < len(ts):
+                try:
+                    return fuse_call(a + b)
+                except Exception:
+                    failures += 1
+            return a + b
+
+    out = rec(list(tags))
+    gmsh.model.occ.synchronize()
+    return out, failures
+
+
+# ---------------------------------------------------------------------------
+# Cache
+# ---------------------------------------------------------------------------
+def _entry_digest(e: Dict[str, Any]) -> Optional[str]:
+    """Digest of one entry's inputs; None if not cacheable (occ callable)."""
+    if e.get("occ") is not None:
+        return None
+    path = e.get("stp_path")
+    if not path:
+        return None
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        h.update(f.read())
+    h.update(repr((e["name"], e.get("mesh_max"), e.get("mesh_min"),
+                   sorted((e.get("structure") or {}).items(),
+                          key=lambda kv: kv[0]))).encode())
+    return h.hexdigest()
+
+
+def _group_cache_key(entries: List[Dict[str, Any]]) -> Optional[str]:
+    h = hashlib.sha256()
+    h.update(str(_CACHE_VERSION).encode())
+    for e in entries:
+        d = _entry_digest(e)
+        if d is None:
+            return None
+        h.update(d.encode())
+    return h.hexdigest()[:16]
+
+
+def _cache_load(key: Optional[str], group_name: str) -> Optional[Dict]:
+    if key is None:
+        return None
+    path = _CACHE_DIR / f"{group_name}-{key}.pkl"
+    if path.exists():
+        try:
+            with open(path, "rb") as f:
+                payload = pickle.load(f)
+            print(f"[structured {group_name}] cache hit: {path.name}",
+                  flush=True)
+            return payload
+        except Exception:
+            return None
+    return None
+
+
+def _cache_store(key: Optional[str], group_name: str, payload: Dict) -> None:
+    if key is None:
+        return
+    try:
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path = _CACHE_DIR / f"{group_name}-{key}.pkl"
+        with open(path, "wb") as f:
+            pickle.dump(payload, f)
+        print(f"[structured {group_name}] cached -> {path.name}", flush=True)
+    except Exception as exc:      # cache is best-effort
+        print(f"[structured {group_name}] cache write failed: {exc}",
+              flush=True)
+
+
+# ---------------------------------------------------------------------------
+# The group builder (rank-0 gmsh work)
+# ---------------------------------------------------------------------------
+def _build_group_rank0(entries: List[Dict[str, Any]], group_name: str,
+                       gmsh_verbosity: int) -> Dict[str, Any]:
+    import gmsh
+
+    from cyclotron_optimizer.geometry.components import (  # avoid cycle
+        _pin_gmsh_determinism,
+    )
+
+    t_start = time.perf_counter()
+
+    def _log(msg):
+        print(f"[structured {group_name}] {msg} "
+              f"(t={time.perf_counter() - t_start:.0f}s)", flush=True)
+
+    gmsh.initialize()
+    try:
+        gmsh.option.setNumber("General.Terminal", 1)
+        gmsh.option.setNumber("General.Verbosity", gmsh_verbosity)
+        _pin_gmsh_determinism()
+        gmsh.model.add(f"structured_{group_name}")
+
+        # --- 1. import members ------------------------------------------
+        owner_of: Dict[int, str] = {}
+        for e in entries:
+            before = {t for _d, t in gmsh.model.occ.getEntities(3)}
+            if e.get("stp_path"):
+                gmsh.model.occ.importShapes(str(e["stp_path"]))
+            elif e.get("occ") is not None:
+                e["occ"]()
+            else:
+                raise ValueError(f"entry {e['name']!r}: neither stp_path "
+                                 "nor occ builder")
+            after = {t for _d, t in gmsh.model.occ.getEntities(3)}
+            new = sorted(after - before)
+            if not new:
+                raise ValueError(f"entry {e['name']!r} added no OCC volume")
+            for t in new:
+                owner_of[t] = e["name"]
+        gmsh.model.occ.synchronize()
+        v_in = {e["name"]: 0.0 for e in entries}
+        for t, n in owner_of.items():
+            v_in[n] += gmsh.model.occ.getMass(3, t)
+        _log(f"imported {len(owner_of)} volumes from {len(entries)} members")
+
+        def _refragment(tags: List[int], what: str) -> None:
+            """Fragment the given volumes against each other, remapping
+            owner_of and detecting cross-member overlaps."""
+            nonlocal owner_of
+            if len(tags) < 2:
+                return
+            _out, out_map = gmsh.model.occ.fragment(
+                [(3, t) for t in sorted(tags)], [])
+            new_owner = dict(owner_of)
+            for t in tags:
+                new_owner.pop(t, None)
+            for in_tag, images in zip(sorted(tags), out_map):
+                for d, t in images:
+                    if d != 3:
+                        continue
+                    prev = new_owner.get(t)
+                    if prev is not None and prev != owner_of[in_tag]:
+                        raise RuntimeError(
+                            f"structured group '{group_name}': members "
+                            f"'{prev}' and '{owner_of[in_tag]}' OVERLAP "
+                            f"({what}); parts must only touch")
+                    new_owner[t] = owner_of[in_tag]
+            owner_of = new_owner
+            gmsh.model.occ.synchronize()
+
+        # --- 2. group imprint fragment (mesh_group contract) ------------
+        _refragment(sorted(owner_of), "group imprint")
+        _log("group imprint fragment done")
+
+        # --- 3. per-member slicing --------------------------------------
+        members: Dict[str, Dict[str, Any]] = {}
+        interior_by_member: Dict[str, Dict[int, Cell]] = {}
+        for e in entries:
+            name = e["name"]
+            st = (_merge_structure(e.get("structure"))
+                  if e.get("structure") is not None else None)
+            if st is None:
+                members[name] = {"structure": None}
+                continue
+            vols = sorted(t for t, n in owner_of.items() if n == name)
+
+            radii, zplanes = (_detect_anchors(gmsh, vols) if st["snap"]
+                              else ([], []))
+            bbs = [gmsh.model.getBoundingBox(3, t) for t in vols]
+            z_lo = min(bb[2] for bb in bbs)
+            z_hi = max(bb[5] for bb in bbs)
+            r_hi = max(math.hypot(max(abs(bb[0]), abs(bb[3])),
+                                  max(abs(bb[1]), abs(bb[4])))
+                       for bb in bbs) + 1.0
+            r_min = radii[0] if radii else 0.0
+            r_max = radii[-1] if radii else r_hi - 1.0
+            r_edges = _build_edges(radii, r_min, r_max, float(st["dr_mm"]),
+                                   float(st["min_fill_frac"]))
+            z_edges = _build_edges(zplanes, z_lo, z_hi, float(st["dz_mm"]),
+                                   float(st["min_fill_frac"]))
+            t0, t1 = (float(st["theta_span_deg"][0]),
+                      float(st["theta_span_deg"][1]))
+            if t1 <= t0:
+                raise ValueError("theta_span_deg must be increasing")
+            n_theta = max(1, int(round((t1 - t0) / float(st["dtheta_deg"]))))
+            dtheta = (t1 - t0) / n_theta
+            th_edges = [t0 + dtheta * j for j in range(n_theta + 1)]
+
+            tools = _make_tools(gmsh, r_edges, z_edges, th_edges,
+                                z_lo, z_hi, r_hi)
+            _log(f"{name}: fragmenting {len(vols)} volume(s) with "
+                 f"{len(tools)} grid tools...")
+            _out, out_map = gmsh.model.occ.fragment(
+                [(3, t) for t in vols], tools)
+            pieces: List[int] = []
+            source_of: Dict[int, int] = {}   # piece -> member-solid index
+            for i_src, images in enumerate(out_map[:len(vols)]):
+                for d, t in images:
+                    if d == 3 and t not in source_of:
+                        source_of[t] = i_src
+                        pieces.append(t)
+            pieces = sorted(set(pieces))
+            for t in vols:
+                owner_of.pop(t, None)
+            for t in pieces:
+                owner_of[t] = name
+            v_pieces = sum(gmsh.model.occ.getMass(3, t) for t in pieces)
+            rel = abs(v_pieces - v_in[name]) / max(v_in[name], 1e-30)
+            if rel > 1e-3:
+                raise RuntimeError(
+                    f"{name}: grid fragment changed the volume by "
+                    f"{rel:.2e} relative -- OCC boolean failed")
+            gmsh.model.occ.synchronize()
+            _log(f"{name}: {len(pieces)} pieces; classifying...")
+
+            interior: Dict[int, Cell] = {}
+            for t in pieces:
+                cell = _classify_piece(gmsh, t, r_edges, z_edges, th_edges)
+                if cell is not None:
+                    interior[t] = cell
+            n_clean = len(interior)
+            # non-clean fragments = true CAD-shaved pieces: the only
+            # legitimate seeds for the thin-skin rule below
+            cad_fragments = [t for t in pieces if t not in interior]
+
+            n_clip = _apply_core_clip(interior, st["core_clip"])
+            n_margin = _apply_theta_margin(interior,
+                                           float(st["skin_margin_deg"]),
+                                           t0, dtheta, n_theta)
+            thr = st["min_skin_thickness_mm"]
+            if thr == "auto":
+                thr = 0.5 * float(e.get("mesh_max") or 0.0)
+            thr = float(thr or 0.0)
+            n_thin = _apply_thin_skin_demote(gmsh, interior, cad_fragments,
+                                             thr)
+            _log(f"{name}: {n_clean} clean cells; demoted {n_clip} (clip) "
+                 f"+ {n_margin} (theta margin) + {n_thin} (thin skin) -> "
+                 f"{len(interior)} core cells")
+
+            cells = sorted(interior.values(),
+                           key=lambda c: (c[4], c[0], c[2]))
+            v_interior = sum(
+                0.5 * math.radians(tb - ta) * (b * b - a * a) * (zb - za)
+                for a, b, ta, tb, za, zb in cells)
+            interior_by_member[name] = interior
+            members[name] = {
+                "structure": st,
+                "cells": cells,
+                "theta_span": (t0, t1),
+                "_v_interior": v_interior,
+                "_grid": (len(r_edges), len(z_edges), n_theta),
+                "_anchors": (radii, zplanes),
+                "_n_skin_pieces": len(pieces) - len(interior),
+                "_source_of": source_of,
+            }
+
+        # --- 4. per-member skin fuse ------------------------------------
+        # Fuse PER SOURCE SOLID (base pole / side shim / VP separately):
+        # cross-solid fuses of heavily faceted contact geometry are what
+        # trip OCC's sewing; _fuse_robust isolates any remaining failures.
+        for e in entries:
+            name = e["name"]
+            interior = interior_by_member.get(name, {})
+            skin = sorted(t for t, n in owner_of.items()
+                          if n == name and t not in interior)
+            if len(skin) > 1 and members[name].get("structure") is not None:
+                source_of = members[name].get("_source_of", {})
+                by_src: Dict[int, List[int]] = {}
+                for t in skin:
+                    by_src.setdefault(source_of.get(t, -1), []).append(t)
+                v_pre = sum(gmsh.model.occ.getMass(3, t) for t in skin)
+                new: List[int] = []
+                n_fail = 0
+                for _src in sorted(by_src):
+                    fused, nf = _fuse_robust(gmsh, sorted(by_src[_src]))
+                    new += fused
+                    n_fail += nf
+                for t in skin:
+                    owner_of.pop(t, None)
+                for t in new:
+                    owner_of[t] = name
+                v_post = sum(gmsh.model.occ.getMass(3, t) for t in new)
+                srel = abs(v_post - v_pre) / max(v_pre, 1e-30)
+                if srel > 1e-6:
+                    _log(f"WARNING: {name} skin fuse shifted volume by "
+                         f"{srel:.2e} relative")
+                _log(f"{name}: fused {len(skin)} skin pieces -> {len(new)}"
+                     + (f" ({n_fail} unfusable joins kept separate)"
+                        if n_fail else ""))
+
+        # --- 5. final conformity fragment over MESHED volumes -----------
+        # The fuses may have rebuilt contact faces; meshed contacts must be
+        # single shared entities again. Interior prisms are never meshed,
+        # so they stay out (exact tiling is already guaranteed).
+        all_interior = {t for m in interior_by_member.values() for t in m}
+        meshed = sorted(t for t in owner_of if t not in all_interior)
+        owners_meshed = {owner_of[t] for t in meshed}
+        if len(owners_meshed) > 1:
+            _refragment(meshed, "conformity restore")
+            meshed = sorted(t for t in owner_of if t not in all_interior)
+            _log("conformity fragment over meshed volumes done")
+
+        # volume conservation per member (interior analytic + meshed OCC)
+        for e in entries:
+            name = e["name"]
+            v_int = members[name].get("_v_interior", 0.0)
+            v_meshed = sum(gmsh.model.occ.getMass(3, t)
+                           for t in meshed if owner_of[t] == name)
+            rel = abs(v_int + v_meshed - v_in[name]) / max(v_in[name], 1e-30)
+            if rel > 1e-3:
+                raise RuntimeError(
+                    f"{name}: volume not conserved through slicing "
+                    f"({rel:.2e} relative)")
+            if rel > 1e-6:
+                _log(f"WARNING: {name} volume shifted by {rel:.2e} relative")
+
+        # conforming-interface diagnostic (the acceptance check)
+        shared: Dict[tuple, int] = {}
+        meshed_set = set(meshed)
+        for _d, s in gmsh.model.getEntities(2):
+            up, _down = gmsh.model.getAdjacencies(2, s)
+            owners = {owner_of.get(int(v)) for v in up
+                      if int(v) in meshed_set}
+            owners.discard(None)
+            if len(owners) > 1:
+                key = tuple(sorted(owners))
+                shared[key] = shared.get(key, 0) + 1
+        msg = (", ".join(f"{a}~{b}: {n}"
+                         for (a, b), n in sorted(shared.items()))
+               if shared else "NONE")
+        _log(f"conforming meshed interfaces: {msg}")
+
+        # --- 6. mesh the meshed volumes ---------------------------------
+        sizes = {e["name"]: float(e["mesh_max"]) for e in entries
+                 if e.get("mesh_max") is not None}
+        if not sizes:
+            raise ValueError("at least one entry needs mesh_max")
+        mins = [float(e["mesh_min"]) for e in entries
+                if e.get("mesh_min") is not None]
+        gmsh.option.setNumber("Mesh.MeshSizeMax", max(sizes.values()))
+        gmsh.option.setNumber("Mesh.MeshSizeMin", min(mins) if mins else 1.0)
+        for e in sorted(entries, key=lambda x: -float(x.get("mesh_max")
+                                                      or 0.0)):
+            if e.get("mesh_max") is None:
+                continue
+            vol_tags = [(3, t) for t in meshed if owner_of[t] == e["name"]]
+            if not vol_tags:
+                continue
+            pts = gmsh.model.getBoundary(vol_tags, combined=False,
+                                         oriented=False, recursive=True)
+            pts = [(d, t) for d, t in pts if d == 0]
+            if pts:
+                gmsh.model.mesh.setSize(pts, float(e["mesh_max"]))
+
+        if all_interior:
+            gmsh.model.setVisibility(gmsh.model.getEntities(3), 0, True)
+            gmsh.model.setVisibility([(3, t) for t in meshed], 1, True)
+            gmsh.option.setNumber("Mesh.MeshOnlyVisible", 1)
+        if meshed:
+            _log(f"meshing {len(meshed)} skin/tet volumes...")
+            gmsh.model.mesh.generate(3)
+
+        node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
+        nodes: Dict[int, List[float]] = {}
+        for i, tag in enumerate(node_tags):
+            j = 3 * i
+            nodes[int(tag)] = [float(node_coords[j]),
+                               float(node_coords[j + 1]),
+                               float(node_coords[j + 2])]
+        tets_by_member: Dict[str, List] = {e["name"]: [] for e in entries}
+        for t in meshed:
+            etypes, _etags, enodes = gmsh.model.mesh.getElements(3, t)
+            for et, conn in zip(etypes, enodes):
+                if int(et) != 4:
+                    continue
+                for i in range(0, len(conn), 4):
+                    tets_by_member[owner_of[t]].append(
+                        [nodes[int(c)] for c in conn[i:i + 4]])
+
+        # --- 7. per-member payloads + stats ------------------------------
+        payload: Dict[str, Any] = {"members": {}}
+        tot_cells = tot_tets = 0
+        for e in entries:
+            name = e["name"]
+            m = members[name]
+            st = m.get("structure")
+            cells = m.get("cells", [])
+            tets = tets_by_member[name]
+            tot_cells += len(cells)
+            tot_tets += len(tets)
+            v_cad = v_in[name]
+            v_int = m.get("_v_interior", 0.0)
+            v_skin = v_cad - v_int
+            if st is not None:
+                t0, t1 = m["theta_span"]
+                n_theta = m["_grid"][2]
+                sub = math.radians(t1 - t0) / n_theta
+                v_model = (math.sin(sub) / sub) * v_int + v_skin
+                radii, zplanes = m["_anchors"]
+                stats = {
+                    "cad_volume_mm3": v_cad,
+                    "interior_cells": len(cells),
+                    "skin_pieces": m["_n_skin_pieces"],
+                    "skin_tets": len(tets),
+                    "skin_volume_frac": v_skin / max(v_cad, 1e-30),
+                    "n_theta": n_theta,
+                    "elements_total": len(cells) + len(tets),
+                    "inscribed_volume_deficit_frac":
+                        (v_cad - v_model) / max(v_cad, 1e-30),
+                    "r_edges": m["_grid"][0],
+                    "z_edges": m["_grid"][1],
+                    "detected_radii": radii,
+                    "detected_zplanes": zplanes,
+                    "min_cell_dr": min((b - a for a, b, *_r in cells),
+                                       default=float("nan")),
+                    "min_cell_dz": min((z1 - z0 for *_r, z0, z1 in cells),
+                                       default=float("nan")),
+                }
+                print(f"[structured {group_name}/{name}] "
+                      f"{len(cells)} prism cells + {len(tets)} skin tets "
+                      f"({100 * stats['skin_volume_frac']:.2f}% of volume "
+                      f"is skin); chord deficit "
+                      f"{100 * stats['inscribed_volume_deficit_frac']:.4f}%",
+                      flush=True)
+            else:
+                stats = {"cad_volume_mm3": v_cad, "interior_cells": 0,
+                         "skin_tets": len(tets),
+                         "elements_total": len(tets)}
+                print(f"[structured {group_name}/{name}] tet member: "
+                      f"{len(tets)} tets", flush=True)
+            payload["members"][name] = {
+                "cells": cells,
+                "skin_tets": tets,
+                "theta_span": m.get("theta_span"),
+                "structure": st,
+                "stats": stats,
+            }
+        payload["group_stats"] = {
+            "elements_total": tot_cells + tot_tets,
+            "prism_cells": tot_cells,
+            "tets": tot_tets,
+            "meshed_interfaces": {f"{a}~{b}": n
+                                  for (a, b), n in sorted(shared.items())},
+            "wall_time_s": time.perf_counter() - t_start,
+        }
+        _log(f"DONE: {tot_cells} prisms + {tot_tets} tets = "
+             f"{tot_cells + tot_tets} elements")
+        return payload
+    finally:
+        gmsh.finalize()
+
+
+def build_structured_group(
+    entries: List[Dict[str, Any]],
+    *,
+    group_name: str = "group",
+    comm: Any = None,
+    gmsh_verbosity: int = 2,
+    use_cache: bool = True,
+) -> Dict[str, Any]:
+    """Build a conforming group where members may be structured.
+
+    Each entry: ``{"name", "stp_path" | "occ", "mesh_max", "mesh_min",
+    "structure"}`` -- ``structure`` is the ComponentSpec dict (None for a
+    plain tet member). Returns ``{"members": {name: payload},
+    "group_stats": {...}}`` where each member payload has
+    cells/skin_tets/structure/stats (emit with emit_prism_cells).
+
+    MPI-safe: rank 0 does the gmsh/OCC work, the payload is broadcast.
+    Results are cached under output/structured_cache when every entry is
+    file-based (digest-keyed: re-slices only when CAD/params change).
+    """
+    from cyclotron_optimizer.geometry.components import _resolve_comm
+
+    comm = _resolve_comm(comm)
+    rank = comm.Get_rank() if comm is not None else 0
+
+    payload: Optional[Dict[str, Any]] = None
+    if rank <= 0:
+        key = _group_cache_key(entries) if use_cache else None
+        payload = _cache_load(key, group_name)
+        if payload is None:
+            payload = _build_group_rank0(entries, group_name, gmsh_verbosity)
+            _cache_store(key, group_name, payload)
+    if comm is not None:
+        payload = comm.bcast(payload, root=0)
+    assert payload is not None
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Standalone wrapper (kept for tests / direct use; rank-local, no MPI)
+# ---------------------------------------------------------------------------
 def slice_stp_polar(
     stp_path: str,
     *,
@@ -181,278 +909,22 @@ def slice_stp_polar(
     mesh_size_min: Optional[float] = None,
     model_name: str = "structured",
     gmsh_verbosity: int = 2,
+    use_cache: bool = False,
 ) -> Dict[str, Any]:
-    """Rank-0 slicing: returns a picklable payload.
+    """Slice ONE component (possibly multi-solid) on the calling rank.
 
-    Payload keys:
-      rings:      [(r0, r1, z0, z1)] interior rings (full theta span each)
-      skin_tets:  [[[x,y,z] x4]] skin tetrahedra
-      theta_span: (t0_deg, t1_deg)
-      structure:  the merged structure options
-      stats:      diagnostics dict (also printed)
+    Returns the member payload: cells / skin_tets / theta_span /
+    structure / stats.
     """
-    import gmsh
-
-    from cyclotron_optimizer.geometry.components import (  # local import: avoid cycle
-        _pin_gmsh_determinism,
-    )
-
-    st = _merge_structure(structure)
-    t0, t1 = (float(st["theta_span_deg"][0]), float(st["theta_span_deg"][1]))
-    span = math.radians(t1 - t0)
-    if span <= 0:
-        raise ValueError("theta_span_deg must be increasing")
-
-    gmsh.initialize()
-    try:
-        gmsh.option.setNumber("General.Terminal", 1)
-        gmsh.option.setNumber("General.Verbosity", gmsh_verbosity)
-        _pin_gmsh_determinism()
-        gmsh.model.add(model_name)
-        gmsh.model.occ.importShapes(str(stp_path))
-        gmsh.model.occ.synchronize()
-
-        vols = gmsh.model.getEntities(3)
-        if len(vols) != 1:
-            raise ValueError(
-                f"{stp_path}: expected ONE solid for polar slicing, found "
-                f"{len(vols)} (slice multi-solid files per part)")
-        yoke = vols[0][1]
-        v_cad = gmsh.model.occ.getMass(3, yoke)
-        bb = gmsh.model.getBoundingBox(3, yoke)
-        r_lo = 0.0
-        r_hi = math.hypot(max(abs(bb[0]), abs(bb[3])),
-                          max(abs(bb[1]), abs(bb[4]))) + 1.0
-        z_lo, z_hi = bb[2], bb[5]
-
-        # --- detect snap anchors from the CAD faces ---
-        radii: List[float] = []
-        zplanes: List[float] = []
-        for _d, s in gmsh.model.getBoundary([(3, yoke)], combined=False,
-                                            oriented=False):
-            kind, info = _surface_info(gmsh, s)
-            if kind == "zcyl":
-                radii.append(info["r"])
-            elif kind == "zplane":
-                zplanes.append(info["z"])
-        radii = _dedupe(radii, _COINCIDENCE_TOL)
-        zplanes = _dedupe(zplanes, _COINCIDENCE_TOL)
-        if not st["snap"]:
-            radii, zplanes = [], []
-
-        # Radial extent of the iron: innermost/outermost detected cylinder
-        # if available, else bbox-derived.
-        r_min = radii[0] if radii else 0.0
-        r_max = radii[-1] if radii else r_hi - 1.0
-        r_edges = _build_edges(radii, r_min, r_max, float(st["dr_mm"]),
-                               float(st["min_fill_frac"]))
-        z_edges = _build_edges(zplanes, z_lo, z_hi, float(st["dz_mm"]),
-                               float(st["min_fill_frac"]))
-        n_theta = max(1, int(round((t1 - t0) / float(st["dtheta_deg"]))))
-        th_edges = [t0 + (t1 - t0) * j / n_theta for j in range(n_theta + 1)]
-
-        # --- cutting tools: SOLID primitives (robust OCC booleans; the
-        # earlier surface tools tripped BOPAlgo self-intersections) ---
-        # A solid tool cuts with every face that intersects the iron, so
-        # each tool is arranged to intersect it with EXACTLY ONE face:
-        #   r cut:  coaxial cylinder, z-padded beyond the solid
-        #   z cut:  fat cylinder capped AT the cut plane, radially padded
-        #   th cut: rotated box whose y'=0 face is the half-plane through
-        #           the axis; every other face lies outside the iron (its
-        #           x'=0 face contains the axis at theta+90 deg, which for
-        #           a <=180 deg part never re-enters the material)
-        tools: List[Tuple[int, int]] = []
-        pad = 2.0
-        zp0, zp1 = z_lo - pad, z_hi + pad
-        big = r_hi + 10.0
-        for r in r_edges[1:-1]:
-            tools.append((3, gmsh.model.occ.addCylinder(
-                0.0, 0.0, zp0, 0.0, 0.0, zp1 - zp0, r)))
-        for z in z_edges[1:-1]:
-            tools.append((3, gmsh.model.occ.addCylinder(
-                0.0, 0.0, zp0, 0.0, 0.0, z - zp0, big)))
-        for th in th_edges[1:-1]:
-            b = gmsh.model.occ.addBox(0.0, 0.0, zp0, big, big, zp1 - zp0)
-            gmsh.model.occ.rotate([(3, b)], 0, 0, 0, 0, 0, 1,
-                                  math.radians(th))
-            tools.append((3, b))
-
-        out_map = None
-        if tools:
-            _out, out_map = gmsh.model.occ.fragment([(3, yoke)], tools)
-        pieces = ([(d, t) for d, t in out_map[0] if d == 3]
-                  if out_map is not None else [(3, yoke)])
-
-        v_pieces = sum(gmsh.model.occ.getMass(3, t) for _d, t in pieces)
-        rel = abs(v_pieces - v_cad) / max(v_cad, 1e-30)
-        if rel > 1e-3:
-            raise RuntimeError(
-                f"polar slicing of {stp_path}: fragment changed the solid "
-                f"volume by {rel:.2e} relative -- OCC boolean failed")
-        gmsh.model.occ.synchronize()
-
-        # --- classify pieces by their own face inventory (NOT by binning
-        # centers-of-mass: the COM of a wide annular sector can fall outside
-        # its own radial interval). A clean interior cell has exactly two
-        # grid cylinders, two grid z-planes and two grid theta-planes, and
-        # the analytic sector volume. ---
-        cells: List[Tuple[float, float, float, float, float, float]] = []
-        skin_tags: List[int] = []
-        v_interior = 0.0
-        for _d, t in pieces:
-            faces = gmsh.model.getBoundary([(3, t)], combined=False,
-                                           oriented=False)
-            cyl_r: List[float] = []
-            pl_z: List[float] = []
-            pl_th: List[float] = []
-            clean = True
-            for _fd, f in faces:
-                kind, info = _surface_info(gmsh, f)
-                if kind == "zcyl":
-                    r = _snap_to(r_edges, info["r"])
-                    if r is None:
-                        clean = False
-                        break
-                    cyl_r.append(r)
-                elif kind == "zplane":
-                    z = _snap_to(z_edges, info["z"])
-                    if z is None:
-                        clean = False
-                        break
-                    pl_z.append(z)
-                elif kind == "plane":
-                    # normal is +-90 deg from the face's azimuth
-                    th = info["theta_deg"]
-                    got = None
-                    for cand in (th - 90.0, th + 90.0):
-                        cand %= 360.0
-                        for e in th_edges:
-                            if abs(cand - (e % 360.0)) <= _THETA_TOL_DEG:
-                                got = e
-                                break
-                        if got is not None:
-                            break
-                    if got is None:
-                        clean = False
-                        break
-                    pl_th.append(got)
-                else:
-                    clean = False
-                    break
-            cyl_r = _dedupe(cyl_r, _COINCIDENCE_TOL)
-            pl_z = _dedupe(pl_z, _COINCIDENCE_TOL)
-            pl_th = _dedupe(pl_th, _THETA_TOL_DEG)
-            if (clean and len(cyl_r) == 2 and len(pl_z) == 2
-                    and len(pl_th) == 2):
-                a, b = cyl_r
-                za, zb = pl_z
-                ta, tb = pl_th
-                v_exp = (0.5 * math.radians(tb - ta) * (b * b - a * a)
-                         * (zb - za))
-                v_act = gmsh.model.occ.getMass(3, t)
-                if abs(v_act - v_exp) <= _VOL_RTOL * v_exp:
-                    cells.append((a, b, ta, tb, za, zb))
-                    v_interior += v_act
-                    continue
-            skin_tags.append(t)
-
-        # --- mesh only the skin ---
-        skin_tets: List[List[List[float]]] = []
-        v_skin = v_cad - v_interior
-        n_skin_pieces = len(skin_tags)
-        if skin_tags:
-            # FUSE the skin pieces back together before meshing: the
-            # fragment imprinted every grid cut onto them (2.5-deg sector
-            # faces, fill-cylinder slivers against drafted CAD walls...),
-            # which forces absurdly fine tets -- measured 15k skin tets vs
-            # 16k for the WHOLE all-tet yoke. Fusing dissolves all internal
-            # imprints (slivers included); the compound's outer boundary
-            # still coincides exactly with the kept interior cells' faces,
-            # so the no-gap/no-overlap tiling is preserved.
-            if len(skin_tags) > 1:
-                v_skin_pre = sum(gmsh.model.occ.getMass(3, t)
-                                 for t in skin_tags)
-                fused, _fmap = gmsh.model.occ.fuse(
-                    [(3, skin_tags[0])],
-                    [(3, t) for t in skin_tags[1:]])
-                gmsh.model.occ.synchronize()
-                skin_tags = [t for d, t in fused if d == 3]
-                v_skin_post = sum(gmsh.model.occ.getMass(3, t)
-                                  for t in skin_tags)
-                srel = abs(v_skin_post - v_skin_pre) / max(v_skin_pre, 1e-30)
-                if srel > 1e-6:
-                    print(f"[structured {model_name}] WARNING: skin fuse "
-                          f"shifted the skin volume by {srel:.2e} relative",
-                          flush=True)
-            # Mesh ONLY the skin volumes via visibility masking. (Removing
-            # the interior volumes from the OCC model instead leaves
-            # orphaned boundary faces that poison the 3D mesher --
-            # observed: tetgen 'segment and facet intersect' PLC error.)
-            if cells:
-                gmsh.model.setVisibility(gmsh.model.getEntities(3), 0, True)
-                gmsh.model.setVisibility([(3, t) for t in skin_tags], 1, True)
-                gmsh.option.setNumber("Mesh.MeshOnlyVisible", 1)
-            if mesh_size_max is not None:
-                gmsh.option.setNumber("Mesh.MeshSizeMax", float(mesh_size_max))
-            if mesh_size_min is not None:
-                gmsh.option.setNumber("Mesh.MeshSizeMin", float(mesh_size_min))
-            gmsh.model.mesh.generate(3)
-
-            node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
-            nodes: Dict[int, List[float]] = {}
-            for i, tag in enumerate(node_tags):
-                j = 3 * i
-                nodes[int(tag)] = [float(node_coords[j]),
-                                   float(node_coords[j + 1]),
-                                   float(node_coords[j + 2])]
-            for t in skin_tags:
-                etypes, _etags, enodes = gmsh.model.mesh.getElements(3, t)
-                for et, conn in zip(etypes, enodes):
-                    if int(et) != 4:
-                        continue
-                    for i in range(0, len(conn), 4):
-                        skin_tets.append([nodes[int(c)] for c in conn[i:i + 4]])
-
-        # --- stats (inscribed-chord deficit of the emitted prisms) ---
-        sub = span / n_theta
-        v_model = (math.sin(sub) / sub) * v_interior + v_skin
-
-        stats = {
-            "cad_volume_mm3": v_cad,
-            "interior_cells": len(cells),
-            "skin_pieces": n_skin_pieces,
-            "skin_volumes_after_fuse": len(skin_tags),
-            "skin_tets": len(skin_tets),
-            "skin_volume_frac": v_skin / v_cad,
-            "n_theta": n_theta,
-            "elements_total": len(cells) + len(skin_tets),
-            "inscribed_volume_deficit_frac": (v_cad - v_model) / v_cad,
-            "r_edges": len(r_edges),
-            "z_edges": len(z_edges),
-            "detected_radii": radii,
-            "detected_zplanes": zplanes,
-            "min_cell_dr": min((b - a for a, b, *_rest in cells),
-                               default=float("nan")),
-            "min_cell_dz": min((z1 - z0 for *_rest, z0, z1 in cells),
-                               default=float("nan")),
-        }
-        print(f"[structured {model_name}] {stats['interior_cells']} prism "
-              f"cells + {stats['skin_tets']} skin tets "
-              f"({stats['skin_pieces']} skin pieces, "
-              f"{100 * stats['skin_volume_frac']:.2f}% of volume); "
-              f"inscribed-chord volume deficit "
-              f"{100 * stats['inscribed_volume_deficit_frac']:.4f}%",
-              flush=True)
-
-        return {
-            "cells": cells,
-            "skin_tets": skin_tets,
-            "theta_span": (t0, t1),
-            "structure": st,
-            "stats": stats,
-        }
-    finally:
-        gmsh.finalize()
+    entry = {"name": model_name, "stp_path": str(stp_path),
+             "mesh_max": mesh_size_max, "mesh_min": mesh_size_min,
+             "structure": dict(structure or {})}
+    key = _group_cache_key([entry]) if use_cache else None
+    payload = _cache_load(key, model_name)
+    if payload is None:
+        payload = _build_group_rank0([entry], model_name, gmsh_verbosity)
+        _cache_store(key, model_name, payload)
+    return payload["members"][model_name]
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +959,7 @@ def _prism_polyhedron(r0: float, r1: float, thetas_rad: Sequence[float],
                  + [O(j) for j in reversed(range(c + 1))])      # bottom
     faces.append([O(j) for j in range(c + 1)]
                  + [I(j) for j in reversed(range(c + 1))]
-                 )                                              # top (indices shifted below)
+                 )                                              # top (shifted below)
     faces[1] = [v + 2 * (c + 1) for v in faces[1]]
     for j in range(c):                                          # inner wall
         faces.append([I(j), TI(j), TI(j + 1), I(j + 1)])
