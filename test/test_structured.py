@@ -201,6 +201,40 @@ def test_core_clip_z():
     assert all(zb <= Z1 + 1e-9 for *_r, _z0, zb in p["cells"])
 
 
+def test_core_clip_z_from_top():
+    """Face-relative z clip: z_from_top offsets inward from the part's own
+    top (z_hi = Z2), so z_from_top = Z2 - Z1 is equivalent to z_max = Z1."""
+    st = dict(STRUCT, core_clip={"z_from_top": Z2 - Z1})
+    p = slice_stp_polar(_make_stp(), structure=st, mesh_size_max=25.0,
+                        model_name="test_clip_relz", gmsh_verbosity=0)
+    assert p["stats"]["interior_cells"] == 4 * 2 * N_THETA, p["stats"]
+    assert all(zb <= Z1 + 1e-9 for *_r, _z0, zb in p["cells"])
+
+
+def test_core_clip_theta_from_max():
+    """theta_from_max_deg offsets inward from the span's high edge (t1=90),
+    so theta_from_max_deg=45 == theta_max_deg=45 (half the wedge stays
+    core). Confirms the angular reference is a span edge, not a fixed 0."""
+    st = dict(STRUCT, core_clip={"theta_from_max_deg": 45.0})
+    p = slice_stp_polar(_make_stp(), structure=st, mesh_size_max=25.0,
+                        model_name="test_clip_relth", gmsh_verbosity=0)
+    n_rings = 4 * 2 + 2
+    assert p["stats"]["interior_cells"] == n_rings * (N_THETA // 2), \
+        p["stats"]
+    assert all(tb <= 45.0 + 1e-9 for _a, _b, _ta, tb, *_z in p["cells"])
+
+
+def test_core_clip_abs_rel_conflict():
+    """A bound given both absolutely and face-relative is rejected."""
+    st = dict(STRUCT, core_clip={"z_max": Z1, "z_from_top": 10.0})
+    try:
+        slice_stp_polar(_make_stp(), structure=st, mesh_size_max=25.0,
+                        model_name="test_clip_conflict", gmsh_verbosity=0)
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError for abs+rel clip conflict")
+
+
 def test_theta_margin_span_edges_are_not_walls():
     """The folded-symmetry span edges must NOT trigger margin demotion:
     full rings stay fully core even with a large margin."""

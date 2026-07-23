@@ -139,12 +139,21 @@ def structured_defaults() -> Dict[str, Any]:
         "min_fill_frac": 0.35,   # never place a fill edge closer than this
                                  # fraction of the target to an anchor
         # v2/v3 rules ------------------------------------------------------
-        "core_clip": None,       # e.g. {"z_max": -140.0}: cells must lie
-                                 # wholly inside these cylindrical bounds
-                                 # (keys r_min/r_max/z_min/z_max/
-                                 # theta_min_deg/theta_max_deg) to be core;
-                                 # a cell whose DILATED box reaches past a
-                                 # clip bound is demoted (margin-band rule)
+        "core_clip": None,       # cells must lie wholly inside these
+                                 # cylindrical bounds to be core (a cell
+                                 # whose DILATED box reaches past a bound is
+                                 # demoted -- margin-band rule). Bounds are
+                                 # given ABSOLUTELY (r_min/r_max/z_min/z_max/
+                                 # theta_min_deg/theta_max_deg) or as an
+                                 # inward offset from the part's own detected
+                                 # face (no need to know the part's size):
+                                 # z_from_top/z_from_bottom (mm),
+                                 # r_from_outer/r_from_inner (mm),
+                                 # theta_from_min_deg/theta_from_max_deg.
+                                 # e.g. {"z_from_top": 100} keeps the top
+                                 # 100 mm (gap/tip/shim) in the tet skin.
+                                 # Give a bound absolutely OR relative, not
+                                 # both.
         "skin_margin_deg": 0.0,  # azimuthal dilation: core cells within this
                                  # angle of any non-core azimuth (spiral
                                  # wall, hole, clip band) are demoted
@@ -158,8 +167,21 @@ def structured_defaults() -> Dict[str, Any]:
     }
 
 
-_CLIP_KEYS = {"r_min", "r_max", "z_min", "z_max",
-              "theta_min_deg", "theta_max_deg"}
+_CLIP_ABS = {"r_min", "r_max", "z_min", "z_max",
+             "theta_min_deg", "theta_max_deg"}
+# face-relative key -> (absolute key it produces, competing absolute key).
+# Each is an INWARD offset from the part's own detected face (resolved per
+# member in _resolve_core_clip using its extents), so users need not know
+# the part's size / where its faces sit.
+_CLIP_REL = {
+    "z_from_top":         "z_max",
+    "z_from_bottom":      "z_min",
+    "r_from_outer":       "r_max",
+    "r_from_inner":       "r_min",
+    "theta_from_max_deg": "theta_max_deg",
+    "theta_from_min_deg": "theta_min_deg",
+}
+_CLIP_KEYS = _CLIP_ABS | set(_CLIP_REL)
 
 
 def _merge_structure(structure: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -182,6 +204,10 @@ def _merge_structure(structure: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if bad:
             raise ValueError(f"Unknown core_clip keys {sorted(bad)}; "
                              f"known: {sorted(_CLIP_KEYS)}")
+        for rel, absk in _CLIP_REL.items():
+            if rel in clip and absk in clip:
+                raise ValueError(
+                    f"core_clip: give {absk!r} OR {rel!r}, not both")
     if float(out["sample_spacing_mm"]) <= 0.0:
         raise ValueError("sample_spacing_mm must be > 0")
     return out
@@ -279,6 +305,34 @@ def _detect_anchors(gmsh, vol_tags: Sequence[int]
 # ---------------------------------------------------------------------------
 # v3 classification: margin-dilated point sampling (no booleans)
 # ---------------------------------------------------------------------------
+def _resolve_core_clip(clip: Optional[Dict[str, float]], *,
+                       z_lo: float, z_hi: float, r_inner: float,
+                       r_outer: float, t0: float, t1: float
+                       ) -> Optional[Dict[str, float]]:
+    """Return an ABSOLUTE core_clip, resolving any face-relative key against
+    this member's detected extents. Relative keys are inward offsets from a
+    face (top/bottom in z, outer/inner in r, min/max edge in theta); e.g.
+    ``z_from_top=100`` -> ``z_max = z_hi - 100`` (keep the top 100 mm out of
+    the core). Absolute keys pass through unchanged; a face given both ways
+    is rejected earlier in _merge_structure."""
+    if not clip:
+        return clip
+    out: Dict[str, float] = {k: float(clip[k]) for k in _CLIP_ABS
+                             if k in clip}
+    faces = {
+        "z_from_top":         (z_hi, -1.0),
+        "z_from_bottom":      (z_lo, +1.0),
+        "r_from_outer":       (r_outer, -1.0),
+        "r_from_inner":       (r_inner, +1.0),
+        "theta_from_max_deg": (t1, -1.0),
+        "theta_from_min_deg": (t0, +1.0),
+    }
+    for rel, (base, sign) in faces.items():
+        if rel in clip:
+            out[_CLIP_REL[rel]] = base + sign * float(clip[rel])
+    return out
+
+
 def _cell_in_clip(clip: Optional[Dict[str, float]],
                   a: float, b: float, ta: float, tb: float,
                   za: float, zb: float) -> bool:
@@ -956,11 +1010,19 @@ def _build_group_rank0(entries: List[Dict[str, Any]], group_name: str,
             def _mlog(msg, _n=name):
                 _log(f"{_n}: {msg}")
 
+            clip = _resolve_core_clip(st["core_clip"], z_lo=z_lo, z_hi=z_hi,
+                                      r_inner=r_min, r_outer=r_max,
+                                      t0=t0, t1=t1)
+            if clip and clip != st["core_clip"]:
+                _mlog("core_clip resolved to "
+                      + ", ".join(f"{k}={v:.2f}"
+                                  for k, v in sorted(clip.items())))
+
             _mlog(f"grid {len(r_edges)}x{len(z_edges)} edges x {n_theta} theta"
                   f"; classifying (skin_mm={skin_mm:.1f}, margin={margin:.1f})")
             core = _classify_core_cells(
                 gmsh, vols, r_edges, r_anchor, z_edges, z_anchor, th_edges,
-                n_theta, st["core_clip"], margin, skin_mm, spacing, _mlog,
+                n_theta, clip, margin, skin_mm, spacing, _mlog,
                 stp_path=e.get("stp_path"), n_workers=classify_workers)
 
             cells = sorted(
