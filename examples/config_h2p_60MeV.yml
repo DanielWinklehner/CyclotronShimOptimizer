@@ -1,9 +1,9 @@
-# Cyclotron machine configuration -- COMPONENT-BASED schema (pilot).
-# Equivalent to config_muon_smaller.yml: the geometry is described as a list
-# of components with named materials and symmetries instead of fixed sections.
+# H2+ cyclotron machine configuration -- component-based schema.
+# Migrated from the legacy config_h2p.yml (fully programmatic gmsh-OCC
+# geometry, no STP files).
 
-particle_species: "muon"
-max_machine_size_mm: 700.0
+particle_species: "H2_1+"
+max_machine_size_mm: 3100.0
 seed: 42
 
 # ---------------------------------------------------------------------------
@@ -34,121 +34,98 @@ symmetries:
     - [para, [0, 0, 0], [0, 0, 1]]    # mirror across z=0 plane
   median_z:                           # median-plane mirror only (extraction channel)
     - [para, [0, 0, 0], [0, 0, 1]]
+    - [perp, [0, 0, 0], [0, 1, 0]]    # mirror across y=0 plane
 
 components:
   - name: yoke
     kind: stp
-    file: "../resources/uCyclo_v2_YokeWall.stp"
+    file: "../resources/HCHC-60_FullYoke.stp"
     material: iron
     symmetry: cyclotron_8fold
-    mesh: {max_size: 60}
+    mesh: {max_size: 80}
     mesh_group: iron
-
-  - name: lid_lower
-    kind: stp
-    file: "../resources/uCyclo_v2_LidLower.stp"
-    material: iron
-    symmetry: cyclotron_8fold
-    mesh: {max_size: 50}
-    mesh_group: iron
-
-  - name: lid_upper
-    kind: stp
-    file: "../resources/uCyclo_v2_LidUpper.stp"
-    material: iron
-    symmetry: cyclotron_8fold
-    mesh: {max_size: 40}
-    mesh_group: iron
-
-#  - name: pole
-#    kind: stp
-#    file: "../resources/uCyclo_v2_ShimmedPole.stp"
-#    material: iron
-#    symmetry: cyclotron_8fold
-#    mesh: {max_size: 30}
+    structure:
+      type: polar_grid
+      dr_mm: 200
+      dz_mm: 200
+      dtheta_deg: 5
 
   - name: pole
-    kind: pole
+    kind: stp
+    file: "../resources/HCHC-60_FullPole.stp"
     material: iron
     symmetry: cyclotron_8fold
-    shimmed: true                    # shape follows the PoleShape shims
-    mesh: {max_size: 25}
+    mesh: {min_size: 10, max_size: 70}
     mesh_group: iron
-    params:
-      inner_radius_mm: 50.0
-      outer_radius_mm: 400.0
-      height_mm: 235.0
-      half_angle_deg: 15.0           # half-wedge; full pole = 30 deg
-      pole_zs: -285.0                # -(yoke 188.5 + lid_lower 96.5)
-      cylindrical_faces: true        # exact rim/bore cylinder patches (required
-                                     # so fragment can merge them with the lid CAD)
+    structure:
+      type: polar_grid
+      dr_mm: 120
+      dz_mm: 120
+      dtheta_deg: 2.5
+      core_clip: { z_max: -140 }
+      skin_margin_deg: 5
 
   - name: extract_channel
     kind: wedge
-    enabled: false
+    enabled: true
     material: iron
     symmetry: median_z               # median plane mirror
     perturbative: true               # solved in the frozen machine field (stage 1)
     mesh: {max_size: 20}
     params:
-      inner_radius_mm: 276.0
-      outer_radius_mm: 287.0
+      inner_radius_mm: 2140.0
+      outer_radius_mm: 2210.0
       height_mm: 20
-      z_offset_mm: -6.25             # -channel_half_width (12.5/2)
-      start_ang_deg: 35
-      end_ang_deg: 55
+      z_offset_mm: -20               # -channel_half_width (12.5/2)
+      start_ang_deg: 1.6
+      end_ang_deg: 17.5
 
   - name: coils
     kind: racetrack_pair
     symmetry: cyclotron_8fold        # declared field symmetry (pair at +/-z)
     params:                          # names match CoilConfig (live current source)
-      radius_min_mm: 460.0
-      radius_max_mm: 574.5
-      height_mm: 123.5
-      midplane_dist: 55
-      current_A: 15034.84            # Amp-turns (initial; optimizer overrides)
+      radius_min_mm: 2230.0
+      radius_max_mm: 2480.5
+      height_mm: 240.0
+      midplane_dist: 95
+      current_A: 158350.0            # Amp-turns (initial; optimizer overrides)
       num_segments: 25
 
 # ---------------------------------------------------------------------------
-# Shim parametrization (initial/default shape; optimizer overrides offsets)
+# Shim parametrization (initial/default shape; optimizers pass their own)
 # ---------------------------------------------------------------------------
 side_shim:
-  include: true
-  num_rad_segments: 19
-  angular_resolution_deg: 2.5
-#  default_offset_deg: 0.0
-  side_offsets_deg: [2.60009495,  0.73979659,  0.0, 0.42199612,  1.66590662,  2.99677784,
-                     4.85228029,  6.82133653,  8.5499665,   9.78387648, 10.33567868, 10.27294429,
-                     9.91347963,  9.43231939,  9.04505908,  8.75995878,  8.58843817,  8.90623647,
-                     9.77249649, 10.84986381]
+  include: false
+  num_rad_segments: 14
+  angular_resolution_deg: 1.25
+  default_offset_deg: 0.0
+  # Best so far:
+  side_offsets_deg: [2.094361390353, 0.163280106077, 0.134112285249, 0.1, 0.116618896064, 0.268190564885, 0.501573646883, 0.713531175144, 0.732937509861, 0.240467647756, 0.122723018452, 0.852793554185, 1.743871948963, 1.936798859169, 2.299915828773]
   segmentation: [3, 1, 20]
 
 top_shim:
-  include: true
-  num_rad_segments: 19
+  include: false
+  num_rad_segments: 14
   angular_resolution_deg: 1.25
-#  default_offset_mm: 0.0
-  top_offsets_mm: [1.73705048, 0.0, 0.0, 1.75125378, 3.04509649, 2.60358329,
-                   2.40179285,  1.98828774,  1.49003946,  1.4994747,   1.81490715,  2.49738539,
-                   3.4781762,   4.44620898,  5.48165388,  6.40182401,  6.93465152,  7.86533554,
-                   9.3088477,  10.89782538]
+  default_offset_mm: 0.0
+  # Best so far:
+  top_offsets_mm: [1.775590119431, 2.214769019456, 2.276484962485, 2.17888248536, 1.55315737062, 1.521650224219, 1.327321032034, 1.412527459606, 2.121682589644, 1.888974168345, 1.220084490272, 2.052889291693, 3.171469027763, 3.895433362261, 4.222144117912]
   segmentation: [3, 1, 1]
 
 # ---------------------------------------------------------------------------
-# Workflow sections (unchanged from the legacy schema)
+# Workflow sections
 # ---------------------------------------------------------------------------
 field_evaluation:
   num_points_circle: 360
   radius_min_mm: 75.0
-  radius_max_mm: 350.0
-  n_eval_pts: 40
+  radius_max_mm: 2000.0
+  median_plane_limit_mm: 2500
+  n_eval_pts: 12
   use_symmetry: true
-  iso_method: "gordon"               # "circle" | "gordon" | "seo"
-  median_plane_limit_mm: 400
-  median_plane_resolution_mm: 0.5
+  iso_method: "gordon"                    # "circle" | "gordon" | "seo"
 
 simulation:
-  precision: 0.0001
+  precision: 0.00001
   iterations: 50000
   relax_method: 11        # override the 9-GPU/10-CPU auto choice
   # anderson: true        # Anderson-accelerated relaxation (default off;
@@ -158,11 +135,11 @@ simulation:
   # perturb_tol: 0.0      # early-exit tolerance [T] for those cycles
 
 optimization:
-  target_frequency_mhz: 42
+  target_frequency_mhz: 8.2
   frequency_tolerance_mhz: 0.001
   max_iterations: 100
-  coil_current_min_A: 10000
-  coil_current_max_A: 30000
+  coil_current_min_A: 100000
+  coil_current_max_A: 200000
   side_shim_min_deg: 0
   side_shim_max_deg: 15
   top_shim_min_mm: 0
@@ -195,8 +172,8 @@ optimization:
   opt_shim_radius_max_mm: null
   coil_match_tol_mhz: 0.1
   random_init: false
-  opt_top: true
-  opt_side: true
+  opt_top: false
+  opt_side: false
   opt_coil: true
   optimizer: 'dfo-ls'
   dfols_rhobeg: 0.1
@@ -208,4 +185,4 @@ optimization:
 visualization:
   show_opengl: true
   show_median_plane_field: true
-  field_map_resolution_mm: 2.0
+  field_map_resolution_mm: 5.0

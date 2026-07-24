@@ -125,6 +125,7 @@ optimization:
   reference_coil_current: 15368
   regularization_weight: 0.0
   convergence_penalty_weight: 1.0
+  smoothness_weight: 0.0           # second-difference roughness penalty (0 = current behavior)
   precondition: true
   coil_match_tol_mhz: 0.1
   random_init: false

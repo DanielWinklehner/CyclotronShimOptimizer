@@ -28,6 +28,7 @@ Typical script:
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Optional, Union
 
@@ -46,6 +47,46 @@ from cyclotron_optimizer.simulation.field_calculator import (
     get_median_plane_field,
     symmetric_axis,
 )
+
+_DPI_AWARE_SET = False
+
+
+def _ensure_dpi_aware():
+    """Make the process per-monitor DPI-aware on Windows before the 3D viewer
+    opens, so VTK/pyvista render at NATIVE resolution (crisp) instead of being
+    bitmap-upscaled by the OS on a scaled high-DPI display.
+
+    The canonical implementation now lives in RadiaCUDA (PyRadia.ensure_dpi_aware,
+    which its own ObjDrwPyVista viewer also calls); we delegate to it so there is
+    a single source of truth. The inline fallback keeps this working with an
+    older PyRadia that predates the helper. Must run before the render window is
+    created; idempotent and a no-op off Windows / if already set.
+    """
+    try:
+        from PyRadia import ensure_dpi_aware
+    except Exception:
+        ensure_dpi_aware = None
+    if ensure_dpi_aware is not None:
+        ensure_dpi_aware()
+        return
+
+    # Fallback (older PyRadia without the helper): same logic inline.
+    # -4 = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 (matches Qt6/PySide6).
+    global _DPI_AWARE_SET
+    if _DPI_AWARE_SET or sys.platform != "win32":
+        return
+    _DPI_AWARE_SET = True
+    import ctypes
+    for setter in (
+        lambda: ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)),
+        lambda: ctypes.windll.shcore.SetProcessDpiAwareness(2),   # PER_MONITOR
+        lambda: ctypes.windll.user32.SetProcessDPIAware(),        # system-aware
+    ):
+        try:
+            setter()
+            return
+        except Exception:
+            continue
 
 ConfigLike = Union[CyclotronConfig, str, Path, None]
 
@@ -96,6 +137,18 @@ class Session:
     @property
     def is_root(self) -> bool:
         return self.rank <= 0
+
+    @property
+    def is_headless(self) -> bool:
+        """True when no interactive display is available (cluster/batch node).
+
+        When headless the 3D PyVista viewers are skipped and live plotting
+        falls back to Agg + a saved final frame. A Jupyter notebook is NOT
+        headless (it renders inline), so the JupyterHub path stays open. Force
+        with the ``CYCLOTRON_HEADLESS=1/0`` environment variable.
+        """
+        from cyclotron_optimizer.runtime import is_headless as _is_headless
+        return _is_headless()
 
     def barrier(self) -> None:
         if self.comm is not None:
@@ -188,7 +241,16 @@ class Session:
 
         Collective: builds on all ranks (rank-0 meshing + broadcast); the
         viewer opens on rank 0 only. Replaces the old ``--geo_test`` flag.
+
+        No-op (on all ranks) in a headless environment -- there is no display
+        to open a 3D window on. Set ``CYCLOTRON_HEADLESS=0`` to force.
         """
+        if self.is_headless:
+            if self.verbosity >= 1 and self.is_root:
+                print("[view_geometry] no display (headless); skipping 3D view. "
+                      "Set CYCLOTRON_HEADLESS=0 to force.", flush=True)
+            return
+
         from cyclotron_optimizer.geometry.geometry import build_geometry
 
         config = self._require_config()
@@ -415,8 +477,21 @@ class CyclotronModel:
 
         :param field: a 2D median-plane Field to overlay (e.g. from
             median_plane_field()); None shows the bare model.
+
+        No-op (on all ranks) in a headless environment. Set
+        ``CYCLOTRON_HEADLESS=0`` to force.
         """
+        if self._session.is_headless:
+            if self._session.verbosity >= 1 and self._session.is_root:
+                print("[show] no display (headless); skipping 3D view. "
+                      "Set CYCLOTRON_HEADLESS=0 to force.", flush=True)
+            return
+
         from cyclotron_optimizer.geometry.geometry import build_geometry
+
+        # Crisp rendering on scaled high-DPI Windows displays (see helper docs).
+        # Must precede the pyvista/VTK render window created in the viewers below.
+        _ensure_dpi_aware()
 
         s = self._session
         display = build_geometry(self.config, self._pole_shape, rank=s.rank,

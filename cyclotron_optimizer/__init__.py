@@ -29,6 +29,14 @@ import sys as _sys
 _os.environ.setdefault("MKL_THREADING_LAYER", "SEQUENTIAL")
 _os.environ.setdefault("CONDA_PREFIX", _sys.prefix)
 
+# Detect a headless/batch environment (e.g. a cluster compute node with no
+# $DISPLAY) and pin matplotlib to the non-interactive Agg backend + PyVista
+# off-screen BEFORE any pyplot/radia import, so live windows and 3D viewers
+# degrade to file output instead of hanging/crashing. Desktops and Jupyter
+# notebooks are left untouched (a notebook renders inline -- see runtime.py).
+from cyclotron_optimizer.runtime import configure_headless_matplotlib  # noqa: E402
+configure_headless_matplotlib()
+
 import radia  # noqa: F401,E402  (must precede any mpi4py import)
 
 from cyclotron_optimizer.config_io.config import CyclotronConfig  # noqa: E402

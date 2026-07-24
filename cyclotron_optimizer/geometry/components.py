@@ -898,6 +898,98 @@ class MagnetizedComponent(BaseRadiaComponent):
         )
 
     @classmethod
+    def from_structured_payload(
+        cls,
+        payload: Dict[str, Any],
+        *,
+        name: str = "structured",
+        symmetries: Optional[SymmetryInput] = None,
+        material: Optional[RadiaMaterial] = None,
+        color: Optional[Sequence[float]] = None,
+        apply_sym: bool = False,
+        apply_mat: bool = False,
+        apply_color: bool = False,
+    ) -> "MagnetizedComponent":
+        """Build a component from a structured-slicing member payload
+        (prism cells + skin tets) -- the common tail of
+        from_stp_structured and the structured mesh_group path."""
+        from cyclotron_optimizer.geometry import structured as _st
+
+        prism_ids, cell_defs = _st.emit_prism_cells(payload)
+        skin_ids = [_tet_to_polyhedron(t) for t in payload["skin_tets"]]
+        child_ids = prism_ids + skin_ids
+        if not child_ids:
+            raise RadiaComponentError(
+                f"Structured slicing of '{name}' produced no elements.")
+
+        container_id = _validate_radia_id(_call_radia("ObjCnt", child_ids),
+                                          "container_id")
+        comp = cls(
+            container_id,
+            child_ids=child_ids,
+            is_container=True,
+            symmetries=symmetries,
+            material=material,
+            color=color,
+            apply_sym=apply_sym,
+            apply_mat=apply_mat,
+            apply_color=apply_color,
+        )
+        comp._tet_coords = payload["skin_tets"]
+        comp._structured_cells = cell_defs
+        comp._structured_stats = payload.get("stats")
+        return comp
+
+    @classmethod
+    def from_stp_structured(
+        cls,
+        stp_path: Union[str, Path],
+        *,
+        structure: Optional[Dict[str, Any]] = None,
+        mesh_size_min: Optional[float] = None,
+        mesh_size_max: Optional[float] = None,
+        model_name: Optional[str] = None,
+        comm: Any = None,
+        symmetries: Optional[SymmetryInput] = None,
+        material: Optional[RadiaMaterial] = None,
+        color: Optional[Sequence[float]] = None,
+        apply_sym: bool = False,
+        apply_mat: bool = False,
+        apply_color: bool = False,
+        gmsh_verbosity: int = 2,
+        use_cache: bool = True,
+    ) -> "MagnetizedComponent":
+        """Structured polar-grid discretization of an STP part (may hold
+        several solids; non-revolved ones land in the tet skin).
+
+        Clean grid cells become analytic annular-sector PRISM elements
+        (rad.ObjPolyhdr); everything touching true CAD detail becomes a
+        conforming tet SKIN (see geometry/structured.py for the rules:
+        core_clip, skin_margin_deg, min_skin_thickness_mm).
+
+        MPI-safe like from_stp (rank 0 slices, payload broadcast) and
+        digest-cached under output/structured_cache.
+        """
+        from cyclotron_optimizer.geometry import structured as _st
+
+        path = Path(stp_path)
+        if not path.exists():
+            raise FileNotFoundError(f"STP file not found: {path}")
+
+        name = model_name or path.stem
+        group = _st.build_structured_group(
+            [{"name": name, "stp_path": str(path),
+              "mesh_max": mesh_size_max, "mesh_min": mesh_size_min,
+              "structure": dict(structure or {})}],
+            group_name=name, comm=comm, gmsh_verbosity=gmsh_verbosity,
+            use_cache=use_cache)
+        return cls.from_structured_payload(
+            group["members"][name], name=name,
+            symmetries=symmetries, material=material, color=color,
+            apply_sym=apply_sym, apply_mat=apply_mat,
+            apply_color=apply_color)
+
+    @classmethod
     def from_gmsh_occ(
         cls,
         occ_builder: Callable[[], None],

@@ -15,8 +15,12 @@ from cyclotron_optimizer.optimization.objective_function import (
     optimize_coil_final,
     solve_coil_for_target_frequency,
     physics_precondition_offsets,
+    compute_objective,
 )
-from cyclotron_optimizer.optimization.constraints import get_optimization_bounds
+from cyclotron_optimizer.optimization.constraints import (
+    get_optimization_bounds,
+    shim_radial_free_indices,
+)
 from cyclotron_optimizer.visualization.optimization_progress import OptimizationProgressPlotter
 from cyclotron_optimizer.simulation.field_calculator import ReusableCyclotronSolver
 from cyclotron_optimizer.geometry.pole_shape import PoleShape
@@ -96,7 +100,9 @@ class CyclotronOptimizer:
             writer = csv.writer(f)
             header = (
                 ['phase', 'iteration', 'multistart', 'nelder_iter',
-                 'avg_frequency_mhz', 'flatness', 'regularization', 'objective',
+                 'avg_frequency_mhz', 'flatness', 'regularization',
+                 'roughness_side', 'roughness_top', 'smoothness_residual_l2',
+                 'convergence_penalty', 'objective',
                  'converged', 'misfit', 'eval_seconds'] +
                 [f'side_param_{i}' for i in range(self.n_side)] +
                 [f'top_param_{i}' for i in range(self.n_top)]
@@ -116,6 +122,10 @@ class CyclotronOptimizer:
                 results['avg_f'],
                 results['flatness'],
                 results['regularization'],
+                results.get('roughness_side', ''),
+                results.get('roughness_top', ''),
+                results.get('smoothness_residual_l2', ''),
+                results.get('convergence_penalty', ''),
                 results['objective'],
                 results.get('converged', ''),
                 results.get('misfit', ''),
@@ -351,8 +361,21 @@ class CyclotronOptimizer:
         s_lo, s_hi = cfg.optimization.side_shim_min_deg, cfg.optimization.side_shim_max_deg
         t_lo, t_hi = cfg.optimization.top_shim_min_mm, cfg.optimization.top_shim_max_mm
 
-        # x0 basis for the optimized blocks: physics preconditioner (optional) or config offsets.
-        if getattr(cfg.optimization, 'precondition', False):
+        # x0 basis for the optimized blocks. Precedence:
+        #   1) x0_from_config  -> resume from the config's saved shim offsets
+        #   2) precondition    -> the cheap physics preconditioner (gamma(r) B0 target)
+        #   3) otherwise       -> the config offsets (same as x0_from_config, implicitly)
+        if getattr(cfg.optimization, 'x0_from_config', False):
+            side_pre, top_pre = side_fixed, top_fixed
+            if self.rank <= 0 and self.verbosity >= 1:
+                print("[DFO-LS] starting from the config shim offsets "
+                      "(x0_from_config: side_offsets_deg / top_offsets_mm)", flush=True)
+                for name, arr, opted in (('side', cfg.side_shim.side_offsets_deg, 'side' in blocks),
+                                         ('top', cfg.top_shim.top_offsets_mm, 'top' in blocks)):
+                    if opted and arr is None:
+                        print(f"[DFO-LS] note: {name} offsets are unset in the config -> x0 "
+                              f"falls back to default_offset for that block", flush=True)
+        elif getattr(cfg.optimization, 'precondition', False):
             # Split the gamma(r) B0 target across the optimized levers so side+top don't
             # both provision the full rise (double-counting Bz(r)).
             side_pre, top_pre = physics_precondition_offsets(cfg, n_iso_levers=len(blocks))
@@ -362,24 +385,65 @@ class CyclotronOptimizer:
         else:
             side_pre, top_pre = side_fixed, top_fixed
 
+        # Optional radial sub-range: optimize only the shim stations inside
+        # [opt_shim_radius_min_mm, opt_shim_radius_max_mm]; stations OUTSIDE it stay
+        # frozen at the x0-basis (starting) value (side and top share stations).
+        free_idx, r_stations = shim_radial_free_indices(cfg)
+        n_free = int(free_idx.size)
+        radial_subset = n_free < n
+        if radial_subset and self.rank <= 0 and self.verbosity >= 1:
+            print(f"[DFO-LS] radial sub-range: optimizing {n_free}/{n} shim stations at "
+                  f"r = {r_stations[free_idx[0]]:.0f}..{r_stations[free_idx[-1]]:.0f} mm "
+                  f"(indices {free_idx[0]}..{free_idx[-1]}); the rest stay at the x0 values",
+                  flush=True)
+
+        # Base (full-length) offsets that the frozen stations keep: the x0 basis for an
+        # OPTIMIZED block (config offsets under x0_from_config, else the preconditioner --
+        # so a radial sub-range refines a slice of the SAME starting design it seeds from),
+        # and the config offsets for a non-optimized block.
+        side_base = np.asarray(side_pre if 'side' in blocks else side_fixed, dtype=float)
+        top_base = np.asarray(top_pre if 'top' in blocks else top_fixed, dtype=float)
+
+        # Bounds + x0 for the FREE stations only (x0 value from the x0 basis).
         lo_list, hi_list, x0p = [], [], []
         if 'side' in blocks:
-            lo_list += [s_lo] * n; hi_list += [s_hi] * n; x0p += list(np.clip(side_pre, s_lo, s_hi))
+            lo_list += [s_lo] * n_free; hi_list += [s_hi] * n_free
+            x0p += list(np.clip(side_base[free_idx], s_lo, s_hi))
         if 'top' in blocks:
-            lo_list += [t_lo] * n; hi_list += [t_hi] * n; x0p += list(np.clip(top_pre, t_lo, t_hi))
+            lo_list += [t_lo] * n_free; hi_list += [t_hi] * n_free
+            x0p += list(np.clip(top_base[free_idx], t_lo, t_hi))
         lo = np.array(lo_list, dtype=float)
         hi = np.array(hi_list, dtype=float)
         x0 = np.clip((np.array(x0p, dtype=float) - lo) / (hi - lo), 0.0, 1.0)
         n_params = len(lo)
 
         def _split(x_phys):
-            """Reconstruct full (side, top) offset arrays from the optimized subvector."""
-            side, top, i = side_fixed.copy(), top_fixed.copy(), 0
+            """Reconstruct full (side, top) offset arrays from the optimized subvector.
+
+            Frozen (out-of-range) stations keep their x0-basis value; free stations
+            take the optimizer's values. Without a radial sub-range every station is
+            free, so the base is fully overwritten (unchanged whole-block behavior).
+            """
+            side, top, i = side_base.copy(), top_base.copy(), 0
             if 'side' in blocks:
-                side = x_phys[i:i + n]; i += n
+                side[free_idx] = x_phys[i:i + n_free]; i += n_free
             if 'top' in blocks:
-                top = x_phys[i:i + n]
+                top[free_idx] = x_phys[i:i + n_free]
             return side, top
+
+        def _full_norm(side_full, top_full):
+            """Full normalized [0,1] profile per optimized block, for D2-over-full
+            (roughness including the transition into the frozen neighbours). Only
+            needed when a radial sub-range is active; None otherwise keeps the
+            whole-block behavior bit-for-bit."""
+            if not radial_subset:
+                return None
+            fn = {}
+            if 'side' in blocks:
+                fn['side'] = np.clip((np.asarray(side_full, float) - s_lo) / (s_hi - s_lo), 0.0, 1.0)
+            if 'top' in blocks:
+                fn['top'] = np.clip((np.asarray(top_full, float) - t_lo) / (t_hi - t_lo), 0.0, 1.0)
+            return fn
 
         solver = ReusableCyclotronSolver(cfg, self.radii_mm, rank=self.rank,
                                          comm=self.comm, verbosity=self.verbosity)
@@ -425,24 +489,35 @@ class CyclotronOptimizer:
                 coil, iso, converged, misfit = _evaluate(x_norm, loose_xtol_A)
                 self.iteration_count += 1
                 f = np.asarray(iso['rev_frequencies_mhz'], dtype=float)
-                # mean-centered residual = pure flatness, decoupled from coil-match precision
-                r = f - f.mean()
-                nrm = float(np.linalg.norm(r))
+                # Shared weighted residual (flatness + smoothness + convergence + magnitude).
+                # With the default weights (smoothness 0, magnitude 0) and a converged
+                # solve this is exactly the mean-centered frequency vector f - mean(f).
+                # full_norm (radial sub-range only) makes D2 span the full shim profile,
+                # including the transition into the frozen stations.
+                side_full, top_full = _split(lo + x_norm * (hi - lo))
+                obj, score = compute_objective(
+                    iso, x_norm, blocks, lo, hi, converged, misfit, cfg,
+                    full_norm=_full_norm(side_full, top_full))
+                r = score['residual_vector']
+                nrm = float(np.sqrt(obj))            # ||r|| of the FULL residual
                 if nrm < best['norm']:
                     best.update(norm=nrm, x=x_norm.copy(), coil=coil, flatness=iso['std_dev_mhz'],
                                 bz=np.asarray(iso['bz_for_plot'], dtype=float), freq=f.copy())
-                side_full, top_full = _split(lo + x_norm * (hi - lo))
                 self._write_diagnostics_row(
                     0, 0, self.iteration_count,
                     {'avg_f': iso['mean_freq_mhz'], 'flatness': iso['std_dev_mhz'],
-                     'regularization': 0.0, 'objective': nrm ** 2,
+                     'regularization': score['regularization'], 'objective': obj,
+                     'roughness_side': score['roughness_side'],
+                     'roughness_top': score['roughness_top'],
+                     'smoothness_residual_l2': score['smoothness_residual_l2'],
+                     'convergence_penalty': score['convergence_penalty'],
                      'converged': converged, 'misfit': misfit,
                      'eval_seconds': _time.time() - t0},
                     side_full, top_full)
                 if self.verbosity >= 1:
                     print(f"  [DFO-LS eval {self.iteration_count}] coil={coil:.0f}A "
-                          f"flatness={iso['std_dev_mhz']:.5f} MHz ||r||={nrm:.5f} "
-                          f"(best {best['norm']:.5f})", flush=True)
+                          f"flatness={iso['std_dev_mhz']:.5f} MHz smooth={score['smoothness_residual_l2']:.4f} "
+                          f"||r||={nrm:.5f} (best {best['norm']:.5f})", flush=True)
                 if plotter is not None:
                     try:
                         cside, ctop = _split(lo + x_norm * (hi - lo))
@@ -676,6 +751,13 @@ class CyclotronOptimizer:
         best_params = self.comm.bcast(self.best_x, root=0)
         best_flatness = self.comm.bcast(self.best_y, root=0)
 
+        # Save the final progress frame (rank 0). Works headless: with the Agg
+        # backend the live window was never shown, but the figure was still
+        # built, so it can be written to disk.
+        if self.rank <= 0 and getattr(self, 'plotter', None) is not None:
+            self.plotter.finalize(savepath=os.path.join(
+                self.output_dir, f'nm_progress_{self.timestamp}.png'))
+
         return best_params, best_flatness
 
     def _objective_wrapper_phase(self,
@@ -747,7 +829,12 @@ class CyclotronOptimizer:
                     rank=self.rank,
                     verbosity=self.verbosity,
                     iteration=self.iteration_count,
-                    x_norm=x_norm_phase_for_reg if self.rank <= 0 else None
+                    x_norm=x_norm_phase_for_reg if self.rank <= 0 else None,
+                    # The current phase optimizes a single block; smoothness (D2) is
+                    # applied to it via the shared builder, same weights as DFO-LS.
+                    blocks=[param_type] if self.rank <= 0 else None,
+                    lo=param_min if self.rank <= 0 else None,
+                    hi=param_max if self.rank <= 0 else None,
                 )
                 break
             except Exception as e:

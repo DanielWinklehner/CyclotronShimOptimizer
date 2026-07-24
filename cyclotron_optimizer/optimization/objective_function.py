@@ -11,6 +11,197 @@ from cyclotron_optimizer.geometry.pole_shape import PoleShape
 from scipy.optimize import minimize_scalar, brentq, newton
 
 
+# ---------------------------------------------------------------------------
+# Shared residual / objective construction (used by BOTH optimizers)
+#
+# Both the joint DFO-LS path (minimizes ||residual vector||^2) and the
+# three-phase Nelder-Mead path (minimizes a scalar) score a design with the
+# SAME weighted residual vector and the SAME config weights, so switching
+# optimizers cannot change what "good" means. See build_residual_vector /
+# compute_objective below.
+#
+# Everything here is PURE NUMPY given a solved isochronism dict, so it is
+# unit-tested without a field solve (test/test_residual_builder.py).
+# ---------------------------------------------------------------------------
+
+def second_difference(v: np.ndarray) -> np.ndarray:
+    """Discrete second difference D2(v)[i] = v[i-1] - 2 v[i] + v[i+1].
+
+    This is the machinable, SVD-truncation-style roughness measure used in
+    cyclotron shimming: it is ZERO for any straight line (constant or linear
+    ramp) and grows with jaggedness, so it penalizes spikes without penalizing
+    a smooth profile of any magnitude. Length len(v) - 2 (empty for len < 3).
+    """
+    v = np.asarray(v, dtype=float)
+    if v.size < 3:
+        return np.zeros(0, dtype=float)
+    return v[:-2] - 2.0 * v[1:-1] + v[2:]
+
+
+def _smoothness_weights(config) -> "tuple[float, float]":
+    """(w_side, w_top) roughness weights: per-block override else the base."""
+    opt = config.optimization
+    base = getattr(opt, 'smoothness_weight', 0.0) or 0.0
+    w_side = getattr(opt, 'smoothness_weight_side', None)
+    w_top = getattr(opt, 'smoothness_weight_top', None)
+    return (base if w_side is None else float(w_side),
+            base if w_top is None else float(w_top))
+
+
+def _block_slices(x_norm: np.ndarray, blocks, n: int) -> Dict[str, np.ndarray]:
+    """Map each optimized block name -> its length-n normalized [0,1] slice.
+
+    ``x_norm`` is the concatenation of the optimized blocks, in ``blocks``
+    order (side before top, matching how the DFO-LS param vector is built).
+    """
+    x_norm = np.asarray(x_norm, dtype=float)
+    out, i = {}, 0
+    for b in (blocks or []):
+        out[b] = x_norm[i:i + n]
+        i += n
+    return out
+
+
+def _convergence_shortfall(converged, misfit, config) -> float:
+    """max(0, misfit/precision - 1); 0 when converged or misfit unknown.
+
+    Grows smoothly with the relaxation shortfall so the continuous convergence
+    gate never silently accepts an unconverged field (see the DFO-LS/NM notes).
+    """
+    prec = getattr(config.simulation, 'precision', None)
+    if converged or misfit is None or not prec or prec <= 0:
+        return 0.0
+    return max(0.0, float(misfit) / float(prec) - 1.0)
+
+
+def _smooth_profiles(x_norm, blocks, n, full_norm):
+    """Normalized per-block profile to take D2 over.
+
+    Without ``full_norm`` this is just the optimized-params slice of x_norm
+    (the whole block). With a radial sub-range only a subset of the block is
+    free, so ``full_norm`` carries the FULL normalized profile (free params
+    inserted into the frozen base); taking D2 over the full profile penalizes
+    roughness INCLUDING the transition into the frozen neighbours, which is
+    what keeps the optimized sub-range blending smoothly into the fixed part.
+    """
+    slices = _block_slices(x_norm, blocks, n)
+    out = {}
+    for name in ('side', 'top'):
+        if full_norm is not None and name in full_norm:
+            out[name] = np.asarray(full_norm[name], dtype=float)
+        elif name in slices:
+            out[name] = slices[name]
+    return out
+
+
+def build_residual_vector(iso: Dict, x_norm: np.ndarray, blocks,
+                          lo, hi, converged, misfit, config,
+                          full_norm=None) -> np.ndarray:
+    """The full weighted least-squares residual for one design.
+
+    Layout (concatenated; each block's length is fixed for a run, so DFO-LS
+    sees a constant-length vector):
+
+        [ f - mean(f)                      isochronism (MHz), len n_eval_pts
+          w_side * D2(side_norm)           if 'side' optimized & w_side != 0
+          w_top  * D2(top_norm)            if 'top'  optimized & w_top  != 0
+          w_conv * sqrt(max(0, shortfall)) convergence gate, len 1 if w_conv!=0
+          w_mag  * x_norm ]                magnitude reg, len n_params if !=0
+
+    The second differences are taken PER BLOCK on the NORMALIZED offsets (both
+    side and top live in [0,1], so one dimensionless weight scale works, and a
+    difference is NEVER taken across the side/top boundary -- they are different
+    physical quantities, deg vs mm). ``lo``/``hi`` are the physical bounds of
+    the optimized blocks; they are accepted for interface symmetry (the
+    penalties act on the already-normalized ``x_norm``). ``full_norm`` (a dict
+    block -> full normalized profile) is passed when a radial sub-range freezes
+    part of a block, so D2 is taken over the full profile rather than only the
+    free params; None -> D2 over the x_norm slice (the whole optimized block).
+
+    With every added-penalty weight 0 and a converged solve this reduces
+    EXACTLY to the mean-centered frequency vector ``f - mean(f)`` -- i.e. the
+    previous DFO-LS residual, bit for bit.
+    """
+    n = config.side_shim.num_rad_segments + 1
+    parts = []
+
+    # (1) isochronism / flatness -- always present.
+    f = np.asarray(iso['rev_frequencies_mhz'], dtype=float)
+    parts.append(f - f.mean())
+
+    # (2) per-block second-difference roughness on the normalized offsets.
+    w_side, w_top = _smoothness_weights(config)
+    prof = _smooth_profiles(x_norm, blocks, n, full_norm)
+    if 'side' in prof and w_side:
+        parts.append(w_side * second_difference(prof['side']))
+    if 'top' in prof and w_top:
+        parts.append(w_top * second_difference(prof['top']))
+
+    # (3) continuous convergence gate (single residual entry).
+    w_conv = getattr(config.optimization, 'convergence_penalty_weight', 0.0) or 0.0
+    if w_conv:
+        shortfall = _convergence_shortfall(converged, misfit, config)
+        parts.append(np.array([w_conv * np.sqrt(shortfall)], dtype=float))
+
+    # (4) magnitude regularization (optional; default OFF).
+    w_mag = getattr(config.optimization, 'regularization_weight', 0.0) or 0.0
+    if w_mag:
+        parts.append(w_mag * np.asarray(x_norm, dtype=float))
+
+    return np.concatenate(parts) if parts else np.zeros(0, dtype=float)
+
+
+def compute_objective(iso: Dict, x_norm: np.ndarray, blocks,
+                      lo, hi, converged, misfit, config,
+                      full_norm=None) -> Tuple[float, Dict]:
+    """Scalar objective (= ||build_residual_vector||^2) plus a diagnostics dict.
+
+    This is the SINGLE scoring entry point: the Nelder-Mead path minimizes the
+    returned scalar, and the DFO-LS path returns the residual vector carried in
+    ``results['residual_vector']`` -- so ||DFO-LS vector||^2 == NM scalar for
+    the same inputs and weights, by construction.
+
+    The diagnostics dict keeps the keys the CSV/plotters expect, with the
+    roughness metrics added so an L-curve (roughness vs flatness) can be read
+    straight off the diagnostics file. ``full_norm`` -> see build_residual_vector.
+    """
+    r = build_residual_vector(iso, x_norm, blocks, lo, hi, converged, misfit, config,
+                              full_norm=full_norm)
+    objective = float(np.dot(r, r))
+
+    n = config.side_shim.num_rad_segments + 1
+    prof = _smooth_profiles(x_norm, blocks, n, full_norm)
+    w_side, w_top = _smoothness_weights(config)
+    # Unweighted per-block roughness (||D2||) -- the machinability-readable
+    # metric that drives the L-curve knee, independent of the chosen weight.
+    rough_side = (float(np.linalg.norm(second_difference(prof['side'])))
+                  if 'side' in prof else 0.0)
+    rough_top = (float(np.linalg.norm(second_difference(prof['top'])))
+                 if 'top' in prof else 0.0)
+    # Weighted smoothness contribution to the residual (L2 of that sub-block).
+    smoothness_residual_l2 = float(np.hypot(w_side * rough_side, w_top * rough_top))
+
+    w_mag = getattr(config.optimization, 'regularization_weight', 0.0) or 0.0
+    regularization = (float(w_mag * np.linalg.norm(np.asarray(x_norm, dtype=float)))
+                      if w_mag else 0.0)
+    w_conv = getattr(config.optimization, 'convergence_penalty_weight', 0.0) or 0.0
+    shortfall = _convergence_shortfall(converged, misfit, config)
+    convergence_penalty = float(w_conv * shortfall)   # linear diagnostic (as before)
+
+    results = {
+        'flatness': float(iso['std_dev_mhz']),
+        'avg_f': float(iso['mean_freq_mhz']),
+        'regularization': regularization,
+        'roughness_side': rough_side,
+        'roughness_top': rough_top,
+        'smoothness_residual_l2': smoothness_residual_l2,
+        'convergence_penalty': convergence_penalty,
+        'objective': objective,
+        'residual_vector': r,
+    }
+    return objective, results
+
+
 def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
                                             config: CyclotronConfig,
                                             radii_mm: list,
@@ -18,23 +209,35 @@ def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
                                             rank: int = 0,
                                             verbosity: int = 0,
                                             iteration: int = 0,
-                                            x_norm: np.ndarray = None) -> Tuple[float, Dict]:
+                                            x_norm: np.ndarray = None,
+                                            blocks=None,
+                                            lo=None,
+                                            hi=None) -> Tuple[float, Dict]:
     """
-    Evaluate objective: flatness + regularization (minimizes shimming).
+    Evaluate the shared objective = ||weighted residual vector||^2.
 
-    :param surface_params_32d: [32] denormalized surface offsets
+    Scoring is delegated to compute_objective / build_residual_vector so the
+    three-phase Nelder-Mead path and the joint DFO-LS path minimize the SAME
+    quantity with the SAME config weights (flatness + smoothness + convergence
+    + magnitude regularization).
+
+    :param surface_params_32d: [2*(n_seg+1)] denormalized surface offsets
     :param config: CyclotronConfig
     :param radii_mm: List of radii in mm
     :param comm: MPI communicator
     :param rank: MPI rank
     :param verbosity: Verbosity level
     :param iteration: Iteration number
-    :param x_norm: Normalized params [0,1] for regularization
+    :param x_norm: Normalized [0,1] params of the optimized block(s); feeds the
+        smoothness (second-difference) and magnitude penalties.
+    :param blocks: which block(s) x_norm holds, e.g. ['side'] or ['top'] (the
+        current Nelder-Mead phase). None -> no shim penalties, pure flatness.
+    :param lo, hi: physical bounds of the optimized block(s) (interface symmetry
+        with the DFO-LS builder; the penalties act on the normalized x_norm).
     :return: (objective, results_dict)
     """
 
     reference_coil_current = config.optimization.reference_coil_current
-    regularization_weight = config.optimization.regularization_weight
 
     if verbosity >= 1 and rank <= 0:
         print(f"    Evaluating with ref coil={reference_coil_current:.0f}A...", flush=True)
@@ -88,6 +291,9 @@ def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
         objective = 1e6
         frequencies = None
         convergence_penalty = 0.0
+        roughness_side = 0.0
+        roughness_top = 0.0
+        smoothness_residual_l2 = 0.0
 
         # bz_values is a (Nr, Ntheta) array (circle/gordon) or a PyPATools Field (seo),
         # and is None off-root -- test identity, not len().
@@ -100,30 +306,27 @@ def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
                                       config, IonSpecies(config.particle_species),
                                       rank=rank, comm=comm, verbose=(verbosity >= 2))
             frequencies = iso['rev_frequencies_mhz']
-            flatness = iso['std_dev_mhz']
-            avg_f = iso['mean_freq_mhz']
             # Per-radius field for the result/plot (the raw input may be a grid or a Field).
             bz_values = iso['bz_for_plot']
 
-            if x_norm is not None:
-                offset_magnitude = np.linalg.norm(x_norm, ord=2)
-            else:
-                offset_magnitude = 0.0
-
-            regularization = regularization_weight * offset_magnitude
-
-            # Continuous convergence gate: never silently accept an unconverged solve.
-            # Penalty is 0 at convergence (misfit <= precision) and grows smoothly with
-            # the relaxation shortfall, keeping the landscape continuous for the optimizer.
-            if not converged:
-                shortfall = max(0.0, misfit / config.simulation.precision - 1.0)
-                convergence_penalty = config.optimization.convergence_penalty_weight * shortfall
-
-            objective = flatness + regularization + convergence_penalty
+            # Shared scoring: flatness + smoothness + convergence + magnitude, all
+            # weighted from config -- identical to what DFO-LS minimizes. blocks/x_norm
+            # None (e.g. coil-only phase) -> pure flatness (+ convergence gate).
+            x_for_score = x_norm if x_norm is not None else np.zeros(0)
+            objective, score = compute_objective(
+                iso, x_for_score, blocks, lo, hi, converged, misfit, config)
+            flatness = score['flatness']
+            avg_f = score['avg_f']
+            regularization = score['regularization']
+            convergence_penalty = score['convergence_penalty']
+            roughness_side = score['roughness_side']
+            roughness_top = score['roughness_top']
+            smoothness_residual_l2 = score['smoothness_residual_l2']
 
             if verbosity >= 1:
                 print(f"      flatness={flatness:.2e}, avg_f={avg_f:.4f}, "
-                      f"reg={regularization:.4f}, conv_pen={convergence_penalty:.4f} "
+                      f"reg={regularization:.4f}, smooth={smoothness_residual_l2:.4f}, "
+                      f"conv_pen={convergence_penalty:.4f} "
                       f"(converged={converged}, misfit={misfit:.2e}) → obj={objective:.6f}", flush=True)
 
         if verbosity >= 2:
@@ -135,6 +338,9 @@ def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
         regularization = comm.bcast(regularization, root=0)
         frequencies = comm.bcast(frequencies, root=0)
         convergence_penalty = comm.bcast(convergence_penalty, root=0)
+        roughness_side = comm.bcast(roughness_side, root=0)
+        roughness_top = comm.bcast(roughness_top, root=0)
+        smoothness_residual_l2 = comm.bcast(smoothness_residual_l2, root=0)
         misfit = comm.bcast(misfit, root=0)
 
         return objective, {
@@ -143,6 +349,9 @@ def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
             'rev_frequencies_mhz': frequencies,
             'avg_f': avg_f,
             'regularization': regularization,
+            'roughness_side': roughness_side,
+            'roughness_top': roughness_top,
+            'smoothness_residual_l2': smoothness_residual_l2,
             'objective': objective,
             'converged': converged,
             'misfit': misfit,

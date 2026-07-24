@@ -126,8 +126,11 @@ optimization:
   num_workers: 1   # Unused
   n_initial_points: 1  # Initial random sample in Bayesian, or number of multistarts in Nelder-Mead
   reference_coil_current: 15368
-  regularization_weight: 0.0  # Penalty for jagged shim shapes
+  regularization_weight: 0.0  # MAGNITUDE penalty (shrinks all offsets toward 0; NOT roughness)
   convergence_penalty_weight: 1.0  # MHz penalty per unit relaxation-misfit shortfall (continuous convergence gate)
+  smoothness_weight: 0.0  # second-difference (roughness) penalty on the shim profile: forbids
+                          # jagged spikes without penalizing a smooth large shim (0 = current
+                          # behavior; tune via examples/l_curve_smoothness.py, start ~0.1)
   precondition: true  # DFO-LS x0 from the physics preconditioner (top & side both ~ gamma(r): gap & hill-duty-cycle -> B0)
   coil_match_tol_mhz: 0.1  # loose coil/freq match DURING optimization; final match uses frequency_tolerance_mhz
   random_init: false
