@@ -13,7 +13,7 @@ from cyclotron_optimizer.geometry.pole_shape import PoleShape
 from cyclotron_optimizer.optimization.optimizer import CyclotronOptimizer
 
 CONFIG = (sys.argv[1] if len(sys.argv) > 1 else
-          os.path.join(os.path.dirname(__file__), "config_muon_smaller.yml"))
+          os.path.join(os.path.dirname(__file__), "config_h2p_60MeV.yml"))
 
 with co.Session(CONFIG) as s:
     radii_mm = s.default_radii_mm().tolist()

@@ -21,6 +21,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from cyclotron_optimizer.config_io.config import CyclotronConfig
+from cyclotron_optimizer.runtime import is_headless
 
 from cyclotron_optimizer.geometry.geometry import build_geometry
 from cyclotron_optimizer.geometry.pole_shape import PoleShape
@@ -257,7 +258,8 @@ def run(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = F
             if iso['orbits'] is not None:
                 for orb in iso['orbits']:
                     plt.plot(orb.trajectory[:, 0], orb.trajectory[:, 1])
-                plt.show()
+                if not is_headless():
+                    plt.show()
 
             if verbosity >= 1:
                 print(f"[OK] Isochronism ({iso['method']}): "
@@ -266,7 +268,7 @@ def run(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = F
                 print(flush=True)
 
     # ========== OPENGL VISUALIZATION (Rank 0 only) ==========
-    if config.visualization.show_opengl:
+    if config.visualization.show_opengl and not is_headless():
         with Timer("Display geometry in OpenGL", rank, verbosity):
             if rank <= 0 and verbosity >= 1:
                 print("Opening OpenGL viewer...", flush=True)
@@ -350,13 +352,15 @@ def run(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = F
         # Display plots
         if verbosity >= 1:
             print(f"Displaying plots...", flush=True)
-        plt.show()
+        if not is_headless():
+            plt.show()
 
     t_total.__exit__(None, None, None)
 
     if rank <= 0 and verbosity >= 1:
         print(f"\n[OK] Complete!", flush=True)
-        input("Hit Enter")
+        if not is_headless():
+            input("Hit Enter")
 
     comm.Barrier()
 

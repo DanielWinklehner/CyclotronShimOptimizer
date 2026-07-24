@@ -751,6 +751,13 @@ class CyclotronOptimizer:
         best_params = self.comm.bcast(self.best_x, root=0)
         best_flatness = self.comm.bcast(self.best_y, root=0)
 
+        # Save the final progress frame (rank 0). Works headless: with the Agg
+        # backend the live window was never shown, but the figure was still
+        # built, so it can be written to disk.
+        if self.rank <= 0 and getattr(self, 'plotter', None) is not None:
+            self.plotter.finalize(savepath=os.path.join(
+                self.output_dir, f'nm_progress_{self.timestamp}.png'))
+
         return best_params, best_flatness
 
     def _objective_wrapper_phase(self,
