@@ -1,0 +1,188 @@
+# H2+ cyclotron machine configuration -- component-based schema.
+# Migrated from the legacy config_h2p.yml (fully programmatic gmsh-OCC
+# geometry, no STP files).
+
+particle_species: "H2_1+"
+max_machine_size_mm: 3100.0
+seed: 42
+
+# ---------------------------------------------------------------------------
+# Machine description
+# ---------------------------------------------------------------------------
+# Materials: type bh_file loads a two-column curve file (H, B|M).
+#   curve:  BH (second column is B; default) or MH (second column is M)
+#   h_unit: unit of the H column -- "T" (mu0*H in Tesla, the historical
+#           radia convention; default), "A/m", "kA/m", "mT", "Oe"
+#   b_unit: unit of the B/M column -- "T" (default), "mT", "G", "kG"
+# NOTE: the COMSOL 1010 file stores H in A/m -- h_unit is REQUIRED here
+# (with the default "T" the iron would be misread as almost non-magnetic).
+# dillinger_steel.csv (both columns in T) has a defective tail (mu_r < 1 in
+# its last segment -> non-monotone M(H); RadiaMaterial warns when loading).
+materials:
+  iron:
+    type: bh_file
+    file: "../resources/COMSOL_1010_BH_T_A-m.csv"  # relative to this yml
+    curve: BH
+    h_unit: "A/m"
+    b_unit: "T"
+
+symmetries:
+  cyclotron_8fold:
+    - [perp, [0, 0, 0], [1, -1, 0]]   # mirror across x=y diagonal
+    - [perp, [0, 0, 0], [1, 0, 0]]    # mirror across x=0 plane
+    - [perp, [0, 0, 0], [0, 1, 0]]    # mirror across y=0 plane
+    - [para, [0, 0, 0], [0, 0, 1]]    # mirror across z=0 plane
+  median_z:                           # median-plane mirror only (extraction channel)
+    - [para, [0, 0, 0], [0, 0, 1]]
+    - [perp, [0, 0, 0], [0, 1, 0]]    # mirror across y=0 plane
+
+components:
+  - name: yoke
+    kind: stp
+    file: "../resources/HCHC-60_FullYoke.stp"
+    material: iron
+    symmetry: cyclotron_8fold
+    mesh: {max_size: 80}
+    mesh_group: iron
+    structure:
+      type: polar_grid
+      dr_mm: 200
+      dz_mm: 200
+      dtheta_deg: 5
+
+  - name: pole
+    kind: stp
+    file: "../resources/HCHC-60_FullPole.stp"
+    material: iron
+    symmetry: cyclotron_8fold
+    mesh: {min_size: 10, max_size: 70}
+    mesh_group: iron
+    structure:
+      type: polar_grid
+      dr_mm: 120
+      dz_mm: 120
+      dtheta_deg: 2.5
+      core_clip: { z_max: -140 }
+      skin_margin_deg: 5
+
+  - name: extract_channel
+    kind: wedge
+    enabled: true
+    material: iron
+    symmetry: median_z               # median plane mirror
+    perturbative: true               # solved in the frozen machine field (stage 1)
+    mesh: {max_size: 20}
+    params:
+      inner_radius_mm: 2140.0
+      outer_radius_mm: 2210.0
+      height_mm: 20
+      z_offset_mm: -20               # -channel_half_width (12.5/2)
+      start_ang_deg: 1.6
+      end_ang_deg: 17.5
+
+  - name: coils
+    kind: racetrack_pair
+    symmetry: cyclotron_8fold        # declared field symmetry (pair at +/-z)
+    params:                          # names match CoilConfig (live current source)
+      radius_min_mm: 2230.0
+      radius_max_mm: 2480.5
+      height_mm: 240.0
+      midplane_dist: 95
+      current_A: 158350.0            # Amp-turns (initial; optimizer overrides)
+      num_segments: 25
+
+# ---------------------------------------------------------------------------
+# Shim parametrization (initial/default shape; optimizers pass their own)
+# ---------------------------------------------------------------------------
+side_shim:
+  include: false
+  num_rad_segments: 14
+  angular_resolution_deg: 1.25
+  default_offset_deg: 0.0
+  # Best so far:
+  side_offsets_deg: [2.094361390353, 0.163280106077, 0.134112285249, 0.1, 0.116618896064, 0.268190564885, 0.501573646883, 0.713531175144, 0.732937509861, 0.240467647756, 0.122723018452, 0.852793554185, 1.743871948963, 1.936798859169, 2.299915828773]
+  segmentation: [3, 1, 20]
+
+top_shim:
+  include: false
+  num_rad_segments: 14
+  angular_resolution_deg: 1.25
+  default_offset_mm: 0.0
+  # Best so far:
+  top_offsets_mm: [1.775590119431, 2.214769019456, 2.276484962485, 2.17888248536, 1.55315737062, 1.521650224219, 1.327321032034, 1.412527459606, 2.121682589644, 1.888974168345, 1.220084490272, 2.052889291693, 3.171469027763, 3.895433362261, 4.222144117912]
+  segmentation: [3, 1, 1]
+
+# ---------------------------------------------------------------------------
+# Workflow sections
+# ---------------------------------------------------------------------------
+field_evaluation:
+  num_points_circle: 360
+  radius_min_mm: 75.0
+  radius_max_mm: 2000.0
+  median_plane_limit_mm: 2500
+  n_eval_pts: 12
+  use_symmetry: true
+  iso_method: "gordon"                    # "circle" | "gordon" | "seo"
+
+simulation:
+  precision: 0.00001
+  iterations: 50000
+  relax_method: 11        # override the 9-GPU/10-CPU auto choice
+  # anderson: true        # Anderson-accelerated relaxation (default off;
+  #                       # ~3x fewer iterations on well-conditioned models,
+  #                       # can stall above the plain floor on fine tet meshes)
+  # perturb_iterations: 0 # perturbative-component back-reaction cycles
+  # perturb_tol: 0.0      # early-exit tolerance [T] for those cycles
+
+optimization:
+  target_frequency_mhz: 8.2
+  frequency_tolerance_mhz: 0.001
+  max_iterations: 100
+  coil_current_min_A: 100000
+  coil_current_max_A: 200000
+  side_shim_min_deg: 0
+  side_shim_max_deg: 15
+  top_shim_min_mm: 0
+  top_shim_max_mm: 15
+  num_workers: 1
+  n_initial_points: 1
+  reference_coil_current: 13101.9
+  regularization_weight: 0.0     # MAGNITUDE penalty (shrinks all offsets to 0)
+  convergence_penalty_weight: 1.0
+  # Second-difference (roughness) penalty on the shim profile -- removes the
+  # jagged mid-radius spike DFO-LS parks in the isochronism null space without
+  # penalizing a smooth large shim. 0 = current behavior. Tune with the knee of
+  # examples/l_curve_smoothness.py (start ~0.1; the spike is on the SIDE block,
+  # so smoothness_weight_side can be raised independently).
+  smoothness_weight: 0.1
+  # smoothness_weight_side: 0.1  # override for the side block only (falls back
+  # smoothness_weight_top: 0.0   # to smoothness_weight when unset)
+  precondition: true
+  # Start from the config's saved shim offsets (side_offsets_deg / top_offsets_mm)
+  # instead of the preconditioner -- set true to resume / warm-start from a
+  # known-good design (takes precedence over precondition).
+  x0_from_config: true
+  # Optimize only the shim stations inside this radial band [mm] (pole radius,
+  # 50..400 here over 20 stations ~18.4 mm apart); stations outside stay frozen
+  # at their x0 value. Pair with x0_from_config: true to refine a sub-range of a
+  # saved design -- e.g. re-smooth just the inner shims (r<150 -> first 6):
+  #   opt_shim_radius_max_mm: 150
+  # null = no bound on that end (both null optimizes all stations).
+  opt_shim_radius_min_mm: null
+  opt_shim_radius_max_mm: null
+  coil_match_tol_mhz: 0.1
+  random_init: false
+  opt_top: false
+  opt_side: false
+  opt_coil: true
+  optimizer: 'dfo-ls'
+  dfols_rhobeg: 0.1
+  dfols_rhoend: 0.03
+  dfols_maxfun: null
+  dfols_objfun_has_noise: false
+  dfols_seek_global_minimum: false
+
+visualization:
+  show_opengl: true
+  show_median_plane_field: true
+  field_map_resolution_mm: 5.0
