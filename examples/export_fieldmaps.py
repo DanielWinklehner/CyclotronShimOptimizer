@@ -20,7 +20,7 @@ with co.Session(CONFIG) as s:
     model.solve()
 
     model.save_median_plane_field("output/midplane_field.comsol")
-    model.save_bore_field("output/bore_field.comsol")
+    # model.save_bore_field("output/bore_field.comsol")
 
     if s.is_root:
         print("\nExported output/midplane_field.comsol and output/bore_field.comsol")

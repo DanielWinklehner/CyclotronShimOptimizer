@@ -7,6 +7,8 @@ import matplotlib
 from matplotlib.patches import Rectangle
 from typing import Optional
 
+from cyclotron_optimizer.runtime import is_headless, display_mode
+
 
 class OptimizationProgressPlotter:
     """Real-time visualization of cyclotron optimization progress."""
@@ -38,7 +40,11 @@ class OptimizationProgressPlotter:
         :param pole_angle_deg: Full pole angle in degrees
         :param target_frequency: Target RF frequency for reference
         """
-        matplotlib.use('TkAgg')
+        # Only force an interactive GUI backend on a real desktop. In a notebook
+        # keep Jupyter's inline backend; headless keeps the Agg backend pinned at
+        # package import, so the figure is built off-screen and saved (never shown).
+        if display_mode() == "desktop":
+            matplotlib.use('TkAgg')
 
         self.fig = plt.figure(figsize=figsize)
         self.fig.canvas.manager.set_window_title("Cyclotron Optimization Progress")
@@ -162,7 +168,8 @@ class OptimizationProgressPlotter:
         # Adjust layout to add padding between columns
         plt.subplots_adjust(left=0.08, right=0.95, top=0.92, bottom=0.1)
 
-        plt.show(block=False)
+        if not is_headless():
+            plt.show(block=False)
 
     def update(self, iteration: int,
                shim_offsets_best: np.ndarray,
@@ -294,9 +301,21 @@ class OptimizationProgressPlotter:
         self.fig.suptitle(metrics_str, fontsize=12, fontweight='bold', y=0.98)
 
         # ===== RENDER UPDATE =====
-        self.fig.canvas.draw()
-        self.fig.canvas.flush_events()
-        plt.pause(0.001)
+        # Interactive refresh only when a window is actually on screen. Headless,
+        # the artist data above is enough -- finalize() renders it via savefig.
+        if not is_headless():
+            self.fig.canvas.draw()
+            self.fig.canvas.flush_events()
+            plt.pause(0.001)
+
+
+    def finalize(self, savepath=None):
+        """Write the final progress frame to disk (used for headless/batch runs)."""
+        if self.fig is not None and savepath:
+            try:
+                self.fig.savefig(savepath, dpi=120)
+            except Exception:
+                pass
 
 
 class DFOLSProgressPlotter:
@@ -319,7 +338,11 @@ class DFOLSProgressPlotter:
 
     def setup(self, *, inner_radius_mm, outer_radius_mm, half_angle_deg, n_seg,
               target_frequency=None, base_depth_mm=50.0, z_exaggeration=2.0, figsize=(18, 7)):
-        matplotlib.use('TkAgg')
+        # Only force an interactive GUI backend on a real desktop. In a notebook
+        # keep Jupyter's inline backend; headless keeps the Agg backend pinned at
+        # package import, so the figure is built off-screen and saved (never shown).
+        if display_mode() == "desktop":
+            matplotlib.use('TkAgg')
         self.r_in = float(inner_radius_mm)
         self.r_out = float(outer_radius_mm)
         self.half_angle = float(half_angle_deg)
@@ -342,7 +365,8 @@ class DFOLSProgressPlotter:
         self.ax_mid = self.fig.add_subplot(gs[:, 1])
         self.ax_mid_r = self.ax_mid.twinx()
         self.ax_conv = self.fig.add_subplot(gs[:, 2])
-        plt.show(block=False)
+        if not is_headless():
+            plt.show(block=False)
 
     def _hill_outline(self, side_offsets):
         """Upper-half hill outline in the x-y plane: inner arc -> side edge -> outer arc
@@ -444,9 +468,12 @@ class DFOLSProgressPlotter:
         if coil is not None:
             ttl += f' | coil={coil:.0f} A'
         self.fig.suptitle(ttl, fontsize=11, fontweight='bold')
-        self.fig.canvas.draw()
-        self.fig.canvas.flush_events()
-        plt.pause(0.001)
+        # Interactive refresh only when a window is actually on screen. Headless,
+        # the artist data above is enough -- finalize() renders it via savefig.
+        if not is_headless():
+            self.fig.canvas.draw()
+            self.fig.canvas.flush_events()
+            plt.pause(0.001)
 
     def finalize(self, savepath=None):
         if self.fig is not None and savepath:

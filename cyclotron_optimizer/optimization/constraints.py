@@ -29,3 +29,35 @@ def get_optimization_bounds(config) -> Tuple[List[float], List[float]]:
     upper_bounds = [side_shim_upper] * (n_segments + 1) + [top_shim_upper] * (n_segments + 1) + [coil_upper]
 
     return lower_bounds, upper_bounds
+
+
+def shim_radial_free_indices(config) -> Tuple[np.ndarray, np.ndarray]:
+    """Shim stations the optimizer is free to move, from the radial-range knob.
+
+    The shim boundary points sit at
+    ``linspace(pole.inner_radius_mm, pole.outer_radius_mm, num_rad_segments+1)``
+    -- the POLE radius, the same convention the physics preconditioner and the
+    progress plotter use. Stations whose radius lies within
+    ``[opt_shim_radius_min_mm, opt_shim_radius_max_mm]`` (None = unbounded on
+    that side) are free; the rest stay frozen at their config offsets. Side and
+    top share stations. With both bounds unset every station is free (the
+    default).
+
+    :return: (free_idx, r_stations) -- integer indices into the length-(n+1)
+        shim arrays, and the station radii [mm].
+    :raises ValueError: if the band selects no station.
+    """
+    n = config.side_shim.num_rad_segments + 1
+    r_stations = np.linspace(config.pole.inner_radius_mm,
+                             config.pole.outer_radius_mm, n)
+    lo = getattr(config.optimization, 'opt_shim_radius_min_mm', None)
+    hi = getattr(config.optimization, 'opt_shim_radius_max_mm', None)
+    mask = ((r_stations >= (-np.inf if lo is None else float(lo))) &
+            (r_stations <= (np.inf if hi is None else float(hi))))
+    free_idx = np.where(mask)[0]
+    if free_idx.size == 0:
+        raise ValueError(
+            f"opt_shim_radius range [{lo}, {hi}] mm selects no shim stations "
+            f"(stations span {r_stations[0]:.0f}..{r_stations[-1]:.0f} mm at "
+            f"{r_stations[1] - r_stations[0]:.1f} mm spacing)")
+    return free_idx, r_stations

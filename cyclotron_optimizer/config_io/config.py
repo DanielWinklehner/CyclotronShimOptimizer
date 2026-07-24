@@ -90,6 +90,17 @@ class ComponentSpec:
     params: Dict[str, Any] = field(default_factory=dict)
     shimmed: bool = False
     perturbative: bool = False
+    # Structured polar-grid discretization for STP components (Option C):
+    # e.g. {'type': 'polar_grid', 'dr_mm': 120, 'dz_mm': 120,
+    # 'dtheta_deg': 2.5, 'core_clip': {'z_max': -140},
+    # 'skin_margin_deg': 5, 'theta_span_deg': [0, 45]}.
+    # Clean revolved cells become analytic prism elements; CAD detail,
+    # the core_clip band (shim envelope!) and thin regions become a
+    # conforming tet skin (geometry/structured.py). Works standalone and
+    # inside a mesh_group (structured cores + skins + tet members are
+    # built conforming in one gmsh model, results digest-cached under
+    # output/structured_cache).
+    structure: Optional[Dict[str, Any]] = None
     mesh_group: Optional[str] = None
 
 
@@ -271,7 +282,38 @@ class OptimizationConfig:
     opt_side: Optional[bool] = True
     opt_coil: Optional[bool] = True
     convergence_penalty_weight: Optional[float] = 1.0
+    # Second-difference (roughness) smoothness penalty on the shim profile,
+    # added to the least-squares RESIDUAL vector as w * D2(normalized offsets)
+    # per block. Unlike regularization_weight (a MAGNITUDE penalty that shrinks
+    # all offsets toward 0), this penalizes only JAGGEDNESS -- a smooth profile,
+    # large or small, has zero roughness residual. It removes the mid-radius
+    # spike DFO-LS parks in the isochronism null space. Default 0 -> identical
+    # to prior behavior (existing runs unaffected). The per-block overrides
+    # (side is where the spike lives) fall back to smoothness_weight when None.
+    # Tune via the L-curve script (examples/l_curve_smoothness.py); ~0.1 is a
+    # sensible starting scale. See objective_function.build_residual_vector.
+    smoothness_weight: Optional[float] = 0.0
+    smoothness_weight_side: Optional[float] = None
+    smoothness_weight_top: Optional[float] = None
     precondition: Optional[bool] = False
+    # Seed the optimizer's starting point (x0) from the config's saved shim
+    # offsets (side_offsets_deg / top_offsets_mm) instead of the physics
+    # preconditioner -- i.e. warm-start / resume from a known-good design.
+    # Takes PRECEDENCE over `precondition` when True. False (default) keeps
+    # the prior behavior (preconditioner if precondition else config offsets).
+    # (The Nelder-Mead path starts from the config offsets whenever
+    # random_init is False; this flag is the DFO-LS equivalent.)
+    x0_from_config: Optional[bool] = False
+    # Optimize only the shim stations whose radius falls in this band [mm];
+    # stations OUTSIDE it stay frozen at their x0 value (the config offsets when
+    # paired with x0_from_config, else the preconditioner). The stations sit at
+    # linspace(pole.inner_radius_mm, pole.outer_radius_mm, num_rad_segments+1) --
+    # the POLE radius, not the field-eval radii. None -> no bound on that side
+    # (default None/None optimizes all stations). Pair with x0_from_config to
+    # refine a sub-range of a saved design (e.g. re-smooth the inner shims:
+    # opt_shim_radius_max_mm: 150). Applies to the DFO-LS optimizer.
+    opt_shim_radius_min_mm: Optional[float] = None
+    opt_shim_radius_max_mm: Optional[float] = None
     coil_match_tol_mhz: Optional[float] = 0.05
     # DFO-LS solver knobs (joint least-squares path). Defaults preserve prior behavior.
     # rhoend should sit ABOVE the mesh-quantization dead zone (~0.026 norm at mesh=50) or
@@ -532,7 +574,8 @@ class CyclotronConfig:
                 mesh=entry.get('mesh') or {}, params=entry.get('params') or {},
                 shimmed=entry.get('shimmed', False),
                 perturbative=entry.get('perturbative', False),
-                mesh_group=entry.get('mesh_group')))
+                mesh_group=entry.get('mesh_group'),
+                structure=entry.get('structure')))
 
         names = [s.name for s in specs]
         if len(set(names)) != len(names):
@@ -730,7 +773,13 @@ class CyclotronConfig:
                 'opt_side': self.optimization.opt_side,
                 'opt_coil': self.optimization.opt_coil,
                 'convergence_penalty_weight': self.optimization.convergence_penalty_weight,
+                'smoothness_weight': self.optimization.smoothness_weight,
+                'smoothness_weight_side': self.optimization.smoothness_weight_side,
+                'smoothness_weight_top': self.optimization.smoothness_weight_top,
                 'precondition': self.optimization.precondition,
+                'x0_from_config': self.optimization.x0_from_config,
+                'opt_shim_radius_min_mm': self.optimization.opt_shim_radius_min_mm,
+                'opt_shim_radius_max_mm': self.optimization.opt_shim_radius_max_mm,
                 'coil_match_tol_mhz': self.optimization.coil_match_tol_mhz,
                 'dfols_rhobeg': self.optimization.dfols_rhobeg,
                 'dfols_rhoend': self.optimization.dfols_rhoend,
