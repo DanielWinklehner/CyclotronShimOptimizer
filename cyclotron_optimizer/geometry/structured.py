@@ -52,14 +52,32 @@ Pipeline (rank 0, one gmsh session):
      build the grid (anchors + fill, tracking which edges are anchors),
      classify cells by dilated isInside sampling, merge the core into
      maximal blocks, cut them out -> skin remainder.
-  3. Cross-member conformity scan on the MESHED volumes (skins + tet
-     members): the group imprint already made shared contact faces single
-     entities; v3 verifies + reports them and warns loudly on any
-     coincident-but-non-shared face rather than refragmenting big skin
-     compounds (on this machine there are ZERO meshed-meshed contacts --
-     everywhere members touch, at least one side is cut-away core).
-  4. One generate(3) with visibility masking; tets split per owner
-     (heal/bisect backstop for boolean debris).
+  3. Re-merge the contact faces the cuts SPLIT. The imprint in step 1 makes
+     every cross-member contact one shared face entity, but occ.cut rebuilds
+     the cut member's skin: wherever the core reached such a contact, that
+     member's side is re-created as a NEW entity, leaving two coincident
+     copies and a contact that is no longer conforming. gmsh then meshes the
+     two copies independently and rejects the result ("Invalid boundary mesh
+     (overlapping facets)"). occ.removeAllDuplicates fuses them back -- a
+     measured no-op where nothing was split (see _remerge_contact_faces).
+  4. Cross-member conformity scan on the MESHED volumes (skins + tet
+     members): after step 3 every cross-member contact must be a single
+     shared face entity, so any coincident-but-non-shared pair that survives
+     is an ERROR, not a warning. Big cut-remainder skin compounds are never
+     refragmented. Which members meet here depends on the configuration: an
+     all-structured group has no meshed-meshed contact at all (both sides are
+     cut-away core), while a tet member against a structured member's skin
+     has many -- the 60 MeV tet-yoke + structured-pole group has 8.
+  5. One generate(3) with visibility masking; tets split per owner
+     (heal/bisect backstop for boolean debris -- which gives up loudly when
+     no single volume is at fault, because the failure is then a cross-volume
+     interaction that healing cannot repair).
+  6. VERIFY THE HARVEST before the payload is returned (and hence before it
+     can be cached): every meshed volume must yield tets, and each member's
+     harvested tet volume must match its analytic skin. Steps 1-5 only ever
+     compare analytic quantities against OCC masses; without step 6 a
+     generate(3) that silently emits nothing is indistinguishable from
+     success (see _verify_harvest).
 
 Emission (all ranks, from the broadcast payload): one CONVEX single-chord
 prism per cell via rad.ObjPolyhdr. Two radia constraints (measured
@@ -92,9 +110,14 @@ __all__ = [
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CACHE_DIR = _REPO_ROOT / "output" / "structured_cache"
-_CACHE_VERSION = 4   # bump on any algorithm change that alters payloads
+_CACHE_VERSION = 6   # bump on any algorithm change that alters payloads
                      # (v3: envelope-cut slicing; 4: multi-volume shared-face
-                     # double-count fix in the classifier)
+                     # double-count fix in the classifier; 5: harvest
+                     # verification -- invalidates payloads written before the
+                     # checks existed, which could be silently incomplete;
+                     # 6: contact re-merge -- a group whose cut split a
+                     # contact but still meshed was cached with a NON-
+                     # conforming interface)
 
 # Point-sampling classification tuning -----------------------------------
 _SAMPLE_CAP = 9            # max sample points per dimension per cell
@@ -105,6 +128,21 @@ _MAX_CLASSIFY_WORKERS = 8       # cap on classification worker processes
 _MIN_PARALLEL_CANDIDATES = 500  # below this, process-spawn overhead is not
                                 # worth it -- classify serially (also keeps
                                 # the small synthetic unit tests single-proc)
+
+# Harvest verification (_verify_harvest) ---------------------------------
+# The tet skin is a LINEAR (flat-faced) discretization of curved CAD walls,
+# so its meshed volume never equals the analytic skin exactly: it inscribes
+# convex walls and circumscribes bores, with an error ~ (h/R)^2 per feature
+# that can go either way. Measured on the 60 MeV yoke across the ladder runs:
+# tet/analytic-skin 0.9949 .. 1.0145. A few percent is therefore NORMAL; only
+# a gross deficit means geometry actually went missing from the mesh.
+_SKIN_VOLUME_WARN_FRAC = 0.03   # log a loud WARNING beyond this
+_SKIN_VOLUME_FAIL_FRAC = 0.20   # raise beyond this -- the mesh lost geometry
+_SKIN_VOLUME_MIN_FRAC = 1e-6    # skip the ratio check when the analytic skin
+                                # is below this fraction of the member (an
+                                # all-core member has no skin to compare)
+_EMPTY_VOLUME_MIN_FRAC = 1e-9   # a meshed volume below this fraction of its
+                                # member is boolean dust; do not demand tets
 
 
 def _auto_workers() -> int:
@@ -776,6 +814,60 @@ def _arc_block(gmsh, r0: float, r1: float, t0_deg: float, t1_deg: float,
 
 
 # ---------------------------------------------------------------------------
+# Contact repair
+# ---------------------------------------------------------------------------
+def _remerge_contact_faces(gmsh, log: Callable[[str], None]) -> int:
+    """Fuse the coincident face copies the envelope cuts left behind.
+
+    The group imprint makes every cross-member contact ONE shared face
+    entity, but ``occ.cut`` rebuilds the cut member's skin: wherever the core
+    reached such a contact, that member's side comes back as a NEW entity and
+    the shared face becomes two coincident copies, one per member. The
+    contact is then no longer conforming -- gmsh meshes the two copies
+    independently and rejects the overlap ("Invalid boundary mesh
+    (overlapping facets)"). Measured on the 60 MeV tet-yoke +
+    structured-pole group: the pole's cut split 3 of its 8 yoke contacts,
+    and the group could not be meshed at all.
+
+    ``occ.removeAllDuplicates`` fuses the copies back into single shared
+    entities. Measured cost ~0.1 s, and bit-identical element counts for the
+    structured-yoke and both-structured groups (which have no meshed-meshed
+    contact to break), so it is a no-op where there is nothing to repair.
+
+    Returns the number of duplicate entities removed. Raises if the repair
+    moved volume tags -- member ownership is keyed by them, so a renumbering
+    would silently reassign geometry to the wrong member -- or changed any
+    volume's mass.
+    """
+    before = {t: gmsh.model.occ.getMass(3, t)
+              for _d, t in gmsh.model.occ.getEntities(3)}
+    n_ent = len(gmsh.model.occ.getEntities())
+    n_srf = len(gmsh.model.occ.getEntities(2))
+    gmsh.model.occ.removeAllDuplicates()
+    gmsh.model.occ.synchronize()
+    after = {t: gmsh.model.occ.getMass(3, t)
+             for _d, t in gmsh.model.occ.getEntities(3)}
+    if sorted(before) != sorted(after):
+        raise RuntimeError(
+            "removeAllDuplicates renumbered the volumes "
+            f"({sorted(before)} -> {sorted(after)}); member ownership is "
+            "keyed by volume tag, so continuing would assign geometry to the "
+            "wrong member")
+    worst = max((abs(after[t] - m) / max(m, 1e-30)
+                 for t, m in before.items()), default=0.0)
+    if worst > 1e-8:
+        raise RuntimeError(
+            f"removeAllDuplicates changed a volume's mass by {worst:.2e} "
+            "relative -- it must only fuse coincident duplicate entities")
+    removed = n_ent - len(gmsh.model.occ.getEntities())
+    if removed:
+        log(f"re-merged {removed} duplicate entities "
+            f"({n_srf - len(gmsh.model.occ.getEntities(2))} surface(s)) -- "
+            "the envelope cut(s) had split a cross-member contact face")
+    return removed
+
+
+# ---------------------------------------------------------------------------
 # Mesh helpers (kept from v2)
 # ---------------------------------------------------------------------------
 def _show_only(gmsh, tags: Sequence[int]) -> None:
@@ -789,11 +881,23 @@ def _show_only(gmsh, tags: Sequence[int]) -> None:
 
 
 def _try_mesh(gmsh, tags: Sequence[int], dim: int = 3) -> bool:
-    """Try to mesh the given volumes in isolation (visibility-masked)."""
+    """Try to mesh the given volumes in isolation (visibility-masked).
+
+    True only if elements actually came out. "generate() did not raise" is
+    NOT evidence that anything was meshed: once a generate(dim) has errored,
+    gmsh's mesher stays dead for the REST of the session -- every later call
+    returns without raising, logs nothing and produces zero nodes and zero
+    elements, even for a volume that meshes fine in a fresh session (measured
+    on gmsh 4.15, 60 MeV tet-yoke + structured-pole). Without this check the
+    bisection below reports every volume as healthy and the retry after it
+    "succeeds" with an empty mesh.
+    """
     _show_only(gmsh, tags)
     try:
         gmsh.model.mesh.generate(dim)
-        return True
+        return all(any(len(tg) for tg in
+                       gmsh.model.mesh.getElements(dim, t)[1])
+                   for t in tags)
     except Exception:
         return False
     finally:
@@ -826,6 +930,77 @@ def _heal_volume(gmsh, tag: int) -> List[int]:
             f"healShapes changed the volume of piece {tag} by "
             f"{abs(v_post - v_pre) / max(v_pre, 1e-30):.2e} relative")
     return new
+
+
+# ---------------------------------------------------------------------------
+# Harvest verification: does the mesh we actually GOT match what we asked for?
+# ---------------------------------------------------------------------------
+def _tet_volume(tet: Sequence[Sequence[float]]) -> float:
+    """Volume (mm^3) of one tetrahedron given as 4 vertex coordinates."""
+    (ax, ay, az), (bx, by, bz), (cx, cy, cz), (dx, dy, dz) = tet
+    ux, uy, uz = bx - ax, by - ay, bz - az
+    vx, vy, vz = cx - ax, cy - ay, cz - az
+    wx, wy, wz = dx - ax, dy - ay, dz - az
+    return abs(ux * (vy * wz - vz * wy)
+               - uy * (vx * wz - vz * wx)
+               + uz * (vx * wy - vy * wx)) / 6.0
+
+
+def _verify_harvest(group_name: str,
+                    empty: Sequence[Tuple[int, str, float]],
+                    skin: Dict[str, Tuple[float, float, float]],
+                    log: Callable[[str], None]) -> Dict[str, float]:
+    """Verify the HARVESTED mesh before its payload is accepted (and cached).
+
+    Everything upstream of this point checks *analytic* quantities against
+    *OCC* masses (block volume vs classified core, cut remainder vs analytic
+    core, per-member conservation). None of it looks at what the MESHER
+    actually produced, so a generate(3) that silently emits nothing -- gmsh
+    can return without raising after a failed-then-retried run -- used to
+    sail through as a success and get cached.
+
+    ``empty`` -- ``(tag, owner, occ_mass)`` for every meshed volume that came
+    back with zero tets. ``skin`` -- ``name -> (harvested tet volume,
+    analytic skin volume, CAD volume)``. Returns ``name -> tet/analytic-skin
+    ratio`` (NaN where the member has no skin to compare).
+
+    Raises on a volume that vanished entirely or a member whose harvested
+    skin is off by more than ``_SKIN_VOLUME_FAIL_FRAC``; warns loudly beyond
+    ``_SKIN_VOLUME_WARN_FRAC`` (linear tets never reproduce curved CAD walls
+    exactly -- see the constants).
+    """
+    if empty:
+        detail = ", ".join(f"volume {t} of '{n}' ({m:.6e} mm^3)"
+                           for t, n, m in sorted(empty, key=lambda x: x[0]))
+        raise RuntimeError(
+            f"structured group '{group_name}': the mesher produced ZERO "
+            f"tetrahedra for {len(empty)} volume(s) that were handed to it "
+            f"-- {detail}. generate(3) returned without raising but the "
+            "geometry is missing from the harvest; the payload would be "
+            "silently incomplete (a member that still has prism cells would "
+            "not even fail downstream). Inspect the CAD/grid interaction.")
+
+    ratios: Dict[str, float] = {}
+    for name in sorted(skin):
+        v_tets, v_skin, v_cad = skin[name]
+        if v_skin <= _SKIN_VOLUME_MIN_FRAC * max(v_cad, 1e-30):
+            ratios[name] = float("nan")
+            continue
+        ratios[name] = v_tets / v_skin
+        rel = abs(v_tets - v_skin) / v_skin
+        if rel > _SKIN_VOLUME_FAIL_FRAC:
+            raise RuntimeError(
+                f"structured group '{group_name}': member '{name}' meshed "
+                f"{v_tets:.6e} mm^3 of tets but its analytic skin is "
+                f"{v_skin:.6e} mm^3 ({rel:.2%} off, ratio "
+                f"{ratios[name]:.4f}) -- that is far beyond the faceting "
+                "error of a linear tet mesh, so part of the skin is missing "
+                "from the harvest")
+        if rel > _SKIN_VOLUME_WARN_FRAC:
+            log(f"WARNING: {name} harvested tet volume is {rel:.2%} off the "
+                f"analytic skin (ratio {ratios[name]:.4f}); expected only the "
+                "linear-tet faceting error -- check for lost skin bodies")
+    return ratios
 
 
 # ---------------------------------------------------------------------------
@@ -1090,16 +1265,19 @@ def _build_group_rank0(entries: List[Dict[str, Any]], group_name: str,
                 "_n_skin_bodies": len(skin_tags),
             }
 
-        # --- 4. cross-member conformity scan (report; never refragment) --
-        # The group imprint (step 2) already made every cross-member contact
-        # a single shared face entity; the per-member cut only removes deep
-        # interior core, so those shared faces survive on the skin. v3 VERIFIES
-        # and reports them, and warns loudly on any coincident-but-non-shared
-        # face -- it does NOT refragment the big cut-remainder skin compounds.
+        # --- 4. re-merge contact faces split by the cuts -----------------
+        _remerge_contact_faces(gmsh, _log)
+
+        # --- 5. cross-member conformity scan (verify; never refragment) --
+        # The group imprint (step 2) makes every cross-member contact a single
+        # shared face entity, and step 4 restores the ones the per-member cuts
+        # split. So by now a coincident-but-non-shared pair is a real
+        # non-conforming contact -- an ERROR, not a warning. This does NOT
+        # refragment the big cut-remainder skin compounds.
         meshed = sorted(owner_of)
         owners_meshed = {owner_of[t] for t in meshed}
         shared: Dict[tuple, int] = {}
-        n_nonconform = 0
+        nonconform: List[Tuple[int, str, int, str]] = []
         if len(owners_meshed) > 1:
             boxes = {t: gmsh.model.getBoundingBox(3, t) for t in meshed}
             tol = 0.1
@@ -1131,34 +1309,45 @@ def _build_group_rank0(entries: List[Dict[str, Any]], group_name: str,
                 if len(owners) > 1:
                     key = tuple(sorted(owners))
                     shared[key] = shared.get(key, 0) + 1
-            # coincident-but-non-shared faces among cross-member candidates:
-            # different face entities of different owners at the same place
+            # Coincident-but-non-shared faces among cross-member candidates:
+            # DISTINCT face entities of DIFFERENT owners at the same place.
+            # Compared pairwise with a tolerance -- bucketing on rounded
+            # com/area (v3) split pairs that straddled a rounding boundary and
+            # so reported only 1 of the 3 contacts the 60 MeV pole cut broke.
+            # A genuinely shared face has ONE entity and cannot pair with
+            # itself, so conforming contacts never show up here.
             if cand_pieces:
-                buckets: Dict[tuple, set] = {}
-                seen_faces: Dict[int, str] = {}
+                owner_face: Dict[int, str] = {}
                 for t in cand_pieces:
                     for _d, s in gmsh.model.getBoundary(
                             [(3, t)], combined=False, oriented=False):
-                        seen_faces[int(s)] = owner_of[t]
-                for s, owner in seen_faces.items():
-                    com = gmsh.model.occ.getCenterOfMass(2, s)
-                    area = gmsh.model.occ.getMass(2, s)
-                    key = (round(com[0], 1), round(com[1], 1),
-                           round(com[2], 1), round(area, 1))
-                    buckets.setdefault(key, set()).add((int(s), owner))
-                for key, group in buckets.items():
-                    owners = {o for _s, o in group}
-                    if len(owners) > 1 and len(group) > 1:
-                        n_nonconform += 1
+                        owner_face[int(s)] = owner_of[t]
+                probe = [(s, owner, gmsh.model.occ.getCenterOfMass(2, s),
+                          gmsh.model.occ.getMass(2, s))
+                         for s, owner in sorted(owner_face.items())]
+                for i, (s1, o1, c1, a1) in enumerate(probe):
+                    for s2, o2, c2, a2 in probe[i + 1:]:
+                        if (o1 != o2
+                                and abs(a1 - a2) <= 1e-3 * max(a1, a2, 1e-30)
+                                and max(abs(c1[k] - c2[k])
+                                        for k in range(3)) <= tol):
+                            nonconform.append((s1, o1, s2, o2))
         msg = (", ".join(f"{a}~{b}: {n}" for (a, b), n in sorted(shared.items()))
                if shared else "NONE")
         _log(f"conforming meshed interfaces: {msg}")
-        if n_nonconform:
-            _log(f"WARNING: {n_nonconform} coincident-but-NON-shared face "
-                 "group(s) between members -- possible non-conforming meshed "
-                 "contact; inspect the CAD/grid interaction (NOT refragmenting)")
+        if nonconform:
+            detail = ", ".join(f"{s1}('{o1}')~{s2}('{o2}')"
+                               for s1, o1, s2, o2 in nonconform[:8])
+            raise RuntimeError(
+                f"structured group '{group_name}': {len(nonconform)} "
+                "coincident-but-NON-shared face pair(s) between members "
+                f"survive the contact re-merge -- {detail}"
+                + (", ..." if len(nonconform) > 8 else "")
+                + ". Each is a non-conforming meshed contact: the members are "
+                "meshed independently there and gmsh rejects the overlapping "
+                "facets. Inspect the CAD/grid interaction.")
 
-        # --- 5. final per-member volume conservation --------------------
+        # --- 6. final per-member volume conservation --------------------
         for e in entries:
             name = e["name"]
             v_int = members[name].get("_v_interior", 0.0)
@@ -1172,7 +1361,7 @@ def _build_group_rank0(entries: List[Dict[str, Any]], group_name: str,
             if rel > 1e-6:
                 _log(f"WARNING: {name} volume shifted by {rel:.2e} relative")
 
-        # --- 6. mesh the meshed (skin + tet-member) volumes -------------
+        # --- 7. mesh the meshed (skin + tet-member) volumes -------------
         sizes = {e["name"]: float(e["mesh_max"]) for e in entries
                  if e.get("mesh_max") is not None}
         if not sizes:
@@ -1206,9 +1395,39 @@ def _build_group_rank0(entries: List[Dict[str, Any]], group_name: str,
                 _log(f"joint mesh failed ({exc}); bisecting per volume "
                      "and healing offenders...")
                 gmsh.model.mesh.clear()
+                ok, bad = [], []
                 for t in list(meshed):
-                    if _try_mesh(gmsh, [t]):
-                        continue
+                    (ok if _try_mesh(gmsh, [t]) else bad).append(t)
+                if not ok:
+                    # gmsh's mesher is dead for the rest of this session (see
+                    # _try_mesh): the bisection can no longer tell a broken
+                    # volume from a healthy one, so healing here would be
+                    # guesswork and the retry would silently mesh nothing.
+                    raise RuntimeError(
+                        f"structured group '{group_name}': the joint mesh "
+                        f"failed ({exc}) and afterwards NOT ONE volume can be "
+                        "meshed on its own -- gmsh stops meshing for the rest "
+                        "of a session once generate(3) has errored, so the "
+                        "per-volume bisection cannot attribute the failure. "
+                        "Fix the geometry it reported (the usual cause is the "
+                        "coincident-but-NON-shared faces flagged by the "
+                        "conformity scan above: a duplicated face on one "
+                        "member's shell gives exactly this 'overlapping "
+                        "facets' error), or re-run in a fresh gmsh session") \
+                        from exc
+                if not bad:
+                    # Every volume meshes alone, so the failure is an
+                    # INTERACTION between volumes; re-running the identical
+                    # joint generate(3) cannot fix that.
+                    raise RuntimeError(
+                        f"structured group '{group_name}': the joint mesh "
+                        f"failed ({exc}) but every volume meshes in "
+                        "isolation, so the failure is an INTERACTION between "
+                        "volumes -- per-volume healing cannot fix it. Check "
+                        "the conformity scan above: coincident-but-NON-shared "
+                        "faces between members give exactly this "
+                        "'overlapping facets' error") from exc
+                for t in bad:
                     name = owner_of[t]
                     _log(f"volume {t} ({name}) fails to mesh; healing...")
                     new = _heal_volume(gmsh, t)
@@ -1227,7 +1446,7 @@ def _build_group_rank0(entries: List[Dict[str, Any]], group_name: str,
                 gmsh.model.mesh.clear()
                 _show_only(gmsh, meshed)
                 gmsh.model.mesh.generate(3)
-                _log("mesh succeeded after healing")
+                _log(f"mesh succeeded after healing {len(bad)} volume(s)")
 
         node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
         nodes: Dict[int, List[float]] = {}
@@ -1237,16 +1456,35 @@ def _build_group_rank0(entries: List[Dict[str, Any]], group_name: str,
                                float(node_coords[j + 1]),
                                float(node_coords[j + 2])]
         tets_by_member: Dict[str, List] = {e["name"]: [] for e in entries}
+        empty_vols: List[Tuple[int, str, float]] = []
         for t in meshed:
             etypes, _etags, enodes = gmsh.model.mesh.getElements(3, t)
+            n_before = len(tets_by_member[owner_of[t]])
             for et, conn in zip(etypes, enodes):
                 if int(et) != 4:
                     continue
                 for i in range(0, len(conn), 4):
                     tets_by_member[owner_of[t]].append(
                         [nodes[int(c)] for c in conn[i:i + 4]])
+            if len(tets_by_member[owner_of[t]]) == n_before:
+                mass = gmsh.model.occ.getMass(3, t)
+                if mass > _EMPTY_VOLUME_MIN_FRAC * max(v_in[owner_of[t]],
+                                                       1e-30):
+                    empty_vols.append((t, owner_of[t], mass))
 
-        # --- 7. per-member payloads + stats ------------------------------
+        # --- 8. verify the harvest BEFORE anyone can cache it -----------
+        v_tets_by_member = {n: sum(_tet_volume(t) for t in ts)
+                            for n, ts in tets_by_member.items()}
+        skin_ratios = _verify_harvest(
+            group_name, empty_vols,
+            {e["name"]: (v_tets_by_member[e["name"]],
+                         v_in[e["name"]]
+                         - members[e["name"]].get("_v_interior", 0.0),
+                         v_in[e["name"]])
+             for e in entries},
+            _log)
+
+        # --- 9. per-member payloads + stats -----------------------------
         payload: Dict[str, Any] = {"members": {}}
         tot_cells = tot_tets = 0
         for e in entries:
@@ -1264,11 +1502,18 @@ def _build_group_rank0(entries: List[Dict[str, Any]], group_name: str,
             # volume exactly, free of the OCC/analytic round-trip noise that
             # would otherwise leak into the chord-deficit stat.
             v_skin = v_cad - v_int
+            # MEASURED counterparts (step 8 verified them): the volume the
+            # mesher actually delivered, and what the emitted model therefore
+            # really covers. Reported so a drift in the tet/analytic-skin
+            # ratio is visible in the log/stats instead of only in a crash.
+            v_tets = v_tets_by_member[name]
+            v_ratio = skin_ratios.get(name, float("nan"))
             if st is not None:
                 t0, t1 = m["theta_span"]
                 n_theta = m["_grid"][2]
                 sub = math.radians(t1 - t0) / n_theta
                 v_model = (math.sin(sub) / sub) * v_int + v_skin
+                v_model_meshed = (math.sin(sub) / sub) * v_int + v_tets
                 radii, zplanes = m["_anchors"]
                 stats = {
                     "cad_volume_mm3": v_cad,
@@ -1276,6 +1521,12 @@ def _build_group_rank0(entries: List[Dict[str, Any]], group_name: str,
                     "skin_pieces": m["_n_skin_bodies"],  # v3: skin bodies
                     "skin_tets": len(tets),
                     "skin_volume_frac": v_skin / max(v_cad, 1e-30),
+                    "skin_volume_mm3": v_skin,             # analytic
+                    "skin_tet_volume_mm3": v_tets,         # measured
+                    "skin_tet_volume_ratio": v_ratio,      # measured/analytic
+                    "modelled_volume_mm3": v_model_meshed,
+                    "modelled_vs_cad_frac":
+                        (v_model_meshed - v_cad) / max(v_cad, 1e-30),
                     "n_theta": n_theta,
                     "elements_total": len(cells) + len(tets),
                     "inscribed_volume_deficit_frac":
@@ -1292,15 +1543,23 @@ def _build_group_rank0(entries: List[Dict[str, Any]], group_name: str,
                 print(f"[structured {group_name}/{name}] "
                       f"{len(cells)} prism cells + {len(tets)} skin tets "
                       f"({100 * stats['skin_volume_frac']:.2f}% of volume "
-                      f"is skin); chord deficit "
-                      f"{100 * stats['inscribed_volume_deficit_frac']:.4f}%",
+                      f"is skin, tet/analytic {v_ratio:.4f}); chord deficit "
+                      f"{100 * stats['inscribed_volume_deficit_frac']:.4f}%; "
+                      f"modelled/CAD "
+                      f"{100 * stats['modelled_vs_cad_frac']:+.3f}%",
                       flush=True)
             else:
                 stats = {"cad_volume_mm3": v_cad, "interior_cells": 0,
                          "skin_tets": len(tets),
+                         "skin_volume_mm3": v_skin,
+                         "skin_tet_volume_mm3": v_tets,
+                         "skin_tet_volume_ratio": v_ratio,
+                         "modelled_volume_mm3": v_tets,
+                         "modelled_vs_cad_frac":
+                             (v_tets - v_cad) / max(v_cad, 1e-30),
                          "elements_total": len(tets)}
                 print(f"[structured {group_name}/{name}] tet member: "
-                      f"{len(tets)} tets", flush=True)
+                      f"{len(tets)} tets (tet/CAD {v_ratio:.4f})", flush=True)
             payload["members"][name] = {
                 "cells": cells,
                 "skin_tets": tets,
@@ -1359,6 +1618,9 @@ def build_structured_group(
         key = _group_cache_key(entries) if use_cache else None
         payload = _cache_load(key, group_name)
         if payload is None:
+            # _build_group_rank0 verifies the harvested mesh (step 8) and
+            # raises rather than returning an incomplete payload, so nothing
+            # unvalidated can reach the cache.
             payload = _build_group_rank0(entries, group_name, gmsh_verbosity,
                                          classify_workers=workers)
             _cache_store(key, group_name, payload)
@@ -1395,6 +1657,7 @@ def slice_stp_polar(
     key = _group_cache_key([entry]) if use_cache else None
     payload = _cache_load(key, model_name)
     if payload is None:
+        # store only after the build's harvest verification passed (step 8)
         payload = _build_group_rank0([entry], model_name, gmsh_verbosity,
                                      classify_workers=workers)
         _cache_store(key, model_name, payload)
