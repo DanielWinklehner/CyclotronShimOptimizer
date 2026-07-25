@@ -133,6 +133,16 @@ simulation:
   #                       # can stall above the plain floor on fine tet meshes)
   # perturb_iterations: 0 # perturbative-component back-reaction cycles
   # perturb_tol: 0.0      # early-exit tolerance [T] for those cycles
+  # gpu_fallback: break   # what radia does when the interaction matrix does
+  #                       # NOT fit in GPU memory. 'cpu' (default) falls back to
+  #                       # the CPU, which is correct but can turn a seconds-long
+  #                       # solve into an hours-long one; 'break' raises instead,
+  #                       # so a model that has outgrown the card is caught at
+  #                       # once and the mesh coarsened deliberately;
+  #                       # 'gpu_streaming' keeps the matrix in host RAM and
+  #                       # streams it a row block at a time -- no VRAM limit on
+  #                       # model size, but PCIe traffic on every iteration
+  #                       # (bit-identical results). Needs rad.UtiGpuFallback.
 
 optimization:
   target_frequency_mhz: 8.2

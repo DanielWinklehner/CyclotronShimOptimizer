@@ -176,6 +176,37 @@ def _rlx_pre(radia_id: int, *, srcobj: int = 0, use_gpu: bool = True) -> int:
         return rad.RlxPre(radia_id, srcobj) if srcobj else rad.RlxPre(radia_id)
 
 
+_GPU_FALLBACK_WARNED = False
+
+
+def _apply_gpu_fallback(mode: Optional[str], *, say: bool = False) -> None:
+    """Set radia's GPU fallback policy (rad.UtiGpuFallback) for this process.
+
+    The policy is a global radia switch, read when the interaction matrix is
+    assembled and again when it is solved, so it must be set BEFORE RlxPre.
+    It only bites when the dense matrix does not fit in VRAM; models that fit
+    are unaffected whatever it is set to.
+
+    ``None`` leaves the radia default alone. Older RadiaCUDA builds have no
+    UtiGpuFallback -- warn once and carry on rather than breaking every run
+    on a build that simply predates the switch.
+    """
+    global _GPU_FALLBACK_WARNED
+    if mode is None:
+        return
+    if not hasattr(rad, "UtiGpuFallback"):
+        if not _GPU_FALLBACK_WARNED:
+            _GPU_FALLBACK_WARNED = True
+            print(f"WARNING: simulation.gpu_fallback={mode!r} ignored -- this "
+                  "radia build has no UtiGpuFallback (rebuild RadiaCUDA to "
+                  "use it). A model that outgrows the GPU will fall back to "
+                  "the CPU as before.", flush=True)
+        return
+    rad.UtiGpuFallback(mode)
+    if say:
+        print(f"GPU fallback policy: {mode}", flush=True)
+
+
 def _magnetizations(radia_id: int) -> np.ndarray:
     """(N, 3) magnetization vectors of an object's relaxable elements."""
     data = rad.ObjM(radia_id)
@@ -808,6 +839,10 @@ class ReusableCyclotronSolver:
             print(f"Building Interaction Matrix "
                   f"({'GPU' if self.gpu.assembly else 'CPU'} assembly)...", flush=True)
             t0 = time.time()
+        # Must precede RlxPre: the policy is read when the matrix is assembled
+        # (and again when it is solved), not when the solver is constructed.
+        _apply_gpu_fallback(getattr(self.config.simulation, "gpu_fallback", None),
+                            say=say)
         # Stage 0: the main solve NEVER sees the perturbative parts (no
         # srcobj here: on reuse they still carry the previous solution's
         # magnetization until stage 1 re-relaxes them).

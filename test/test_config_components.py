@@ -150,6 +150,59 @@ def test_build_coils_from_component_spec():
         components.rad = real_rad
 
 
+def test_gpu_fallback_setting():
+    """simulation.gpu_fallback: optional, validated at load time.
+
+    A typo must fail when the config is read, not hours later when a solve
+    finally hits the fallback -- that is the whole point of the setting.
+    """
+    from cyclotron_optimizer.config_io.config import SimulationConfig
+
+    assert SimulationConfig(precision=1e-4, iterations=10).gpu_fallback is None
+    for mode in ("cpu", "gpu_streaming", "break"):
+        cfg = SimulationConfig(precision=1e-4, iterations=10,
+                               gpu_fallback=mode)
+        assert cfg.gpu_fallback == mode
+
+    for bad in ("CPU", "stream", "gpu-streaming", ""):
+        try:
+            SimulationConfig(precision=1e-4, iterations=10, gpu_fallback=bad)
+        except ValueError as e:
+            assert "gpu_fallback" in str(e), e
+        else:
+            raise AssertionError(f"{bad!r} should have been rejected")
+
+
+def test_gpu_fallback_ignored_on_older_radia(monkeypatch=None):
+    """A radia build without UtiGpuFallback warns once and keeps going --
+    the setting must not break every run on an older RadiaCUDA."""
+    import cyclotron_optimizer.simulation.field_calculator as fc
+
+    calls = []
+
+    class _FakeRad:            # no UtiGpuFallback attribute
+        pass
+
+    real_rad, real_warned = fc.rad, fc._GPU_FALLBACK_WARNED
+    try:
+        fc.rad = _FakeRad()
+        fc._GPU_FALLBACK_WARNED = False
+        fc._apply_gpu_fallback("break")     # must not raise
+        fc._apply_gpu_fallback(None)        # no-op
+
+        class _NewRad:
+            def UtiGpuFallback(self, mode):
+                calls.append(mode)
+                return mode
+
+        fc.rad = _NewRad()
+        fc._apply_gpu_fallback("gpu_streaming")
+        fc._apply_gpu_fallback(None)        # None never calls through
+        assert calls == ["gpu_streaming"], calls
+    finally:
+        fc.rad, fc._GPU_FALLBACK_WARNED = real_rad, real_warned
+
+
 def test_all_example_configs_load():
     """Every shipped example config parses, resolves its files, and exposes a
     complete machine description."""

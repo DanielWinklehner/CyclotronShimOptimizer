@@ -140,6 +140,16 @@ field_evaluation:
 simulation:
   precision: 0.0001
   iterations: 3000
+  # gpu_fallback: break   # what radia does when the interaction matrix does
+  #                       # NOT fit in GPU memory. 'cpu' (default) falls back to
+  #                       # the CPU, which is correct but can turn a seconds-long
+  #                       # solve into an hours-long one; 'break' raises instead,
+  #                       # so a model that has outgrown the card is caught at
+  #                       # once and the mesh coarsened deliberately;
+  #                       # 'gpu_streaming' keeps the matrix in host RAM and
+  #                       # streams it a row block at a time -- no VRAM limit on
+  #                       # model size, but PCIe traffic on every iteration
+  #                       # (bit-identical results). Needs rad.UtiGpuFallback.
 
 optimization:
   target_frequency_mhz: 8.2

@@ -259,6 +259,28 @@ class SimulationConfig:
     # perturbative magnetization changes by less than perturb_tol [T].
     perturb_iterations: int = 0
     perturb_tol: float = 0.0
+    # What radia does when the GPU cannot service the interaction matrix --
+    # almost always: the dense matrix (36*N^2 bytes) does not fit in VRAM.
+    # None leaves whatever the radia build defaults to ('cpu'); otherwise
+    #   'cpu'            fall back to the CPU assembly/relaxation. Correct, but
+    #                    can turn a seconds-long solve into an hours-long one.
+    #   'break'          raise instead, so a model that has outgrown the card
+    #                    is caught immediately and the mesh can be coarsened
+    #                    deliberately rather than discovered overnight.
+    #   'gpu_streaming'  keep the matrix in host RAM and move it to the device
+    #                    one row block per matvec: lifts the VRAM limit on model
+    #                    size at the cost of PCIe traffic every iteration
+    #                    (results are bit-identical to an in-core solve).
+    # Requires a RadiaCUDA build with rad.UtiGpuFallback; older builds ignore
+    # the setting with a warning.
+    gpu_fallback: Optional[str] = None
+
+    def __post_init__(self):
+        allowed = ("cpu", "gpu_streaming", "break")
+        if self.gpu_fallback is not None and self.gpu_fallback not in allowed:
+            raise ValueError(
+                f"simulation.gpu_fallback must be one of {allowed} "
+                f"(got {self.gpu_fallback!r})")
 
 
 @dataclass
