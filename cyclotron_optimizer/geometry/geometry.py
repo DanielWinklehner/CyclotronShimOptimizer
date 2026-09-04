@@ -346,8 +346,9 @@ def _build_mesh_group(group_name: str, specs: List[ComponentSpec],
             out.append((spec, comp))
         return out
 
-    tets_by_name = build_conforming_group(entries, group_name=group_name,
-                                          comm=ctx.comm)
+    tets_by_name = build_conforming_group(
+        entries, group_name=group_name, comm=ctx.comm,
+        size_boxes=getattr(ctx.config, "mesh_refinement", None))
     for spec in specs:
         mat = ctx.material(spec)
         comp = MagnetizedComponent.from_tet_coords(

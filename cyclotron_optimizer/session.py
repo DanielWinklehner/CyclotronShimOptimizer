@@ -372,6 +372,26 @@ class CyclotronModel:
             use_gpu=self._use_gpu(use_gpu),
             rank=s.rank, comm=s.comm, verbosity=s.verbosity)
 
+    def field_rz_dense(self, radii_mm=None, num_angles: Optional[int] = None,
+                       use_symmetry: Optional[bool] = None,
+                       use_gpu: Optional[bool] = None):
+        """Dense polar Bz grid around the evaluation radii (closed-orbit
+        isochronism input; eo_radial_step_mm / eo_radial_margin from config)."""
+        from cyclotron_optimizer.simulation.field_calculator import get_field_rz_dense
+        cyclotron = self._require_solved()
+        fe = self.config.field_evaluation
+        s = self._session
+        return get_field_rz_dense(
+            cyclotron,
+            self.radii_mm if radii_mm is None else radii_mm,
+            (int(getattr(fe, 'eo_num_points_circle', None) or fe.num_points_circle)
+             if num_angles is None else num_angles),
+            step_mm=float(getattr(fe, 'eo_radial_step_mm', None) or 2.0),
+            margin=float(getattr(fe, 'eo_radial_margin', None) or 0.15),
+            use_symmetry=fe.use_symmetry if use_symmetry is None else use_symmetry,
+            use_gpu=self._use_gpu(use_gpu),
+            rank=s.rank, comm=s.comm, verbosity=s.verbosity)
+
     def median_plane_field(self, limit_mm: Optional[float] = None,
                            resolution_mm: Optional[float] = None,
                            use_symmetry: Optional[bool] = None,
@@ -423,7 +443,7 @@ class CyclotronModel:
     # ------------------------------------------------------------------
     def isochronism(self, radii_mm=None, method: Optional[str] = None,
                     seo_solver: str = "newton", **kwargs):
-        """Isochronism analysis (circle / gordon / seo) at the given radii.
+        """Isochronism analysis (circle / gordon / gordon_analytic / seo) at the given radii.
 
         Collective (performs the field query); the iso dict is returned on
         rank 0, None elsewhere. Extra kwargs go to compute_isochronism.
@@ -435,6 +455,8 @@ class CyclotronModel:
 
         if method == "seo":
             field = self.median_plane_field()
+        elif method == "gordon":
+            field = self.field_rz_dense(radii_mm=radii)
         else:
             field = self.field_rz(radii_mm=radii)
 

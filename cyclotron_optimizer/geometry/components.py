@@ -1066,9 +1066,17 @@ def build_conforming_group(
     gmsh_verbosity: int = 3,
     export_stp_path: Optional[Union[str, Path]] = None,
     mesh: bool = True,
+    size_boxes: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, List[List[List[float]]]]:
     """Mesh several touching components in ONE gmsh model with CONFORMING
     interfaces, and return per-component tet vertex lists.
+
+    ``size_boxes``: optional local refinement, a list of dicts
+    ``{x_min, x_max, y_min, y_max, z_min, z_max, size_mm, thickness_mm}``
+    (gmsh Box size fields combined by a Min field into the background
+    field; gmsh takes the minimum of that and the point-prescribed sizes,
+    so inside a box the size is min(size_mm, part cap); ``thickness_mm`` is
+    the transition width outside the box).
 
     Each entry: ``{"name": str, "stp_path": str | None, "occ": callable |
     None, "mesh_max": float, "mesh_min": float | None}`` — exactly one of
@@ -1223,6 +1231,91 @@ def build_conforming_group(
                     pts = [(d, t) for d, t in pts if d == 0]
                     if pts:
                         gmsh.model.mesh.setSize(pts, float(e["mesh_max"]))
+
+                if size_boxes:
+                    box_ids = []
+                    for b in size_boxes:
+                        if b.get("type") == "distance":
+                            # Graded size from selected faces of one component:
+                            # {type: distance, component, face_z_min_mm,
+                            #  size_min_mm, size_max_mm, dist_min_mm, dist_max_mm}
+                            # Faces are the boundary faces of the component
+                            # whose bounding box lies entirely above
+                            # face_z_min_mm (the gap-facing surfaces); the
+                            # size is size_min at the face and grows linearly
+                            # to size_max at dist_max (gmsh Distance +
+                            # Threshold fields).
+                            vol_tags = [(3, t) for t, n in owner_of.items()
+                                        if n == b["component"]]
+                            faces = gmsh.model.getBoundary(vol_tags, combined=False,
+                                                           oriented=False)
+                            sel = []
+                            for d, f in faces:
+                                if d != 2:
+                                    continue
+                                bb = gmsh.model.getBoundingBox(d, abs(f))
+                                if bb[2] >= float(b["face_z_min_mm"]):
+                                    sel.append(abs(f))
+                            sel = sorted(set(sel))
+                            if not sel:
+                                raise RadiaComponentError(
+                                    f"mesh_group '{group_name}': distance refinement "
+                                    f"found no faces of '{b['component']}' above "
+                                    f"z = {b['face_z_min_mm']}")
+                            fd = gmsh.model.mesh.field.add("Distance")
+                            gmsh.model.mesh.field.setNumbers(fd, "SurfacesList", sel)
+                            gmsh.model.mesh.field.setNumber(fd, "Sampling",
+                                                            float(b.get("sampling", 60)))
+                            ft = gmsh.model.mesh.field.add("Threshold")
+                            gmsh.model.mesh.field.setNumber(ft, "InField", fd)
+                            gmsh.model.mesh.field.setNumber(ft, "SizeMin", float(b["size_min_mm"]))
+                            gmsh.model.mesh.field.setNumber(ft, "SizeMax", float(b["size_max_mm"]))
+                            gmsh.model.mesh.field.setNumber(ft, "DistMin", float(b["dist_min_mm"]))
+                            gmsh.model.mesh.field.setNumber(ft, "DistMax", float(b["dist_max_mm"]))
+                            # restrict to the component's own volumes: beyond
+                            # DistMax a Threshold returns SizeMax everywhere,
+                            # which through the Min field would cap the whole
+                            # model
+                            fr = gmsh.model.mesh.field.add("Restrict")
+                            gmsh.model.mesh.field.setNumber(fr, "InField", ft)
+                            gmsh.model.mesh.field.setNumbers(
+                                fr, "VolumesList", [t for _d, t in vol_tags])
+                            print(f"[mesh_group {group_name}] distance refinement from "
+                                  f"{len(sel)} faces of '{b['component']}' (restricted to "
+                                  f"{len(vol_tags)} volumes)", flush=True)
+                            box_ids.append(fr)
+                            continue
+                        if b.get("radius_mm") is not None:
+                            # z-axis cylinder: {radius_mm, z_min, z_max, size_mm}
+                            fid = gmsh.model.mesh.field.add("Cylinder")
+                            gmsh.model.mesh.field.setNumber(fid, "VIn", float(b["size_mm"]))
+                            gmsh.model.mesh.field.setNumber(fid, "VOut", max(sizes.values()))
+                            gmsh.model.mesh.field.setNumber(fid, "Radius", float(b["radius_mm"]))
+                            z0, z1 = float(b["z_min"]), float(b["z_max"])
+                            gmsh.model.mesh.field.setNumber(fid, "XCenter", 0.0)
+                            gmsh.model.mesh.field.setNumber(fid, "YCenter", 0.0)
+                            gmsh.model.mesh.field.setNumber(fid, "ZCenter", 0.5 * (z0 + z1))
+                            gmsh.model.mesh.field.setNumber(fid, "XAxis", 0.0)
+                            gmsh.model.mesh.field.setNumber(fid, "YAxis", 0.0)
+                            gmsh.model.mesh.field.setNumber(fid, "ZAxis", 0.5 * (z1 - z0))
+                            box_ids.append(fid)
+                            continue
+                        fid = gmsh.model.mesh.field.add("Box")
+                        gmsh.model.mesh.field.setNumber(fid, "VIn", float(b["size_mm"]))
+                        gmsh.model.mesh.field.setNumber(fid, "VOut", max(sizes.values()))
+                        for key, src in (("XMin", "x_min"), ("XMax", "x_max"),
+                                         ("YMin", "y_min"), ("YMax", "y_max"),
+                                         ("ZMin", "z_min"), ("ZMax", "z_max")):
+                            gmsh.model.mesh.field.setNumber(fid, key, float(b[src]))
+                        gmsh.model.mesh.field.setNumber(
+                            fid, "Thickness",
+                            float(b.get("thickness_mm", 2.0 * float(b["size_mm"]))))
+                        box_ids.append(fid)
+                    fmin = gmsh.model.mesh.field.add("Min")
+                    gmsh.model.mesh.field.setNumbers(fmin, "FieldsList", box_ids)
+                    gmsh.model.mesh.field.setAsBackgroundMesh(fmin)
+                    print(f"[mesh_group {group_name}] {len(box_ids)} refinement "
+                          f"box(es) applied", flush=True)
 
                 gmsh.model.mesh.generate(3)
 

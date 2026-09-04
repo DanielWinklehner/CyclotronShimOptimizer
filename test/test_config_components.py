@@ -256,3 +256,43 @@ def test_component_accessors():
         pass
     else:
         raise AssertionError("Expected KeyError for undefined symmetry")
+
+def test_numeric_string_values_are_coerced_or_rejected_at_load(tmp_path=None):
+    """YAML turns several innocent values into STRINGS (quoted numbers, '1e-1'
+    without a decimal point, pasted dataclass syntax 'key: float = 200.0').
+    They must be coerced when honest and rejected AT LOAD TIME when bogus --
+    the real incident crashed the bore-field export with a bare TypeError
+    after the ~100 s solve."""
+    import tempfile
+
+    src = open(LIVE_EXAMPLE, encoding="utf-8").read()
+
+    def _load(text):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "cfg.yml")
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            return CyclotronConfig.from_yaml(p)
+
+    # File paths in the live example are relative to examples/ -- make them
+    # absolute so the copy in the temp dir still resolves.
+    src = src.replace('"../resources/', f'"{_testenv.REPO_ROOT}/resources/'.replace("\\", "/"))
+
+    # (1) honest numeric strings coerce silently
+    ok = _load(src.replace("bore_xy_limit_mm: 200.0", 'bore_xy_limit_mm: "200.0"'))
+    assert ok.field_evaluation.bore_xy_limit_mm == 200.0
+    assert isinstance(ok.field_evaluation.bore_xy_limit_mm, float)
+
+    # (2) the incident: pasted dataclass syntax -> ValueError NAMING the key
+    try:
+        _load(src.replace("bore_xy_limit_mm: 200.0",
+                          "bore_xy_limit_mm: float = 200.0"))
+    except ValueError as exc:
+        assert "bore_xy_limit_mm" in str(exc)
+        assert "float = 200.0" in str(exc)
+    else:
+        raise AssertionError("bogus numeric string must fail at load time")
+
+    # (3) the YAML-1.1 exponent gotcha coerces (it is an honest number)
+    ok = _load(src.replace("precision: 0.0001", "precision: 1e-4"))
+    assert ok.simulation.precision == 1e-4

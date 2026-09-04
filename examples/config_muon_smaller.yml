@@ -41,7 +41,7 @@ components:
     file: "../resources/uCyclo_v2_YokeWall.stp"
     material: iron
     symmetry: cyclotron_8fold
-    mesh: {max_size: 60}
+    mesh: {max_size: 60}  # 60
     mesh_group: iron
 
   - name: lid_lower
@@ -49,7 +49,7 @@ components:
     file: "../resources/uCyclo_v2_LidLower.stp"
     material: iron
     symmetry: cyclotron_8fold
-    mesh: {max_size: 50}
+    mesh: {max_size: 50}  # 50
     mesh_group: iron
 
   - name: lid_upper
@@ -72,13 +72,13 @@ components:
     material: iron
     symmetry: cyclotron_8fold
     shimmed: true                    # shape follows the PoleShape shims
-    mesh: {max_size: 25}
+    mesh: {max_size: 20}  # 20
     mesh_group: iron
     params:
       inner_radius_mm: 50.0
       outer_radius_mm: 400.0
-      height_mm: 235.0
-      half_angle_deg: 15.0           # half-wedge; full pole = 30 deg
+      height_mm: 245.0               # Max gap is then -pole_zs - height_mm
+      half_angle_deg: 12.5           # half-wedge; full pole = 25 deg - rest is shimming
       pole_zs: -285.0                # -(yoke 188.5 + lid_lower 96.5)
       cylindrical_faces: true        # exact rim/bore cylinder patches (required
                                      # so fragment can merge them with the lid CAD)
@@ -106,8 +106,8 @@ components:
       radius_max_mm: 574.5
       height_mm: 123.5
       midplane_dist: 55
-      current_A: 15034.84            # Amp-turns (initial; optimizer overrides)
-      num_segments: 25
+      current_A: 12892.2             # Amp-turns (initial; optimizer overrides)
+      num_segments: 50
 
 # ---------------------------------------------------------------------------
 # Shim parametrization (initial/default shape; optimizer overrides offsets)
@@ -115,37 +115,38 @@ components:
 side_shim:
   include: true
   num_rad_segments: 19
-  angular_resolution_deg: 2.5
-#  default_offset_deg: 0.0
-  side_offsets_deg: [2.60009495,  0.73979659,  0.0, 0.42199612,  1.66590662,  2.99677784,
-                     4.85228029,  6.82133653,  8.5499665,   9.78387648, 10.33567868, 10.27294429,
-                     9.91347963,  9.43231939,  9.04505908,  8.75995878,  8.58843817,  8.90623647,
-                     9.77249649, 10.84986381]
+  angular_resolution_deg: 1.25
+  default_offset_deg: 0.0
+  side_offsets_deg: [0.2995905685307252,0.2010313060972677,0.5563623798242714,1.7182389824028137,2.5014943162673093,3.2140760336161205,3.9206893232720654,4.423487102953504,4.978177874102305,5.388533359032637,5.852292182111533,6.164118975760534,6.620404163644232,6.930326508670628,7.439083634406862,7.8062266909325695,8.417901282527689,9.169110484595151,9.837786748673983,9.899576985343156
+]
   segmentation: [3, 1, 20]
 
 top_shim:
   include: true
   num_rad_segments: 19
   angular_resolution_deg: 1.25
-#  default_offset_mm: 0.0
-  top_offsets_mm: [1.73705048, 0.0, 0.0, 1.75125378, 3.04509649, 2.60358329,
-                   2.40179285,  1.98828774,  1.49003946,  1.4994747,   1.81490715,  2.49738539,
-                   3.4781762,   4.44620898,  5.48165388,  6.40182401,  6.93465152,  7.86533554,
-                   9.3088477,  10.89782538]
+  default_offset_mm: 0.0
+  top_offsets_mm: [1.585438872546877,0.5472255284147777,0.5184576287675244,2.1461458822186024,3.0409604671024395,3.774737948151011,4.510471822213677,4.918600317892446,5.493662627018618,5.8001836674407015,6.291941801046872,6.446686274940138,6.869006901915428,6.920043507137248,7.2737419820766895,7.18625722838542,7.350577471541178,7.677874581760198,8.002425111914325,7.155444452776323
+]
   segmentation: [3, 1, 1]
 
 # ---------------------------------------------------------------------------
 # Workflow sections (unchanged from the legacy schema)
 # ---------------------------------------------------------------------------
 field_evaluation:
-  num_points_circle: 360
+  num_points_circle: 720
   radius_min_mm: 75.0
   radius_max_mm: 350.0
-  n_eval_pts: 40
+  n_eval_pts: 60
   use_symmetry: true
-  iso_method: "gordon"               # "circle" | "gordon" | "seo"
-  median_plane_limit_mm: 400
+  iso_method: "gordon"               # "circle" | "gordon" (closed orbits) | "gordon_analytic" | "seo"
+  median_plane_limit_mm: 700
   median_plane_resolution_mm: 0.5
+  # 3D bore-field export domain: x, y in [-limit, limit], z in [z_min, z_max]
+  bore_xy_limit_mm: 150.0
+  bore_z_min_mm: -25.0
+  bore_z_max_mm: 250.0
+  bore_resolution_mm: 1.0
 
 simulation:
   precision: 0.0001
@@ -156,7 +157,7 @@ simulation:
   #                       # can stall above the plain floor on fine tet meshes)
   # perturb_iterations: 0 # perturbative-component back-reaction cycles
   # perturb_tol: 0.0      # early-exit tolerance [T] for those cycles
-  # gpu_fallback: break   # what radia does when the interaction matrix does
+  gpu_fallback: gpu_streaming   # what radia does when the interaction matrix does
   #                       # NOT fit in GPU memory. 'cpu' (default) falls back to
   #                       # the CPU, which is correct but can turn a seconds-long
   #                       # solve into an hours-long one; 'break' raises instead,
@@ -170,16 +171,16 @@ simulation:
 optimization:
   target_frequency_mhz: 42
   frequency_tolerance_mhz: 0.001
-  max_iterations: 100
-  coil_current_min_A: 10000
-  coil_current_max_A: 30000
+  max_iterations: 300
+  coil_current_min_A: 8000
+  coil_current_max_A: 20000
   side_shim_min_deg: 0
-  side_shim_max_deg: 15
+  side_shim_max_deg: 10
   top_shim_min_mm: 0
   top_shim_max_mm: 15
   num_workers: 1
   n_initial_points: 1
-  reference_coil_current: 13101.9
+  reference_coil_current: 13000
   regularization_weight: 0.0     # MAGNITUDE penalty (shrinks all offsets to 0)
   convergence_penalty_weight: 1.0
   # Second-difference (roughness) penalty on the shim profile -- removes the
@@ -187,9 +188,57 @@ optimization:
   # penalizing a smooth large shim. 0 = current behavior. Tune with the knee of
   # examples/l_curve_smoothness.py (start ~0.1; the spike is on the SIDE block,
   # so smoothness_weight_side can be raised independently).
-  smoothness_weight: 0.1
+#  smoothness_weight: 0.1
   # smoothness_weight_side: 0.1  # override for the side block only (falls back
   # smoothness_weight_top: 0.0   # to smoothness_weight when unset)
+  #
+  # FIELD-BASIS smoothness. Side and top are BOTH first-order levers on <B>(r)
+  # while isochronism constrains only that ONE function, so the pair has a
+  # field-neutral null direction the residual cannot see -- measured on the
+  # 2026-07-27 muon optimum as corr(D2(side), D2(top)) = -0.94: a dip in the top
+  # shim at r~197 cancelled by a bulge in the side shim. Per-block D2 taxes that
+  # mode and legitimate curvature alike (it was already 34% of the objective and
+  # the mode survived). Setting either weight below splits the pair instead:
+  #   neutral = (side_norm - rho*top_norm)/sqrt(1+rho^2)   <B>-invariant (waste)
+  #   active  = (rho*side_norm + top_norm)/sqrt(1+rho^2)   carries <B>(r) (needed)
+  # so the null mode can be penalized hard while real shaping stays nearly free.
+  # Both unset -> per-block behavior, bit for bit. Equal weights are IDENTICAL to
+  # the per-block penalty at that weight (the rotation is orthonormal).
+  # Read roughness_neutral / roughness_active in the diagnostics CSV first: they
+  # are logged either way, so the split is visible before you switch penalties.
+  # smoothness_weight_neutral: 1.0    # penalize the null mode hard
+  # smoothness_weight_active: 0.02    # leave real <B>(r) shaping nearly free
+  # rho = d<B>/d(side_norm) / d<B>/d(top_norm); 1.0 assumes the two bound ranges
+  # (10 deg, 15 mm) carry equal field authority -- MEASURE it instead with
+  #   mpiexec -n 1 python examples/measure_shim_exchange_ratio.py <config.yml>
+  smoothness_exchange_ratio: 0.70
+  smoothness_weight_neutral: 0.5  # 1.0
+  smoothness_weight_active: 0.05
+
+  # BETATRON-RESONANCE BARRIERS (all OPT-IN; weight 0 = off = prior behavior).
+  # One-sided hinges: exactly zero while the design stays in the safe band, so
+  # they cost nothing until they bind. Needs iso_method: gordon or
+# gordon_analytic (tunes).
+  # WHY THESE ARE CEILINGS, NOT A "MAXIMIZE nu_z" REWARD: measured at the
+  # 2026-07-27 muon optimum, nu_z PEAKS at 0.4804 at r = 294 mm -- 0.020 from the
+  # nu_z = 1/2 half-integer and 0.064 from Walkinshaw (nu_r = 2 nu_z) -- while
+  # nu_z^2 > 0 everywhere (vertically stable at every radius). Vertical focusing
+  # is ABUNDANT in this machine, not scarce, so rewarding it would drive the
+  # design straight into those resonances. What was missing is an upper guard
+  # rail; nothing in the objective was watching.
+  # nu_z_peak / walkinshaw_min / nu_z_sq_min are logged to the diagnostics CSV on
+  # EVERY gordon eval whether or not these are enabled -- read them first.
+  # NOTE isochronism pins nu_r = gamma (verified to 1.7% here), so the Walkinshaw
+  # term is really a radius-dependent nu_z ceiling at (gamma(r) - delta)/2 and
+  # overlaps the flat one. Weight ONE as primary rather than both hard.
+  nu_z_ceiling_weight: 2.0        # w * max(0, nu_z - nu_z_max)
+  nu_z_max: 0.42                  # ~0.08 below both the half-integer and Walkinshaw
+  walkinshaw_weight: 2.0          # w * max(0, min_distance - (nu_r - 2 nu_z))
+  walkinshaw_min_distance: 0.15
+  nu_z_floor_weight: 5.0          # w * max(0, nu_z_sq_min - nu_z_sq); vertical
+  nu_z_sq_min: 0.0                # stability. Written on nu_z^2, NOT nu_z, which
+  #                               # is NaN below the boundary (one NaN destroys
+  #                               # DFO-LS's model). Inactive on this design.
   precondition: true
   # Start from the config's saved shim offsets (side_offsets_deg / top_offsets_mm)
   # instead of the preconditioner -- set true to resume / warm-start from a
@@ -208,12 +257,45 @@ optimization:
   opt_top: true
   opt_side: true
   opt_coil: true
-  optimizer: 'dfo-ls'
+  # 'dfo-ls' (300-eval black box) | 'matrix-full' | 'matrix-reduced' | 'nelder-mead'.
+  # The MATRIX modes probe the sensitivity matrix M = df_rev/dx ONCE around x0
+  # at fixed coil (full: 1 column/station = ~41 solves; reduced: 1 column per
+  # smooth basis mode = ~17 solves -- the gap low-passes station-scale shim
+  # structure, so M is effectively low-rank and smooth probes capture all the
+  # authority), then iterate regularized linear steps, ~1 coil-matched solve
+  # each. Both score with the SAME shared residual as DFO-LS (weights above).
+  # Best used with x0_from_config: true from a known-good design.
+  optimizer: 'matrix-reduced' # 'dfo-ls'
   dfols_rhobeg: 0.1
   dfols_rhoend: 0.03
-  dfols_maxfun: null
+  dfols_maxfun: 300
   dfols_objfun_has_noise: false
   dfols_seek_global_minimum: false
+  # matrix_broyden: true        # free secant updates of M from the iteration
+  #                             # solves -- lets M track saturation drift
+  # matrix_basis_size: 8        # smooth modes per block ('matrix-reduced')
+  # matrix_probe_delta: 0.05    # probe step [normalized]
+  # matrix_relaxation: 0.7      # step relaxation alpha (spec 7.2)
+  # matrix_max_outer: 10
+  # matrix_ftol_rel: 0.01
+
+# -----------------------------------------------------------------------------
+# RF / longitudinal description -- enables the ACCUMULATED PHASE SLIP report
+# (isochronism_reporting_spec.md): the physically meaningful isochronism metric,
+# Phi(E) integrated along the acceleration, replacing sigma(f_rev) as the
+# headline number. Logged per evaluation to the diagnostics CSV (phi_max_deg /
+# phase_margin / n_turns) once this section is present; sigma survives only as
+# a solver-noise diagnostic. Values 2026-07-29: 2 or 4 double-gap cavities at
+# 50 kV peak -> ~180 or ~360 keV/turn depending on design phase.
+# -----------------------------------------------------------------------------
+rf:
+  harmonic_h: 4
+  f_rf_mhz: 168.0            # = h * 42 MHz (gauge-optimized in the report)
+  de0_kev_per_turn: 180      # 2 cavities; 360 with 4
+  phi0_deg: 0.0              # phase at central-region exit (central bump TBD)
+  phi_budget_deg: 10.0       # tight; 30 is accepted for production machines
+  e_inj_mev: 0.03
+  e_final_mev: 5.0
 
 visualization:
   show_opengl: true

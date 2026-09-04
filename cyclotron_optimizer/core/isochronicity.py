@@ -1,4 +1,23 @@
-"""Gordon-style isochronism (equilibrium-orbit revolution frequency from a field map)."""
+"""Isochronism analysis: equilibrium-orbit revolution frequency from a field map.
+
+Methods (``compute_isochronism``):
+
+  circle           rigidity from the azimuthal-average field, T = 2 pi r / v
+  gordon           Gordon closed-orbit integrator (PyCentralRegion.closed_orbit):
+                   the exact midplane equilibrium orbit in polar coordinates on
+                   a DENSE polar grid (field_calculator.get_field_rz_dense) or a
+                   2D Field map; f_rev = v / L, nu_r from the one-turn matrix,
+                   nu_z from the linearised vertical motion. Default.
+  gordon_analytic  the first-order scalloping FORMULAS on a sparse rz grid
+                   (isochronicity_gordon_octant below). Cheap, but ~0.4 % low in
+                   f_rev at large flutter (relative 4th harmonic ~0.9) and only
+                   valid for 4 k harmonics; keep for quick scans / legacy
+                   comparisons.
+  seo              time-domain tracked SEOs (PyCentralRegion.SEOFinder) on a
+                   median-plane Field map; slowest, no tunes.
+"""
+
+import warnings
 
 import numpy as np
 from scipy.interpolate import CubicSpline
@@ -171,7 +190,7 @@ def isochronicity_gordon_octant(
 
 
 # ============================================================================
-# Unified isochronism dispatch (circle / gordon / seo)
+# Unified isochronism dispatch (circle / gordon / gordon_analytic / seo)
 # ============================================================================
 def _angles_from_config(config):
     """Legacy azimuthal sample angles (pre-RZFieldGrid): hardcoded 8-fold octant.
@@ -188,7 +207,7 @@ def _angles_from_config(config):
 
 
 def _grid_and_angles(bz_values, config):
-    """(Bz grid, azimuthal angles) for the circle/gordon methods.
+    """(Bz grid, azimuthal angles) for the circle/gordon_analytic methods.
 
     Prefers the angles attached to the field grid (RZFieldGrid from
     get_field_rz); falls back to the config-derived angles for plain arrays.
@@ -240,8 +259,8 @@ def _iso_circle(bz_values, radii_mm, config, species):
     return _iso_result('circle', energies_mev, rev_times_s, freq_mhz, B0)
 
 
-def _iso_gordon(bz_values, radii_mm, config, species):
-    """Gordon method: flutter-corrected equilibrium-orbit frequency."""
+def _iso_gordon_analytic(bz_values, radii_mm, config, species):
+    """'gordon_analytic': first-order scalloping formulas on the sparse rz grid."""
     bz_grid, angles = _grid_and_angles(bz_values, config)
     res = isochronicity_gordon_octant(
         np.abs(bz_grid),
@@ -260,8 +279,140 @@ def _iso_gordon(bz_values, radii_mm, config, species):
         'flutter': res['flutter'],
         'field_index': res['field_index'],
     }
-    return _iso_result('gordon', res['energy_MeV'], res['T_rev'],
+    return _iso_result('gordon_analytic', res['energy_MeV'], res['T_rev'],
                        res['f_rev'] * 1e-6, res['B_avg_orbit'], tunes=tunes)
+
+
+def _closed_orbit_field(bz_values, radii_mm):
+    """Midplane field object for the closed-orbit method.
+
+    Accepts a dense polar RZFieldGrid (field_calculator.get_field_rz_dense;
+    period/mirror describe the folded sector), a PyPATools 2D Field map, or
+    any object already exposing ``B(r, theta)`` / ``dB(r, theta)``.
+    """
+    from PyCentralRegion.closed_orbit import CartesianMidplane, PolarMidplane
+
+    if hasattr(bz_values, 'B') and hasattr(bz_values, 'dB'):
+        return bz_values
+    if hasattr(bz_values, 'grid_values'):              # PyPATools Field
+        return CartesianMidplane.from_field(bz_values)
+    bz = getattr(bz_values, 'bz', None)
+    angles = getattr(bz_values, 'angles', None)
+    grid_r = getattr(bz_values, 'radii_mm', None)
+    if bz is None or angles is None or grid_r is None:
+        raise ValueError(
+            "iso_method 'gordon' (closed orbits) needs a dense polar RZFieldGrid "
+            "(field_calculator.get_field_rz_dense) or a 2D Field map; a plain "
+            "(Nr, Ntheta) array only works with 'circle' / 'gordon_analytic'.")
+    grid_r = np.asarray(grid_r, dtype=float)
+    radii = np.asarray(radii_mm, dtype=float)
+    steps = np.diff(grid_r)
+    if (len(grid_r) < 8 or steps.max() > 10.0 + 1e-9
+            or grid_r[0] > 0.9 * radii.min() + 1e-9 or grid_r[-1] < 1.1 * radii.max() - 1e-9):
+        raise ValueError(
+            "iso_method 'gordon' (closed orbits) needs a DENSE polar grid covering "
+            f"[0.9 r_min, 1.1 r_max] = [{0.9 * radii.min():.1f}, {1.1 * radii.max():.1f}] mm "
+            f"with <= 10 mm radial step; got {len(grid_r)} radii "
+            f"{grid_r[0]:.1f}..{grid_r[-1]:.1f} mm (max step {steps.max() if len(steps) else 0:.1f} mm). "
+            "Query it with get_field_rz_dense (ReusableCyclotronSolver / "
+            "CyclotronModel.isochronism do this automatically), or use "
+            "iso_method 'gordon_analytic' for the sparse rz grid.")
+    return PolarMidplane(grid_r * 1e-3, np.asarray(angles, dtype=float), np.asarray(bz, dtype=float),
+                         period=float(getattr(bz_values, 'period', 2.0 * np.pi)),
+                         mirror=bool(getattr(bz_values, 'mirror', False)))
+
+
+# Warm-start cache for the closed-orbit method: last converged (E, r0, pr0)
+# per (species, radii). Consecutive optimizer iterates differ slightly, so
+# re-seeding from the previous orbits cuts the solve from ~4 Newton solves of
+# 6-10 iterations to ~2 of 2-3 (see scripts/bench_gordon_muon.py).
+_WARM_START = {}
+
+
+def _warm_key(species, radii):
+    ident = getattr(species, 'name', None) or (float(species.mass_mev), float(species.q))
+    return (ident, tuple(np.round(np.asarray(radii, dtype=float), 6)))
+
+
+def reset_warm_start():
+    """Forget the closed-orbit warm-start seeds (e.g. after a change of machine)."""
+    _WARM_START.clear()
+
+
+def _iso_gordon(bz_values, radii_mm, config, species, warm_start=True):
+    """'gordon': Gordon closed-orbit integrator (PyCentralRegion.closed_orbit).
+
+    Exact midplane equilibrium orbits whose MEAN radius equals each requested
+    radius; f_rev = v / L; nu_r from the one-turn matrix; nu_z from the
+    linearised vertical motion along the orbit (Thomas + gradient focusing).
+    Radii without a closed orbit (beyond the pole edge) fall back to the
+    circle estimate with a warning so the objective stays finite; they are
+    marked in ``tunes['closed']``.  With ``warm_start`` the previous solve at
+    the same radii seeds this one (module-level cache).
+    """
+    from PyCentralRegion.closed_orbit import azimuthal_stats, orbits_at_radii
+
+    fld = _closed_orbit_field(bz_values, radii_mm)
+    fe = getattr(config, 'field_evaluation', None)
+    n_steps = int(getattr(fe, 'eo_steps_per_turn', None) or 3600)
+    radii = np.asarray(radii_mm, dtype=float)
+    r_m = radii * 1e-3
+    key = _warm_key(species, radii)
+    seed = _WARM_START.get(key) if warm_start else None
+    st = azimuthal_stats(fld, r_m)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)   # reported below
+        if seed is not None:
+            # rescale the cached orbits to the new field: at fixed radius the
+            # rigidity follows <B>, so E and the hill radius barely move --
+            # the Newton then starts within microns even after a coil change
+            from PyCentralRegion.closed_orbit import energy_from_brho
+            ratio = np.abs(st['B0']) / seed['B0']
+            E_seed = energy_from_brho(seed['brho'] * ratio, species)
+            eo = orbits_at_radii(fld, r_m, species, energy_seed_mev=E_seed,
+                                 r0_seed_m=seed['r0'], pr0_seed=seed['pr0'] * ratio,
+                                 n_steps=n_steps)
+        else:
+            eo = orbits_at_radii(fld, r_m, species, n_steps=n_steps)
+    if np.asarray(eo['converged']).any():
+        _WARM_START[key] = dict(E=np.array(eo['E_MeV'], dtype=float),
+                                brho=np.array(eo['brho'], dtype=float),
+                                r0=np.array(eo['r0'], dtype=float),
+                                pr0=np.array(eo['pr0'], dtype=float),
+                                B0=np.array(st['B0'], dtype=float))
+
+    f_rev, E, T, B_orb = eo['f_rev'], eo['E_MeV'], eo['T_rev'], eo['B_avg_orbit']
+    ok = np.asarray(eo['converged'], dtype=bool)
+    if not ok.all():
+        warnings.warn(
+            f"iso_method 'gordon': no closed orbit at {int((~ok).sum())} of {len(radii)} radii "
+            f"(r = {radii[~ok].min():.0f}..{radii[~ok].max():.0f} mm; pole edge?) -- "
+            "circle-approximation values substituted there (tunes['closed'] marks them).",
+            RuntimeWarning, stacklevel=2)
+        b_rho = np.abs(st['B0']) * r_m
+        beta_gamma = RIGIDITY_K * abs(species.q) * b_rho / species.mass_mev
+        gamma = np.sqrt(1.0 + beta_gamma ** 2)
+        v = (beta_gamma / gamma) * CLIGHT
+        T_c = 2.0 * np.pi * r_m / v
+        f_rev = np.where(ok, f_rev, 1.0 / T_c)
+        T = np.where(ok, T, T_c)
+        E = np.where(ok, E, (gamma - 1.0) * species.mass_mev)
+        B_orb = np.where(ok, B_orb, np.abs(st['B0']))
+
+    tunes = {
+        'r_mm': radii,
+        'nu_r': eo['nu_r'],
+        'nu_z': eo['nu_z'],
+        'nu_r_sq': eo['nu_r_sq'],
+        'nu_z_sq': eo['nu_z_sq'],
+        'walkinshaw_distance': eo['nu_r'] - 2.0 * eo['nu_z'],
+        'flutter': st['F'],
+        'field_index': st['k'],
+        'r_hill_mm': eo['r0'] * 1e3,       # theta = 0 radius of the scalloped orbit
+        'r_max_mm': eo['r_max'] * 1e3,
+        'closed': ok,
+    }
+    return _iso_result('gordon', E, T, f_rev * 1e-6, B_orb, tunes=tunes)
 
 
 def _iso_seo(bz_values, radii_mm, config, solver, energy_seeds_kev, verbose):
@@ -286,15 +437,17 @@ def _iso_seo(bz_values, radii_mm, config, solver, energy_seeds_kev, verbose):
 
 def compute_isochronism(method, bz_values, radii_mm, config, species, *,
                         solver='newton', energy_seeds_kev=None,
-                        rank=0, comm=None, verbose=False):
+                        rank=0, comm=None, verbose=False, warm_start=True):
     """Compute isochronism (energy / frequency vs radius) by the selected method.
 
-    Single dispatch point for the circle / gordon / seo selection (previously a
-    triple-if in main.py), so the optimizer reuses the same path.
+    Single dispatch point for the circle / gordon / gordon_analytic / seo
+    selection, so the optimizer reuses the same path.
 
-    :param method: 'circle', 'gordon', or 'seo'.
+    :param method: 'circle', 'gordon' (closed orbits, default), 'gordon_analytic'
+        (first-order scalloping formulas) or 'seo' (tracked orbits).
     :param bz_values: field as returned by evaluate_radii_parallel for this method --
-        an RZFieldGrid (or plain (Nr, Ntheta) array) for 'circle'/'gordon', or a
+        an RZFieldGrid (or plain (Nr, Ntheta) array) for 'circle'/'gordon_analytic',
+        a DENSE RZFieldGrid (get_field_rz_dense) or 2D Field map for 'gordon', or a
         2D PyPATools Field map for 'seo'. An RZFieldGrid carries the azimuthal
         sample angles actually used (symmetry-derived sector); plain arrays fall
         back to the config-derived octant/full-circle angles.
@@ -303,6 +456,8 @@ def compute_isochronism(method, bz_values, radii_mm, config, species, *,
     :param species: IonSpecies (used by circle/gordon).
     :param solver: SEO fixed-point solver ('newton' | 'symmetric' | 'centroid').
     :param energy_seeds_kev: optional per-radius Gordon energy seeds (seo only).
+    :param warm_start: 'gordon' only -- seed from the previous solve at the same
+        radii (module cache; ``reset_warm_start()`` clears it).
     :return: dict with keys {method, energies_mev, rev_times_s, rev_frequencies_mhz,
         bz_for_plot, mean_freq_mhz, std_dev_mhz, percent_dev, orbits}.
     """
@@ -310,10 +465,17 @@ def compute_isochronism(method, bz_values, radii_mm, config, species, *,
     if method == 'circle':
         return _iso_circle(bz_values, radii_mm, config, species)
     if method == 'gordon':
-        return _iso_gordon(bz_values, radii_mm, config, species)
+        return _iso_gordon(bz_values, radii_mm, config, species, warm_start=warm_start)
+    if method == 'gordon_analytic':
+        return _iso_gordon_analytic(bz_values, radii_mm, config, species)
     if method == 'seo':
         return _iso_seo(bz_values, radii_mm, config, solver, energy_seeds_kev, verbose)
-    raise ValueError(f"Unknown isochronism method '{method}' (expected circle|gordon|seo).")
+    raise ValueError(f"Unknown isochronism method '{method}' "
+                     "(expected circle|gordon|gordon_analytic|seo).")
+
+
+ISO_METHODS = ('circle', 'gordon', 'gordon_analytic', 'seo')
+ISO_METHODS_WITH_TUNES = ('gordon', 'gordon_analytic')
 
 
 if __name__ == '__main__':

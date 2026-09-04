@@ -25,6 +25,7 @@ from cyclotron_optimizer.visualization.optimization_progress import Optimization
 from cyclotron_optimizer.simulation.field_calculator import ReusableCyclotronSolver
 from cyclotron_optimizer.geometry.pole_shape import PoleShape
 from cyclotron_optimizer.core.species import IonSpecies
+from cyclotron_optimizer.core.isochronicity import compute_isochronism
 
 
 class CyclotronOptimizer:
@@ -100,8 +101,11 @@ class CyclotronOptimizer:
             writer = csv.writer(f)
             header = (
                 ['phase', 'iteration', 'multistart', 'nelder_iter',
-                 'avg_frequency_mhz', 'flatness', 'regularization',
-                 'roughness_side', 'roughness_top', 'smoothness_residual_l2',
+                 'avg_frequency_mhz', 'coil_A', 'flatness', 'regularization',
+                 'roughness_side', 'roughness_top',
+                 'roughness_neutral', 'roughness_active', 'smoothness_residual_l2',
+                 'nu_z_peak', 'walkinshaw_min', 'nu_z_sq_min', 'tune_penalty_l2',
+                 'phi_max_deg', 'phase_margin', 'n_turns',
                  'convergence_penalty', 'objective',
                  'converged', 'misfit', 'eval_seconds'] +
                 [f'side_param_{i}' for i in range(self.n_side)] +
@@ -120,11 +124,21 @@ class CyclotronOptimizer:
                 multistart_idx,
                 nelder_iter,
                 results['avg_f'],
+                results.get('coil_A', ''),
                 results['flatness'],
                 results['regularization'],
                 results.get('roughness_side', ''),
                 results.get('roughness_top', ''),
+                results.get('roughness_neutral', ''),
+                results.get('roughness_active', ''),
                 results.get('smoothness_residual_l2', ''),
+                results.get('nu_z_peak', ''),
+                results.get('walkinshaw_min', ''),
+                results.get('nu_z_sq_min', ''),
+                results.get('tune_penalty_l2', ''),
+                results.get('phi_max_deg', ''),
+                results.get('phase_margin', ''),
+                results.get('n_turns', ''),
                 results.get('convergence_penalty', ''),
                 results['objective'],
                 results.get('converged', ''),
@@ -152,6 +166,8 @@ class CyclotronOptimizer:
         opt_name = (self.config.optimization.optimizer or 'nelder-mead').lower().replace('_', '-')
         if opt_name in ('dfo-ls', 'dfols', 'least-squares'):
             return self.optimize_joint_least_squares()
+        if opt_name in ('matrix', 'matrix-full', 'matrix-reduced'):
+            return self.optimize_matrix_shim()
 
         # Determine which shims to optimize
         opt_top = self.config.optimization.opt_top
@@ -324,12 +340,19 @@ class CyclotronOptimizer:
         target = cfg.optimization.target_frequency_mhz
         bracket = (cfg.optimization.coil_current_min_A, cfg.optimization.coil_current_max_A)
         seed_current = cfg.optimization.reference_coil_current
-        # Coil-match tolerances (df/dI ~ f/I): loose during optimization (fast; saturation
-        # stays correct), tight for the final production match. Mean-centered residuals make
-        # the loose match harmless to the flatness objective.
-        coil_match_tol = getattr(cfg.optimization, 'coil_match_tol_mhz', 0.05)
-        loose_xtol_A = max(1e-3, coil_match_tol * seed_current / target)
-        final_xtol_A = max(1e-4, cfg.optimization.frequency_tolerance_mhz * seed_current / target)
+        # Coil-match tolerances, in MHz: LOOSE during optimization (fast; saturation
+        # stays correct), TIGHT for the final production match. Mean-centered residuals
+        # make the loose match harmless to the flatness objective.
+        # These are the real stopping criterion -- the inner solve now tests the
+        # frequency residual directly. The matching step tolerance in AMPS is only a
+        # backstop, and is derived per evaluation from the LIVE coil current via
+        # df/dI ~ f/I; deriving it once from reference_coil_current made it 31% too
+        # tight at this machine's true operating point (10000 A assumed vs ~13055 A).
+        loose_ftol_mhz = float(getattr(cfg.optimization, 'coil_match_tol_mhz', 0.05))
+        final_ftol_mhz = float(cfg.optimization.frequency_tolerance_mhz)
+
+        def _xtol_A(ftol_mhz, current):
+            return max(1e-4, ftol_mhz * float(current) / target)
         n_seg = cfg.side_shim.num_rad_segments
         n = n_seg + 1
 
@@ -464,14 +487,17 @@ class CyclotronOptimizer:
                 print(f"[DFO-LS] live plot disabled ({exc})", flush=True)
                 plotter = None
 
-        def _evaluate(x_norm, xtol_A):
+        def _evaluate(x_norm, ftol_mhz):
             side, top = _split(lo + x_norm * (hi - lo))
             pole = PoleShape(n_seg, side_offsets=side, top_offsets=top)
-            solver.build(pole, last_coil[0])
+            # Geometry only: the coil solve's first secant point IS
+            # last_coil[0]; build's fused solve would duplicate it exactly.
+            solver.build(pole, last_coil[0], solve=False)
             coil, iso, converged, misfit = solve_coil_for_target_frequency(
                 solver, cfg, species, target, bracket,
                 rank=self.rank, comm=self.comm, verbosity=self.verbosity,
-                seed_current=last_coil[0], xtol_A=xtol_A)
+                seed_current=last_coil[0], ftol_mhz=ftol_mhz,
+                xtol_A=_xtol_A(ftol_mhz, last_coil[0]))
             last_coil[0] = coil
             return coil, iso, converged, misfit
 
@@ -484,9 +510,9 @@ class CyclotronOptimizer:
             def residual(x_norm):
                 nonlocal plotter
                 x_norm = np.asarray(x_norm, dtype=float)
-                self.comm.bcast((x_norm, loose_xtol_A), root=0)   # ranks 1+ evaluate this shim vector
+                self.comm.bcast((x_norm, loose_ftol_mhz), root=0)   # ranks 1+ evaluate this shim vector
                 t0 = _time.time()
-                coil, iso, converged, misfit = _evaluate(x_norm, loose_xtol_A)
+                coil, iso, converged, misfit = _evaluate(x_norm, loose_ftol_mhz)
                 self.iteration_count += 1
                 f = np.asarray(iso['rev_frequencies_mhz'], dtype=float)
                 # Shared weighted residual (flatness + smoothness + convergence + magnitude).
@@ -505,18 +531,35 @@ class CyclotronOptimizer:
                                 bz=np.asarray(iso['bz_for_plot'], dtype=float), freq=f.copy())
                 self._write_diagnostics_row(
                     0, 0, self.iteration_count,
-                    {'avg_f': iso['mean_freq_mhz'], 'flatness': iso['std_dev_mhz'],
+                    {'avg_f': iso['mean_freq_mhz'], 'coil_A': coil,
+                     'flatness': iso['std_dev_mhz'],
                      'regularization': score['regularization'], 'objective': obj,
                      'roughness_side': score['roughness_side'],
                      'roughness_top': score['roughness_top'],
+                     'roughness_neutral': score['roughness_neutral'],
+                     'roughness_active': score['roughness_active'],
                      'smoothness_residual_l2': score['smoothness_residual_l2'],
+                     'nu_z_peak': score['nu_z_peak'],
+                     'walkinshaw_min': score['walkinshaw_min'],
+                     'nu_z_sq_min': score['nu_z_sq_min'],
+                     'tune_penalty_l2': score['tune_penalty_l2'],
+                     'phi_max_deg': score['phi_max_deg'],
+                     'phase_margin': score['phase_margin'],
+                     'n_turns': score['n_turns'],
                      'convergence_penalty': score['convergence_penalty'],
                      'converged': converged, 'misfit': misfit,
                      'eval_seconds': _time.time() - t0},
                     side_full, top_full)
                 if self.verbosity >= 1:
+                    # Resonance margins print on every tune-bearing eval, barriers on
+                    # or off -- they are NaN for iso methods that produce no tunes.
                     print(f"  [DFO-LS eval {self.iteration_count}] coil={coil:.0f}A "
                           f"flatness={iso['std_dev_mhz']:.5f} MHz smooth={score['smoothness_residual_l2']:.4f} "
+                          f"(rough neutral/active={score['roughness_neutral']:.3f}/"
+                          f"{score['roughness_active']:.3f}) "
+                          f"nu_z<={score['nu_z_peak']:.3f} walk={score['walkinshaw_min']:.3f} "
+                          f"tune_pen={score['tune_penalty_l2']:.4f} "
+                          f"Phi_max={score['phi_max_deg']:.2f}deg "
                           f"||r||={nrm:.5f} (best {best['norm']:.5f})", flush=True)
                 if plotter is not None:
                     try:
@@ -563,8 +606,8 @@ class CyclotronOptimizer:
             soln = dfols.solve(residual, x0, **solve_kwargs)
             # Final high-accuracy coil match at the best shims -> production current + flatness.
             if best['x'] is not None:
-                self.comm.bcast((np.asarray(best['x'], dtype=float), final_xtol_A), root=0)
-                coil_f, iso_f, _, _ = _evaluate(np.asarray(best['x'], dtype=float), final_xtol_A)
+                self.comm.bcast((np.asarray(best['x'], dtype=float), final_ftol_mhz), root=0)
+                coil_f, iso_f, _, _ = _evaluate(np.asarray(best['x'], dtype=float), final_ftol_mhz)
                 best.update(coil=coil_f, flatness=iso_f['std_dev_mhz'])
             self.comm.bcast(None, root=0)   # stop ranks 1+
             if self.verbosity >= 1:
@@ -579,14 +622,257 @@ class CyclotronOptimizer:
                 msg = self.comm.bcast(None, root=0)
                 if msg is None:
                     break
-                x_norm, xtol_A = msg
-                _evaluate(np.asarray(x_norm, dtype=float), xtol_A)
+                x_norm, ftol_mhz = msg
+                _evaluate(np.asarray(x_norm, dtype=float), ftol_mhz)
 
         solver.dispose()
 
         best_x = self.comm.bcast(best['x'] if self.rank <= 0 else None, root=0)
         best_coil = self.comm.bcast(best['coil'] if self.rank <= 0 else None, root=0)
         best_flatness = self.comm.bcast(best['flatness'] if self.rank <= 0 else None, root=0)
+
+        best_side, best_top = _split(lo + np.asarray(best_x, dtype=float) * (hi - lo))
+        return {
+            'best_side_shims': best_side,
+            'best_top_shims': best_top,
+            'flatness_phase1': -1,
+            'flatness_phase2': best_flatness,
+            'optimal_coil': best_coil,
+            'coil_error': -1,
+            'n_coil_evals': 0,
+            'diagnostics_file': self.diagnostics_file if self.rank <= 0 else None,
+        }
+
+    def optimize_matrix_shim(self) -> Dict:
+        """Response-matrix shimming (optimizer: 'matrix-full' | 'matrix-reduced').
+
+        Probes the sensitivity matrix around x0 at FIXED coil current, then
+        iterates regularized linear steps, each followed by ONE coil-matched
+        evaluation scored with the SAME shared objective as DFO-LS. Optional
+        Broyden secant updates track saturation drift for free. Algorithm in
+        optimization/matrix_shim.py (pure, unit-tested); this method provides
+        the MPI/solver wiring and the diagnostics CSV rows.
+
+        The problem setup below deliberately DUPLICATES the DFO-LS setup
+        (blocks / x0 precedence / bounds / _split) rather than refactoring it
+        out -- the DFO-LS path is production and stays untouched.
+        """
+        from cyclotron_optimizer.optimization.matrix_shim import (
+            MatrixShimOptions, run_matrix_shim, smoothness_operator)
+        from cyclotron_optimizer.optimization.objective_function import (
+            _tune_barrier_weights)
+        import time as _time
+
+        cfg = self.config
+        opt = cfg.optimization
+        mode = 'reduced' if 'reduced' in (opt.optimizer or '').lower() else 'full'
+        species = IonSpecies(cfg.particle_species)
+        target = cfg.optimization.target_frequency_mhz
+        bracket = (opt.coil_current_min_A, opt.coil_current_max_A)
+        seed_current = opt.reference_coil_current
+        loose_ftol_mhz = float(getattr(opt, 'coil_match_tol_mhz', 0.05))
+        final_ftol_mhz = float(opt.frequency_tolerance_mhz)
+
+        def _xtol_A(ftol_mhz, current):
+            return max(1e-4, ftol_mhz * float(current) / target)
+
+        n_seg = cfg.side_shim.num_rad_segments
+        n = n_seg + 1
+
+        # -- which blocks (same rules as DFO-LS: respect opt_side/opt_top,
+        #    force include for optimized blocks) --
+        blocks = [b for b, flag in (('side', opt.opt_side),
+                                    ('top', opt.opt_top)) if flag]
+        if not blocks:
+            blocks = ['side', 'top']
+        if 'side' in blocks and not cfg.side_shim.include:
+            cfg.side_shim.include = True
+        if 'top' in blocks and not cfg.top_shim.include:
+            cfg.top_shim.include = True
+
+        if (getattr(opt, 'opt_shim_radius_min_mm', None) is not None
+                or getattr(opt, 'opt_shim_radius_max_mm', None) is not None):
+            raise NotImplementedError(
+                "matrix shimming does not support opt_shim_radius_min/max_mm yet; "
+                "unset them or use optimizer: dfo-ls for radial sub-range runs")
+
+        side_fixed = (np.array(cfg.side_shim.side_offsets_deg, dtype=float)
+                      if cfg.side_shim.side_offsets_deg is not None
+                      else np.full(n, cfg.side_shim.default_offset_deg))
+        top_fixed = (np.array(cfg.top_shim.top_offsets_mm, dtype=float)
+                     if cfg.top_shim.top_offsets_mm is not None
+                     else np.full(n, cfg.top_shim.default_offset_mm))
+        s_lo, s_hi = opt.side_shim_min_deg, opt.side_shim_max_deg
+        t_lo, t_hi = opt.top_shim_min_mm, opt.top_shim_max_mm
+
+        # x0 precedence: x0_from_config > precondition > config offsets.
+        if getattr(opt, 'x0_from_config', False):
+            side_pre, top_pre = side_fixed, top_fixed
+        elif getattr(opt, 'precondition', False):
+            side_pre, top_pre = physics_precondition_offsets(cfg, n_iso_levers=len(blocks))
+        else:
+            side_pre, top_pre = side_fixed, top_fixed
+        side_base = np.asarray(side_pre if 'side' in blocks else side_fixed, dtype=float)
+        top_base = np.asarray(top_pre if 'top' in blocks else top_fixed, dtype=float)
+
+        lo_list, hi_list, x0p = [], [], []
+        if 'side' in blocks:
+            lo_list += [s_lo] * n; hi_list += [s_hi] * n
+            x0p += list(np.clip(side_base, s_lo, s_hi))
+        if 'top' in blocks:
+            lo_list += [t_lo] * n; hi_list += [t_hi] * n
+            x0p += list(np.clip(top_base, t_lo, t_hi))
+        lo = np.array(lo_list, dtype=float)
+        hi = np.array(hi_list, dtype=float)
+        x0 = np.clip((np.array(x0p, dtype=float) - lo) / (hi - lo), 0.0, 1.0)
+
+        def _split(x_phys):
+            side, top, i = side_base.copy(), top_base.copy(), 0
+            if 'side' in blocks:
+                side[:] = x_phys[i:i + n]; i += n
+            if 'top' in blocks:
+                top[:] = x_phys[i:i + n]
+            return side, top
+
+        options = MatrixShimOptions(
+            mode=mode,
+            basis_size=int(getattr(opt, 'matrix_basis_size', 8) or 8),
+            probe_delta=float(getattr(opt, 'matrix_probe_delta', 0.05) or 0.05),
+            relaxation=float(getattr(opt, 'matrix_relaxation', 0.7) or 0.7),
+            max_outer=int(getattr(opt, 'matrix_max_outer', 10) or 10),
+            ftol_rel=float(getattr(opt, 'matrix_ftol_rel', 0.01) or 0.01),
+            broyden=bool(getattr(opt, 'matrix_broyden', False)),
+        )
+
+        solver = ReusableCyclotronSolver(cfg, self.radii_mm, rank=self.rank,
+                                         comm=self.comm, verbosity=self.verbosity)
+        last_coil = [seed_current]
+
+        def _evaluate(x_norm, ftol_mhz):
+            side, top = _split(lo + np.asarray(x_norm, float) * (hi - lo))
+            pole = PoleShape(n_seg, side_offsets=side, top_offsets=top)
+            # Geometry only: the coil solve's first secant point IS
+            # last_coil[0]; build's fused solve would duplicate it exactly.
+            solver.build(pole, last_coil[0], solve=False)
+            coil, iso, converged, misfit = solve_coil_for_target_frequency(
+                solver, cfg, species, target, bracket,
+                rank=self.rank, comm=self.comm, verbosity=self.verbosity,
+                seed_current=last_coil[0], ftol_mhz=ftol_mhz,
+                xtol_A=_xtol_A(ftol_mhz, last_coil[0]))
+            last_coil[0] = coil
+            return coil, iso, converged, misfit
+
+        def _probe_solve(x_norm, current):
+            """Fixed-coil solve; returns iso on rank 0 (None elsewhere)."""
+            side, top = _split(lo + np.asarray(x_norm, float) * (hi - lo))
+            pole = PoleShape(n_seg, side_offsets=side, top_offsets=top)
+            # Geometry only: resolve_at_current below does THE one solve.
+            solver.build(pole, current, solve=False)
+            _, bz, converged, misfit = solver.resolve_at_current(current)
+            iso = None
+            if self.rank <= 0 and bz is not None:
+                iso = compute_isochronism(cfg.field_evaluation.iso_method, bz,
+                                          solver.radii_mm, cfg, species,
+                                          rank=self.rank, comm=self.comm)
+            return iso, converged, misfit
+
+        result_holder = {}
+        if self.rank <= 0:
+            self.iteration_count = 0
+            if self.verbosity >= 1:
+                print(f"\n{'=' * 100}\nRESPONSE-MATRIX SHIM OPTIMIZATION "
+                      f"({mode}, {len(blocks) * n} params, broyden={options.broyden})"
+                      f"\n{'=' * 100}\n", flush=True)
+            if _tune_barrier_weights(cfg) is not None and self.verbosity >= 1:
+                print("[matrix] NOTE: resonance barriers are enabled; the LINEAR "
+                      "step ignores them (they still score every iterate). If a "
+                      "step walks into a barrier the objective will show it.",
+                      flush=True)
+
+            def _log_row(kind, coil, iso, converged, misfit, x_norm, t0):
+                """Score + CSV row, marking probes with multistart=1."""
+                obj, score = compute_objective(iso, np.asarray(x_norm, float),
+                                               blocks, lo, hi, converged, misfit, cfg)
+                self.iteration_count += 1
+                side, top = _split(lo + np.asarray(x_norm, float) * (hi - lo))
+                row = {'avg_f': iso['mean_freq_mhz'], 'coil_A': coil,
+                       'flatness': iso['std_dev_mhz'],
+                       'regularization': score['regularization'], 'objective': obj,
+                       'converged': converged, 'misfit': misfit,
+                       'eval_seconds': _time.time() - t0}
+                for key in ('roughness_side', 'roughness_top', 'roughness_neutral',
+                            'roughness_active', 'smoothness_residual_l2',
+                            'nu_z_peak', 'walkinshaw_min', 'nu_z_sq_min',
+                            'tune_penalty_l2', 'phi_max_deg', 'phase_margin',
+                            'n_turns', 'convergence_penalty'):
+                    row[key] = score[key]
+                self._write_diagnostics_row(0, 1 if kind == 'probe' else 0,
+                                            self.iteration_count, row, side, top)
+                return obj, score
+
+            def evaluate_fn(x_norm):
+                self.comm.bcast(('eval', np.asarray(x_norm, float), loose_ftol_mhz), root=0)
+                t0 = _time.time()
+                coil, iso, converged, misfit = _evaluate(x_norm, loose_ftol_mhz)
+                evaluate_fn._pending = (coil, iso, converged, misfit, t0)
+                return coil, iso, converged, misfit
+
+            def score_fn(x_norm, iso, converged, misfit):
+                coil, _, _, _, t0 = evaluate_fn._pending
+                obj, score = _log_row('eval', coil, iso, converged, misfit, x_norm, t0)
+                if self.verbosity >= 1:
+                    print(f"  [matrix eval {self.iteration_count}] coil={coil:.0f}A "
+                          f"flatness={iso['std_dev_mhz']:.5f} MHz "
+                          f"Phi_max={score['phi_max_deg']:.2f}deg "
+                          f"obj={obj:.6f}", flush=True)
+                return obj, score
+
+            def probe_fn(x_norm):
+                current = last_coil[0]
+                self.comm.bcast(('probe', np.asarray(x_norm, float), current), root=0)
+                t0 = _time.time()
+                iso, converged, misfit = _probe_solve(x_norm, current)
+                _log_row('probe', current, iso, converged, misfit, x_norm, t0)
+                if self.verbosity >= 1:
+                    print(f"  [matrix probe {self.iteration_count}] I={current:.0f}A "
+                          f"(fixed)", flush=True)
+                return np.asarray(iso['rev_frequencies_mhz'], dtype=float)
+
+            try:
+                S = smoothness_operator(blocks, n, cfg)
+                res = run_matrix_shim(evaluate_fn, probe_fn, score_fn, x0, S,
+                                      blocks, n, options)
+                # Final high-accuracy coil match at the best design.
+                self.comm.bcast(('eval', np.asarray(res['best_x'], float),
+                                 final_ftol_mhz), root=0)
+                coil_f, iso_f, conv_f, mis_f = _evaluate(res['best_x'], final_ftol_mhz)
+                _log_row('eval', coil_f, iso_f, conv_f, mis_f, res['best_x'], _time.time())
+                res['best_coil'] = coil_f
+                res['best_flatness'] = iso_f['std_dev_mhz']
+                if self.verbosity >= 1:
+                    print(f"\nMatrix shimming finished: {res['n_probes']} probe + "
+                          f"{res['n_evaluations']} evaluation solves; final tight "
+                          f"match coil={coil_f:.0f}A, "
+                          f"flatness={iso_f['std_dev_mhz']:.5f} MHz", flush=True)
+                result_holder = res
+            finally:
+                self.comm.bcast(None, root=0)   # ALWAYS release ranks 1+
+        else:
+            while True:
+                msg = self.comm.bcast(None, root=0)
+                if msg is None:
+                    break
+                kind = msg[0]
+                if kind == 'eval':
+                    _evaluate(np.asarray(msg[1], float), msg[2])
+                elif kind == 'probe':
+                    _probe_solve(np.asarray(msg[1], float), msg[2])
+
+        solver.dispose()
+
+        best_x = self.comm.bcast(result_holder.get('best_x') if self.rank <= 0 else None, root=0)
+        best_coil = self.comm.bcast(result_holder.get('best_coil') if self.rank <= 0 else None, root=0)
+        best_flatness = self.comm.bcast(result_holder.get('best_flatness') if self.rank <= 0 else None, root=0)
 
         best_side, best_top = _split(lo + np.asarray(best_x, dtype=float) * (hi - lo))
         return {

@@ -36,6 +36,7 @@ from cyclotron_optimizer.geometry.geometry import (assemble_iron, build_coils,
 from cyclotron_optimizer.geometry.pole_shape import PoleShape
 from cyclotron_optimizer.geometry.symmetry import (
     SymmetryTuple,
+    azimuthal_fold,
     azimuthal_sector,
     canonical_symmetry_set,
     collect_field_symmetries,
@@ -79,10 +80,17 @@ class RZFieldGrid(NamedTuple):
     ``angles`` may span less than the full circle when the field's symmetry
     allowed folding (e.g. [0, pi/4) for the 8-fold cyclotron); consumers
     (core.isochronicity) read the angles from here instead of re-deriving them.
+    ``period`` (2 pi / n_rot) and ``mirror`` describe that fold so the closed-
+    orbit method can unfold the sector: with ``mirror`` the samples cover the
+    half period [0, period/2] (endpoint included when queried with
+    ``mirror_endpoint=True``, which the dense grid does), otherwise one full
+    period with endpoint=False.
     """
     bz: np.ndarray        # (n_radii, n_angles)
     angles: np.ndarray    # (n_angles,) [rad]
     radii_mm: np.ndarray  # (n_radii,)
+    period: float = 2.0 * np.pi   # rotational period of the field [rad]
+    mirror: bool = False          # sector is the mirror-folded half period
 
 
 class _SourceGroup(NamedTuple):
@@ -432,27 +440,36 @@ def get_field_rz(component: ComponentOrId,
                  rank: int = 0,
                  comm=None,
                  verbosity: int = 1,
-                 use_gpu: bool = True) -> Optional[RZFieldGrid]:
+                 use_gpu: bool = True,
+                 mirror_endpoint: bool = False) -> Optional[RZFieldGrid]:
     """Bz on midplane circles at the given radii (isochronism input).
 
     The azimuthal fundamental sector is derived from the component's declared
     symmetries (pi/4 for the 8-fold cyclotron, full circle when no usable
     symmetry, e.g. with the extraction channel present); ``num_angles`` is the
     full-circle-equivalent count, so the effective angular resolution is
-    independent of the fold.
+    independent of the fold. With ``mirror_endpoint`` a mirror-folded sector
+    also samples its closing mirror plane (theta = sector), which the
+    closed-orbit unfolding needs.
 
-    :return: RZFieldGrid(bz (Nr, Ntheta), angles, radii_mm) on rank 0, None on
-        other ranks.
+    :return: RZFieldGrid(bz (Nr, Ntheta), angles, radii_mm, period, mirror) on
+        rank 0, None on other ranks.
     """
     radii = np.atleast_1d(np.asarray(radii_mm, dtype=float))
 
     syms: List[SymmetryTuple] = []
     if use_symmetry and not isinstance(component, (int, np.integer)):
         syms = collect_field_symmetries(component)
-    sector = azimuthal_sector(syms)
+    n_rot, mirror0 = azimuthal_fold(symmetry_group(syms))
+    period = 2.0 * np.pi / n_rot
+    sector = period / 2.0 if mirror0 else period
 
     n_ang = max(1, int(round(num_angles * sector / (2.0 * np.pi))))
-    angles = np.linspace(0.0, sector, n_ang, endpoint=False)
+    if mirror0 and mirror_endpoint:
+        angles = np.linspace(0.0, sector, n_ang + 1, endpoint=True)
+        n_ang += 1
+    else:
+        angles = np.linspace(0.0, sector, n_ang, endpoint=False)
 
     if rank <= 0 and verbosity >= 1:
         print(f"Calculating Bz on {len(radii)} circles "
@@ -475,7 +492,77 @@ def get_field_rz(component: ComponentOrId,
 
     return RZFieldGrid(bz=bz_flat.reshape(len(radii), n_ang),
                        angles=angles,
-                       radii_mm=radii)
+                       radii_mm=radii,
+                       period=period,
+                       mirror=mirror0)
+
+
+def dense_radii_mm(radii_mm, step_mm: float = 2.0, margin: float = 0.15) -> np.ndarray:
+    """Radial grid for the closed-orbit method: covers the evaluation radii
+    with ``margin`` (fraction) to spare on both sides -- the scalloped orbit
+    reaches ~ +7 % / -6 % of its mean radius in the hills / valleys -- at
+    ``step_mm`` spacing (cubic-spline lookup; 2 mm reproduces a 1 mm
+    Cartesian map to < 1e-6 in f_rev)."""
+    radii = np.atleast_1d(np.asarray(radii_mm, dtype=float))
+    r_lo = max(step_mm, (1.0 - margin) * radii.min())
+    r_hi = (1.0 + margin) * radii.max()
+    n = int(np.ceil((r_hi - r_lo) / step_mm)) + 1
+    return r_lo + step_mm * np.arange(n)
+
+
+def get_field_rz_dense(component: ComponentOrId,
+                       radii_mm,
+                       num_angles: int = 720,
+                       *,
+                       step_mm: float = 2.0,
+                       margin: float = 0.15,
+                       use_symmetry: bool = True,
+                       rank: int = 0,
+                       comm=None,
+                       verbosity: int = 1,
+                       use_gpu: bool = True) -> Optional[RZFieldGrid]:
+    """Dense polar Bz grid around the evaluation radii for the closed-orbit
+    ('gordon') isochronism method: ``dense_radii_mm(radii_mm, step_mm,
+    margin)`` circles x ``num_angles`` full-circle-equivalent angles over the
+    symmetry sector (mirror plane sample included). ~40k points for the
+    60 MeV machine at 2 mm / 720 angles -- a few seconds on the GPU."""
+    return get_field_rz(component, dense_radii_mm(radii_mm, step_mm, margin),
+                        num_angles, use_symmetry=use_symmetry, rank=rank,
+                        comm=comm, verbosity=verbosity, use_gpu=use_gpu,
+                        mirror_endpoint=True)
+
+
+def query_iso_field(component: ComponentOrId, config: CyclotronConfig, radii_mm, *,
+                    use_gpu: bool = True, rank: int = 0, comm=None, verbosity: int = 1):
+    """Field query matching ``config.field_evaluation.iso_method``:
+
+      seo               median-plane Field map (median_plane_limit/resolution)
+      gordon            dense polar RZFieldGrid (eo_radial_step_mm / eo_radial_margin /
+                        eo_num_points_circle)
+      circle, gordon_analytic  sparse RZFieldGrid at the evaluation radii
+
+    Collective; data on rank 0 only."""
+    fe = config.field_evaluation
+    method = (fe.iso_method or 'circle').lower()
+    if method == 'seo':
+        return get_median_plane_field(
+            component,
+            limit_mm=fe.median_plane_limit_mm,
+            resolution_mm=fe.median_plane_resolution_mm,
+            use_symmetry=fe.use_symmetry, use_gpu=use_gpu,
+            rank=rank, comm=comm, verbosity=verbosity)
+    if method == 'gordon':
+        return get_field_rz_dense(
+            component, radii_mm,
+            int(getattr(fe, 'eo_num_points_circle', None) or fe.num_points_circle),
+            step_mm=float(getattr(fe, 'eo_radial_step_mm', None) or 2.0),
+            margin=float(getattr(fe, 'eo_radial_margin', None) or 0.15),
+            use_symmetry=fe.use_symmetry, use_gpu=use_gpu,
+            rank=rank, comm=comm, verbosity=verbosity)
+    return get_field_rz(
+        component, radii_mm, fe.num_points_circle,
+        use_symmetry=fe.use_symmetry, use_gpu=use_gpu,
+        rank=rank, comm=comm, verbosity=verbosity)
 
 
 # ---------------------------------------------------------------------------
@@ -649,8 +736,8 @@ class ReusableCyclotronSolver:
         return self._cyclotron
 
     def build(self, pole_shape, coil_current, *, query=True,
-              reuse_static_iron=True):
-        """(Re)build for new shims, then solve.
+              reuse_static_iron=True, solve=True):
+        """(Re)build for new shims, then (by default) solve.
 
         On the first call (or with reuse_static_iron=False) everything is
         built from scratch. On subsequent calls the static components
@@ -662,6 +749,16 @@ class ReusableCyclotronSolver:
         query=False skips the post-relaxation field evaluation (bz_values in
         the returned tuple is None) -- used by the Session/Model facade, which
         queries fields on demand instead.
+
+        solve=False rebuilds the GEOMETRY ONLY and returns
+        (radii_mm, None, None, None): no coils, no RlxPre, no relaxation.
+        Use it when the next call is resolve_at_current() / a coil solve --
+        the pattern ``build(pole, I); resolve_at_current(I)`` otherwise solves
+        the SAME state twice back to back (each optimizer evaluation and each
+        sensitivity probe paid one full redundant IM assembly + relaxation +
+        field query). After solve=False the next resolve must be COLD (the
+        default): any retained magnetization belongs to the OLD pole shape,
+        and only zero_magnetization makes the result rebuild-identical.
         """
         say = self.rank <= 0 and self.verbosity >= 1
 
@@ -716,6 +813,8 @@ class ReusableCyclotronSolver:
             rank=self.rank, verbosity=self.verbosity,
             split_perturbative=True)
         self._iron_subs = [*self._main_subs, *self._perturb_subs]
+        if not solve:
+            return self.radii_mm, None, None, None
         return self._solve_and_query(coil_current,
                                      zero_magnetization=zero_magnetization,
                                      query=query)
@@ -934,20 +1033,10 @@ class ReusableCyclotronSolver:
         return worst, worst <= prec
 
     def _query(self, converged, misfit):
-        fe = self.config.field_evaluation
-        if fe.iso_method != "seo":
-            bz_values = get_field_rz(
-                self._cyclotron, self.radii_mm, fe.num_points_circle,
-                use_symmetry=fe.use_symmetry, use_gpu=self.gpu.field,
-                rank=self.rank, comm=self.comm, verbosity=self.verbosity)
-        else:
-            bz_values = get_median_plane_field(
-                self._cyclotron,
-                limit_mm=fe.median_plane_limit_mm,
-                resolution_mm=fe.median_plane_resolution_mm,
-                use_symmetry=fe.use_symmetry, use_gpu=self.gpu.field,
-                rank=self.rank, comm=self.comm, verbosity=self.verbosity)
-
+        bz_values = query_iso_field(
+            self._cyclotron, self.config, self.radii_mm,
+            use_gpu=self.gpu.field, rank=self.rank, comm=self.comm,
+            verbosity=self.verbosity)
         return self.radii_mm, bz_values, converged, misfit
 
 
@@ -972,8 +1061,8 @@ def evaluate_radii_parallel(config: CyclotronConfig,
     :param comm: MPI communicator
     :param verbosity: 0 silent, 1 normal, 2 debug
     :return: Tuple (radii_mm, bz_values, converged, cyclotron, misfit).
-        bz_values is an RZFieldGrid (circle/gordon) or a PyPATools Field (seo)
-        on rank 0, None on other ranks; cyclotron is the assembled
+        bz_values is an RZFieldGrid (circle/gordon_analytic; dense for gordon)
+        or a PyPATools Field (seo) on rank 0, None on other ranks; cyclotron is the assembled
         BaseRadiaComponent (use .id for the radia object id); misfit is the
         achieved relaxation misfit (valid on all ranks).
     """

@@ -233,11 +233,11 @@ def run(rank: int = 0, comm=None, verbosity: int = 1, run_optimization: bool = F
     mean_freq_mhz = std_dev_mhz = percent_dev = None
     tunes = None
 
-    # bz_values is a (Nr, Ntheta) array for circle/gordon or a PyPATools Field for seo,
+    # bz_values is an RZFieldGrid for circle/gordon/gordon_analytic or a PyPATools Field for seo,
     # and is None on non-root ranks -- so test identity, not len().
     if rank <= 0 and bz_values is not None:
         with Timer("Compute isochronism", rank, verbosity):
-            # Single dispatch for circle / gordon / seo (see core.isochronicity).
+            # Single dispatch for circle / gordon / gordon_analytic / seo (see core.isochronicity).
             # SEO solver knob: 'newton' (full-turn fixed point, no residual betatron),
             # 'symmetric' (mirror-plane shooting), or 'centroid' (legacy averaging).
             iso = compute_isochronism(

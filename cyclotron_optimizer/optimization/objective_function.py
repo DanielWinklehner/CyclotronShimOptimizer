@@ -24,6 +24,16 @@ from scipy.optimize import minimize_scalar, brentq, newton
 # unit-tested without a field solve (test/test_residual_builder.py).
 # ---------------------------------------------------------------------------
 
+# Scalar diagnostics that compute_objective produces and the MPI evaluate wrapper
+# forwards verbatim (broadcast as one dict; see evaluate_cyclotron_objective_simplified).
+_PASSTHROUGH_DIAGNOSTICS = (
+    'roughness_side', 'roughness_top', 'roughness_neutral', 'roughness_active',
+    'smoothness_residual_l2',
+    'nu_z_peak', 'walkinshaw_min', 'nu_z_sq_min', 'tune_penalty_l2',
+    'phi_max_deg', 'phase_margin', 'n_turns',
+)
+
+
 def second_difference(v: np.ndarray) -> np.ndarray:
     """Discrete second difference D2(v)[i] = v[i-1] - 2 v[i] + v[i+1].
 
@@ -46,6 +56,219 @@ def _smoothness_weights(config) -> "tuple[float, float]":
     w_top = getattr(opt, 'smoothness_weight_top', None)
     return (base if w_side is None else float(w_side),
             base if w_top is None else float(w_top))
+
+
+def field_basis_profiles(side_norm, top_norm, rho: float):
+    """Rotate a (side, top) normalized shim pair into the FIELD basis.
+
+    Both shim blocks are first-order levers on the azimuthally averaged field:
+    the side shim through the hill duty cycle, the top shim through the gap (see
+    ``physics_precondition_offsets``). Isochronism constrains only ONE function
+    of radius, <B>(r), so the pair is rank-deficient BY CONSTRUCTION and the
+    optimizer is free to wander along a field-neutral direction -- which is what
+    produces a dip in one profile cancelled by a bulge in the other at the same
+    radius.
+
+    With a = d<B>/d(side_norm), b = d<B>/d(top_norm) and ``rho`` = a / b, the
+    field-neutral direction is (1, -rho) (raise the side, lower the top, no net
+    <B> change) and the field-active direction is (rho, 1). They are orthogonal,
+    so projecting onto the unit vectors gives
+
+        neutral = (side - rho * top) / sqrt(1 + rho^2)     <B>-invariant
+        active  = (rho * side + top) / sqrt(1 + rho^2)     carries all of <B>
+
+    Penalizing D2(neutral) HARD and D2(active) LIGHTLY forbids the two profiles
+    from curving AGAINST each other while letting them curve TOGETHER as much as
+    the isochronism target demands -- i.e. SVD truncation done in a physics
+    basis, rather than the per-block D2 that cannot tell the two apart and so
+    spends its budget taxing legitimate curvature.
+
+    Because the rotation is orthonormal and D2 is linear,
+    ``||D2(neutral)||^2 + ||D2(active)||^2 == ||D2(side)||^2 + ||D2(top)||^2``,
+    so EQUAL weights reproduce the per-block penalty exactly (unit-tested).
+
+    :param rho: a / b, the normalized-unit exchange ratio. 1.0 means one full
+        normalized side unit and one full normalized top unit move <B> equally
+        (roughly true when the two bound RANGES are chosen to have comparable
+        field authority); measure it with two finite differences rather than
+        assuming -- see examples/measure_shim_exchange_ratio.py.
+    """
+    s = np.asarray(side_norm, dtype=float)
+    t = np.asarray(top_norm, dtype=float)
+    k = 1.0 / np.hypot(1.0, rho)
+    return (s - rho * t) * k, (rho * s + t) * k
+
+
+def _coupling_params(config):
+    """(w_neutral, w_active, rho) for the field-basis penalty, or None.
+
+    None (both weights unset) keeps the per-block D2 behavior bit-for-bit. An
+    unset weight on ONE side falls back to ``smoothness_weight``, matching how
+    smoothness_weight_side/top behave.
+    """
+    opt = config.optimization
+    w_neutral = getattr(opt, 'smoothness_weight_neutral', None)
+    w_active = getattr(opt, 'smoothness_weight_active', None)
+    if w_neutral is None and w_active is None:
+        return None
+    base = getattr(opt, 'smoothness_weight', 0.0) or 0.0
+    rho = getattr(opt, 'smoothness_exchange_ratio', 1.0)
+    rho = 1.0 if rho is None else float(rho)
+    return (base if w_neutral is None else float(w_neutral),
+            base if w_active is None else float(w_active),
+            rho)
+
+
+def _coupled_profiles(prof, config):
+    """(neutral, active, w_neutral, w_active) when the field basis applies, else None.
+
+    Applies only when BOTH blocks are being scored and their profiles have the
+    same length -- otherwise there is no pair to rotate and the per-block path
+    is the only meaningful one.
+    """
+    coupling = _coupling_params(config)
+    if coupling is None or 'side' not in prof or 'top' not in prof:
+        return None
+    if len(prof['side']) != len(prof['top']):
+        return None
+    w_neutral, w_active, rho = coupling
+    neutral, active = field_basis_profiles(prof['side'], prof['top'], rho)
+    return neutral, active, w_neutral, w_active
+
+
+def _tune_barrier_weights(config):
+    """(w_ceiling, w_walkinshaw, w_floor) or None when every barrier is off.
+
+    All three default to 0, so the resonance barriers are strictly OPT-IN and an
+    existing config is unaffected bit for bit.
+    """
+    opt = config.optimization
+    w_ceil = getattr(opt, 'nu_z_ceiling_weight', 0.0) or 0.0
+    w_walk = getattr(opt, 'walkinshaw_weight', 0.0) or 0.0
+    w_floor = getattr(opt, 'nu_z_floor_weight', 0.0) or 0.0
+    if not (w_ceil or w_walk or w_floor):
+        return None
+    return float(w_ceil), float(w_walk), float(w_floor)
+
+
+def safe_nu_z(tunes) -> np.ndarray:
+    """nu_z with the vertically-unstable radii mapped to 0 instead of NaN.
+
+    ``isochronicity`` deliberately returns nu_z = NaN wherever nu_z^2 < 0 (no
+    real vertical oscillation) and keeps the SIGNED nu_z_sq alongside it. A
+    single NaN anywhere in a DFO-LS residual destroys its interpolation model
+    for the rest of the run, so every barrier below is computed from
+    ``sqrt(max(nu_z_sq, 0))`` rather than from nu_z itself.
+
+    Mapping the unstable radii to 0 is not a fudge -- it is the correct limit
+    for the two UPPER barriers (a radius with no vertical focusing at all is
+    infinitely far below a resonance ceiling), and that state is what the
+    separate nu_z^2 FLOOR term exists to catch.
+    """
+    nu_z_sq = np.asarray(tunes['nu_z_sq'], dtype=float)
+    nu_z_sq = np.nan_to_num(nu_z_sq, nan=0.0, posinf=0.0, neginf=0.0)
+    return np.sqrt(np.clip(nu_z_sq, 0.0, None))
+
+
+def tune_barriers(iso: Dict, config) -> "list[np.ndarray]":
+    """Weighted one-sided betatron-resonance barriers; [] when all weights are 0.
+
+    WHY CEILINGS AND NOT A REWARD. The obvious way to give the side shim its own
+    physics target is to REWARD vertical focusing (maximize nu_z, breaking the
+    side/top isochronism degeneracy from ``field_basis_profiles``). Measurement
+    on the muon design killed that idea: nu_z peaks at 0.4804 at r = 294 mm --
+    0.0196 from the nu_z = 1/2 half-integer and 0.0639 from Walkinshaw
+    (nu_r = 2 nu_z), with nu_z^2 > 0 everywhere. Vertical focusing is ABUNDANT
+    in this machine, not scarce, so a maximize-nu_z term would have driven the
+    design straight INTO those resonances. What the objective was missing is an
+    upper guard rail, which nothing was watching.
+
+    Three barriers, each length n_eval_pts, each 0 when satisfied:
+
+        w_ceiling * max(0, nu_z - nu_z_max)              stay off nu_z = 1/2
+        w_walk    * max(0, delta_W - (nu_r - 2 nu_z))    stay off nu_r = 2 nu_z
+        w_floor   * max(0, nu_z_sq_min - nu_z_sq)        stay vertically stable
+
+    NOTE the first two overlap heavily HERE and that is expected: isochronism
+    pins nu_r = gamma (verified to 1.7% worst-case on this design), so the
+    Walkinshaw term is really a RADIUS-DEPENDENT nu_z ceiling at
+    (gamma(r) - delta_W)/2, while nu_z_max is a flat one. Walkinshaw is the more
+    physical of the two and adapts as gamma rises; the flat ceiling is the guard
+    against the half-integer, which sits just below it. Enabling both is mild
+    double-counting rather than a conflict -- weight one as primary.
+
+    The floor is written on nu_z^2, NOT on nu_z, so it stays finite and signed
+    through the instability it is meant to detect (see ``safe_nu_z``).
+
+    Each barrier is a PLAIN hinge, not the ``sqrt(hinge)`` used by the
+    convergence gate. Squaring a plain hinge gives a penalty whose value AND
+    slope are both zero at the threshold, so an inactive barrier perturbs
+    DFO-LS's model not at all and a newly active one engages smoothly; the
+    convergence gate uses sqrt precisely because it wants the opposite (a
+    penalty linear in the shortfall after squaring).
+
+    :raises ValueError: if a barrier is enabled but the configured
+        ``iso_method`` produces no tunes ('gordon' and 'gordon_analytic' do) -- failing
+        loudly beats silently dropping a safety constraint.
+    """
+    weights = _tune_barrier_weights(config)
+    if weights is None:
+        return []
+    w_ceil, w_walk, w_floor = weights
+
+    tunes = iso.get('tunes')
+    if not tunes or 'nu_z_sq' not in tunes:
+        method = getattr(getattr(config, 'field_evaluation', None),
+                         'iso_method', '<unknown>')
+        raise ValueError(
+            "Betatron-resonance barriers are enabled (nu_z_ceiling_weight / "
+            f"walkinshaw_weight / nu_z_floor_weight) but iso_method '{method}' "
+            "returns no tunes. Set field_evaluation.iso_method: gordon, or zero "
+            "those weights.")
+
+    opt = config.optimization
+    nu_z = safe_nu_z(tunes)
+    parts = []
+
+    if w_ceil:
+        nu_z_max = getattr(opt, 'nu_z_max', None)
+        nu_z_max = 0.42 if nu_z_max is None else float(nu_z_max)
+        parts.append(w_ceil * np.maximum(0.0, nu_z - nu_z_max))
+
+    if w_walk:
+        delta_w = getattr(opt, 'walkinshaw_min_distance', None)
+        delta_w = 0.15 if delta_w is None else float(delta_w)
+        nu_r = np.nan_to_num(np.asarray(tunes['nu_r'], dtype=float), nan=0.0)
+        parts.append(w_walk * np.maximum(0.0, delta_w - (nu_r - 2.0 * nu_z)))
+
+    if w_floor:
+        nu_z_sq_min = getattr(opt, 'nu_z_sq_min', None)
+        nu_z_sq_min = 0.0 if nu_z_sq_min is None else float(nu_z_sq_min)
+        nu_z_sq = np.nan_to_num(np.asarray(tunes['nu_z_sq'], dtype=float),
+                                nan=0.0, posinf=0.0, neginf=0.0)
+        parts.append(w_floor * np.maximum(0.0, nu_z_sq_min - nu_z_sq))
+
+    return parts
+
+
+def tune_margins(iso: Dict) -> "tuple[float, float, float]":
+    """(peak nu_z, min Walkinshaw clearance, min nu_z^2) -- NaN when no tunes.
+
+    Reported for EVERY gordon evaluation whether or not the barriers are
+    enabled, so the resonance margins can be read straight off the diagnostics
+    CSV of a plain isochronism run. Nothing was watching these before, which is
+    how a design ended up 0.02 from nu_z = 1/2.
+    """
+    tunes = iso.get('tunes')
+    if not tunes or 'nu_z_sq' not in tunes:
+        return float('nan'), float('nan'), float('nan')
+    nu_z = safe_nu_z(tunes)
+    nu_r = np.nan_to_num(np.asarray(tunes['nu_r'], dtype=float), nan=0.0)
+    nu_z_sq = np.nan_to_num(np.asarray(tunes['nu_z_sq'], dtype=float),
+                            nan=0.0, posinf=0.0, neginf=0.0)
+    if nu_z.size == 0:
+        return float('nan'), float('nan'), float('nan')
+    return (float(nu_z.max()), float((nu_r - 2.0 * nu_z).min()), float(nu_z_sq.min()))
 
 
 def _block_slices(x_norm: np.ndarray, blocks, n: int) -> Dict[str, np.ndarray]:
@@ -105,8 +328,22 @@ def build_residual_vector(iso: Dict, x_norm: np.ndarray, blocks,
         [ f - mean(f)                      isochronism (MHz), len n_eval_pts
           w_side * D2(side_norm)           if 'side' optimized & w_side != 0
           w_top  * D2(top_norm)            if 'top'  optimized & w_top  != 0
+          <resonance barriers>             0-3 blocks of len n_eval_pts, all
+                                           default OFF -- see tune_barriers
           w_conv * sqrt(max(0, shortfall)) convergence gate, len 1 if w_conv!=0
           w_mag  * x_norm ]                magnitude reg, len n_params if !=0
+
+    When the FIELD-BASIS weights are configured (``smoothness_weight_neutral``
+    and/or ``smoothness_weight_active``) and BOTH blocks are being scored, the
+    two per-block roughness entries are replaced by
+
+          w_neutral * D2(neutral)          neutral = (side - rho*top)/|..|
+          w_active  * D2(active)           active  = (rho*side + top)/|..|
+
+    which penalizes the two profiles curving AGAINST each other (the field-
+    neutral direction the isochronism residual cannot see) separately from them
+    curving TOGETHER -- see ``field_basis_profiles``. The rotation is
+    orthonormal, so equal weights reduce exactly to the per-block form.
 
     The second differences are taken PER BLOCK on the NORMALIZED offsets (both
     side and top live in [0,1], so one dimensionless weight scale works, and a
@@ -129,21 +366,35 @@ def build_residual_vector(iso: Dict, x_norm: np.ndarray, blocks,
     f = np.asarray(iso['rev_frequencies_mhz'], dtype=float)
     parts.append(f - f.mean())
 
-    # (2) per-block second-difference roughness on the normalized offsets.
+    # (2) second-difference roughness on the normalized offsets -- either per
+    #     block, or (when the field-basis weights are configured and both blocks
+    #     are scored) on the field-neutral / field-active combinations.
     w_side, w_top = _smoothness_weights(config)
     prof = _smooth_profiles(x_norm, blocks, n, full_norm)
-    if 'side' in prof and w_side:
-        parts.append(w_side * second_difference(prof['side']))
-    if 'top' in prof and w_top:
-        parts.append(w_top * second_difference(prof['top']))
+    coupled = _coupled_profiles(prof, config)
+    if coupled is not None:
+        neutral, active, w_neutral, w_active = coupled
+        if w_neutral:
+            parts.append(w_neutral * second_difference(neutral))
+        if w_active:
+            parts.append(w_active * second_difference(active))
+    else:
+        if 'side' in prof and w_side:
+            parts.append(w_side * second_difference(prof['side']))
+        if 'top' in prof and w_top:
+            parts.append(w_top * second_difference(prof['top']))
 
-    # (3) continuous convergence gate (single residual entry).
+    # (3) betatron-resonance barriers (optional; default OFF). One-sided, so a
+    #     design inside the safe band is scored exactly as before.
+    parts.extend(tune_barriers(iso, config))
+
+    # (4) continuous convergence gate (single residual entry).
     w_conv = getattr(config.optimization, 'convergence_penalty_weight', 0.0) or 0.0
     if w_conv:
         shortfall = _convergence_shortfall(converged, misfit, config)
         parts.append(np.array([w_conv * np.sqrt(shortfall)], dtype=float))
 
-    # (4) magnitude regularization (optional; default OFF).
+    # (5) magnitude regularization (optional; default OFF).
     w_mag = getattr(config.optimization, 'regularization_weight', 0.0) or 0.0
     if w_mag:
         parts.append(w_mag * np.asarray(x_norm, dtype=float))
@@ -178,8 +429,28 @@ def compute_objective(iso: Dict, x_norm: np.ndarray, blocks,
                   if 'side' in prof else 0.0)
     rough_top = (float(np.linalg.norm(second_difference(prof['top'])))
                  if 'top' in prof else 0.0)
-    # Weighted smoothness contribution to the residual (L2 of that sub-block).
-    smoothness_residual_l2 = float(np.hypot(w_side * rough_side, w_top * rough_top))
+    # Field-basis roughness: how much of the jaggedness is the side/top pair
+    # fighting each other (neutral -- invisible to isochronism, pure waste) vs
+    # legitimately shaping <B>(r) together (active). Reported whenever both
+    # blocks are scored, even when the per-block penalty is the one in force, so
+    # the split can be READ before deciding to switch penalties.
+    rough_neutral = rough_active = 0.0
+    if 'side' in prof and 'top' in prof and len(prof['side']) == len(prof['top']):
+        rho = getattr(config.optimization, 'smoothness_exchange_ratio', 1.0)
+        neutral, active = field_basis_profiles(prof['side'], prof['top'],
+                                               1.0 if rho is None else float(rho))
+        rough_neutral = float(np.linalg.norm(second_difference(neutral)))
+        rough_active = float(np.linalg.norm(second_difference(active)))
+
+    # Weighted smoothness contribution to the residual (L2 of that sub-block) --
+    # from whichever basis is actually in force.
+    coupled = _coupled_profiles(prof, config)
+    if coupled is not None:
+        _, _, w_neutral, w_active = coupled
+        smoothness_residual_l2 = float(np.hypot(w_neutral * rough_neutral,
+                                                w_active * rough_active))
+    else:
+        smoothness_residual_l2 = float(np.hypot(w_side * rough_side, w_top * rough_top))
 
     w_mag = getattr(config.optimization, 'regularization_weight', 0.0) or 0.0
     regularization = (float(w_mag * np.linalg.norm(np.asarray(x_norm, dtype=float)))
@@ -188,13 +459,44 @@ def compute_objective(iso: Dict, x_norm: np.ndarray, blocks,
     shortfall = _convergence_shortfall(converged, misfit, config)
     convergence_penalty = float(w_conv * shortfall)   # linear diagnostic (as before)
 
+    # Accumulated RF phase slip -- the spec's PRIMARY figure of merit, reported
+    # on every evaluation once the config carries an rf: section (nan otherwise,
+    # so nothing changes for configs without one). Gauge-optimized f_RF.
+    phi_max_deg = phase_margin = n_turns_rf = float('nan')
+    try:
+        from cyclotron_optimizer.core.phase_slip import phase_slip_report
+        _psr = phase_slip_report(iso, config)
+        if _psr is not None:
+            phi_max_deg = _psr['phi_max_deg']
+            phase_margin = _psr['margin']
+            n_turns_rf = _psr['n_turns']
+    except Exception:
+        pass   # reporting must never take down a field evaluation
+
+    # Resonance margins are reported for every tune-bearing evaluation, whether
+    # or not the barriers are switched on, so they can be READ before deciding
+    # to constrain them (see tune_margins).
+    nu_z_peak, walkinshaw_min, nu_z_sq_min_seen = tune_margins(iso)
+    barrier_parts = tune_barriers(iso, config)
+    tune_penalty_l2 = (float(np.linalg.norm(np.concatenate(barrier_parts)))
+                       if barrier_parts else 0.0)
+
     results = {
         'flatness': float(iso['std_dev_mhz']),
         'avg_f': float(iso['mean_freq_mhz']),
         'regularization': regularization,
         'roughness_side': rough_side,
         'roughness_top': rough_top,
+        'roughness_neutral': rough_neutral,
+        'roughness_active': rough_active,
         'smoothness_residual_l2': smoothness_residual_l2,
+        'nu_z_peak': nu_z_peak,
+        'walkinshaw_min': walkinshaw_min,
+        'nu_z_sq_min': nu_z_sq_min_seen,
+        'tune_penalty_l2': tune_penalty_l2,
+        'phi_max_deg': phi_max_deg,
+        'phase_margin': phase_margin,
+        'n_turns': n_turns_rf,
         'convergence_penalty': convergence_penalty,
         'objective': objective,
         'residual_vector': r,
@@ -291,9 +593,10 @@ def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
         objective = 1e6
         frequencies = None
         convergence_penalty = 0.0
-        roughness_side = 0.0
-        roughness_top = 0.0
-        smoothness_residual_l2 = 0.0
+        # Extra scalar diagnostics that pass straight through from compute_objective
+        # to the caller's dict. Carried as ONE dict so adding a metric needs no new
+        # collective -- an accidentally-missing bcast here deadlocks the run.
+        extras = {k: 0.0 for k in _PASSTHROUGH_DIAGNOSTICS}
 
         # bz_values is a (Nr, Ntheta) array (circle/gordon) or a PyPATools Field (seo),
         # and is None off-root -- test identity, not len().
@@ -319,13 +622,12 @@ def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
             avg_f = score['avg_f']
             regularization = score['regularization']
             convergence_penalty = score['convergence_penalty']
-            roughness_side = score['roughness_side']
-            roughness_top = score['roughness_top']
-            smoothness_residual_l2 = score['smoothness_residual_l2']
+            extras = {k: score[k] for k in _PASSTHROUGH_DIAGNOSTICS}
 
             if verbosity >= 1:
                 print(f"      flatness={flatness:.2e}, avg_f={avg_f:.4f}, "
-                      f"reg={regularization:.4f}, smooth={smoothness_residual_l2:.4f}, "
+                      f"reg={regularization:.4f}, smooth={extras['smoothness_residual_l2']:.4f}, "
+                      f"tune_pen={extras['tune_penalty_l2']:.4f}, "
                       f"conv_pen={convergence_penalty:.4f} "
                       f"(converged={converged}, misfit={misfit:.2e}) → obj={objective:.6f}", flush=True)
 
@@ -338,9 +640,7 @@ def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
         regularization = comm.bcast(regularization, root=0)
         frequencies = comm.bcast(frequencies, root=0)
         convergence_penalty = comm.bcast(convergence_penalty, root=0)
-        roughness_side = comm.bcast(roughness_side, root=0)
-        roughness_top = comm.bcast(roughness_top, root=0)
-        smoothness_residual_l2 = comm.bcast(smoothness_residual_l2, root=0)
+        extras = comm.bcast(extras, root=0)
         misfit = comm.bcast(misfit, root=0)
 
         return objective, {
@@ -348,14 +648,13 @@ def evaluate_cyclotron_objective_simplified(surface_params_32d: np.ndarray,
             'bz_values': bz_values,
             'rev_frequencies_mhz': frequencies,
             'avg_f': avg_f,
+            'coil_A': reference_coil_current,
             'regularization': regularization,
-            'roughness_side': roughness_side,
-            'roughness_top': roughness_top,
-            'smoothness_residual_l2': smoothness_residual_l2,
             'objective': objective,
             'converged': converged,
             'misfit': misfit,
             'convergence_penalty': convergence_penalty,
+            **extras,
         }
 
     finally:
@@ -527,9 +826,61 @@ def optimize_coil_final(best_surface_params: np.ndarray,
     return optimal_coil, final_error, n_evals[0]
 
 
+class CoilBracketError(RuntimeError):
+    """[coil_current_min_A, coil_current_max_A] does not contain the target frequency."""
+
+
+class _CoilConverged(Exception):
+    """Internal: an ALREADY-EVALUATED current met the frequency tolerance.
+
+    Raised from inside the root-finder's callback to stop immediately and carry
+    that point's solved state out. Deliberately derives from ``Exception`` and
+    NOT from RuntimeError/ValueError, because the secant call is wrapped in
+    ``except (RuntimeError, ValueError)`` -- re-parenting this would make the
+    early exit silently vanish into that handler.
+    """
+
+    def __init__(self, current, iso, converged, misfit):
+        super().__init__("coil residual within tolerance")
+        self.result = (float(current), iso, converged, misfit)
+
+
+class _CoilFailure:
+    """Picklable error carrier broadcast to every rank.
+
+    Raising on rank 0 alone would leave ranks 1+ blocked in the next collective,
+    turning a diagnosable config error into a silent hang.
+    """
+
+    def __init__(self, message):
+        self.message = message
+
+
+def _bracket_failure_message(history, bracket, target_f_mhz):
+    """Explain a bracketing failure using the frequencies actually measured."""
+    ends = {}
+    for cur, mf in history:
+        for b in bracket:
+            if abs(cur - float(b)) < 1e-6:
+                ends[float(b)] = mf
+    lo_f, hi_f = ends.get(float(bracket[0])), ends.get(float(bracket[1]))
+    seen = "; ".join(f"{b:.0f} A -> {ends[b]:.4f} MHz" for b in sorted(ends)) or "not measured"
+    hint = ""
+    if lo_f is not None and hi_f is not None:
+        if lo_f > target_f_mhz:
+            hint = (" Both ends are ABOVE target: LOWER coil_current_min_A "
+                    "(or the shims are adding too much field).")
+        elif hi_f < target_f_mhz:
+            hint = (" Both ends are BELOW target: RAISE coil_current_max_A "
+                    "(or the shims are not adding enough field).")
+    return (f"coil current bracket [{bracket[0]:.0f}, {bracket[1]:.0f}] A does not "
+            f"bracket the target {target_f_mhz:.4f} MHz for this shim design "
+            f"({seen}).{hint}")
+
+
 def solve_coil_for_target_frequency(solver, config, species, target_f_mhz, bracket,
                                     *, rank: int = 0, comm=None, verbosity: int = 1,
-                                    xtol_A: float = 1.0, seed_current=None):
+                                    xtol_A: float = 1.0, ftol_mhz=None, seed_current=None):
     """Find the coil current whose mean revolution frequency equals the target.
 
     Uses an already-built ReusableCyclotronSolver, so each trial current re-solves
@@ -541,67 +892,105 @@ def solve_coil_for_target_frequency(solver, config, species, target_f_mhz, brack
     MPI-collective: rank 0 drives brentq and broadcasts each trial current; ranks 1+
     follow in a resolve loop until a None sentinel.
 
+    STOPPING. ``ftol_mhz`` is the REAL criterion: as soon as an evaluated current
+    lands within it of the target, that point is returned with the iso already in
+    hand. ``xtol_A`` (a step/bracket tolerance on the CURRENT) remains only as a
+    backstop for the root-finder. They are not interchangeable -- for a
+    superlinearly converging secant |x_n - x_{n-1}| ~ |x_{n-1} - root|, so an
+    x-only test fires one iteration AFTER the residual was already acceptable,
+    and the returned root has never been evaluated, forcing a further re-solve.
+    Measured on the muon deck: 4 field solves where 1 sufficed, landing 17-1700x
+    tighter than the 0.1 MHz asked for. Pass ftol_mhz=None to get the old
+    x-tolerance-only behavior.
+
     :param bracket: (I_min, I_max) Amps; must bracket the target frequency.
+    :param xtol_A: root-finder step/bracket tolerance [A] (backstop).
+    :param ftol_mhz: accept any evaluated current within this of the target [MHz].
     :return: (optimal_current_A, iso_dict, converged, misfit). iso_dict is the
         compute_isochronism result at the on-target current (mean_freq_mhz, std_dev_mhz,
         rev_frequencies_mhz, tunes, ...), broadcast to all ranks.
+    :raises CoilBracketError: on every rank, if the bracket does not contain the
+        target frequency for this design.
     """
     radii = solver.radii_mm
     method = config.field_evaluation.iso_method
+    payload = None
 
     if rank <= 0:
         n_eval = [0]
+        history = []
 
         def g(coil_current):
             if comm is not None:
                 comm.bcast(float(coil_current), root=0)   # ranks 1+ resolve this current
-            _, bz, _, _ = solver.resolve_at_current(coil_current)
+            _, bz, conv_i, misfit_i = solver.resolve_at_current(coil_current)
             iso_i = compute_isochronism(method, bz, radii, config, species, rank=rank, comm=comm)
             n_eval[0] += 1
             mf = iso_i['mean_freq_mhz']
+            err = mf - target_f_mhz
+            history.append((float(coil_current), mf))
             if verbosity >= 1:
                 print(f"    [coil-solve {n_eval[0]}] I={coil_current:.1f} A -> "
-                      f"mean_f={mf:.4f} MHz (err={mf - target_f_mhz:+.4f})", flush=True)
-            return mf - target_f_mhz
+                      f"mean_f={mf:.4f} MHz (err={err:+.4f})", flush=True)
+            # RESIDUAL stop: this current is already good enough AND its field is
+            # solved, so neither another iteration nor the final re-solve is needed.
+            if ftol_mhz and abs(err) <= float(ftol_mhz):
+                raise _CoilConverged(coil_current, iso_i, conv_i, misfit_i)
+            return err
 
-        # Warm-start from a seed current (e.g. the previous outer iterate's optimum) via
-        # the secant method -- few evals when the seed is close; fall back to a bracketed
-        # brentq over the full range if it strays out of bounds or fails to converge.
-        optimal_current = None
-        if seed_current is not None:
+        try:
+            early = None
             try:
-                x1 = float(min(max(seed_current * 1.02, bracket[0]), bracket[1]))
-                root = newton(g, x0=float(seed_current), x1=x1, tol=xtol_A, maxiter=10)
-                if bracket[0] <= root <= bracket[1]:
-                    optimal_current = float(root)
-            except (RuntimeError, ValueError):
+                # Warm-start from a seed current (e.g. the previous outer iterate's
+                # optimum) via the secant method -- few evals when the seed is close;
+                # fall back to a bracketed brentq if it strays out of bounds or fails.
                 optimal_current = None
-        if optimal_current is None:
-            optimal_current = brentq(g, bracket[0], bracket[1], xtol=xtol_A)
+                if seed_current is not None:
+                    try:
+                        x1 = float(min(max(seed_current * 1.02, bracket[0]), bracket[1]))
+                        root = newton(g, x0=float(seed_current), x1=x1, tol=xtol_A, maxiter=10)
+                        if bracket[0] <= root <= bracket[1]:
+                            optimal_current = float(root)
+                    except (RuntimeError, ValueError):
+                        optimal_current = None   # _CoilConverged deliberately passes through
+                if optimal_current is None:
+                    optimal_current = brentq(g, bracket[0], bracket[1], xtol=xtol_A)
+            except _CoilConverged as hit:
+                early = hit.result
+            except ValueError:
+                # brentq's "f(a) and f(b) must have different signs" -- a real design/
+                # config problem, reported with the frequencies actually measured
+                # rather than as a bare scipy error out of the middle of an optimizer.
+                payload = _CoilFailure(_bracket_failure_message(history, bracket, target_f_mhz))
 
-        # one final collective resolve exactly at the root, for the on-target iso
-        if comm is not None:
-            comm.bcast(float(optimal_current), root=0)
-        _, bz, converged, misfit = solver.resolve_at_current(optimal_current)
-        iso = compute_isochronism(method, bz, radii, config, species, rank=rank, comm=comm)
-
-        if comm is not None:
-            comm.bcast(None, root=0)   # stop the ranks-1+ resolve loop
+            if payload is None:
+                if early is not None:
+                    payload = early
+                else:
+                    # The root the solver returned was EXTRAPOLATED, never evaluated,
+                    # so it still needs one collective resolve for the on-target iso.
+                    if comm is not None:
+                        comm.bcast(float(optimal_current), root=0)
+                    _, bz, converged, misfit = solver.resolve_at_current(optimal_current)
+                    iso = compute_isochronism(method, bz, radii, config, species,
+                                              rank=rank, comm=comm)
+                    payload = (float(optimal_current), iso, converged, misfit)
+        finally:
+            if comm is not None:
+                comm.bcast(None, root=0)   # ALWAYS stop the ranks-1+ resolve loop
     else:
         while True:
             ci = comm.bcast(None, root=0)
             if ci is None:
                 break
             solver.resolve_at_current(ci)
-        optimal_current = iso = converged = misfit = None
 
     if comm is not None:
-        optimal_current = comm.bcast(optimal_current, root=0)
-        iso = comm.bcast(iso, root=0)
-        converged = comm.bcast(converged, root=0)
-        misfit = comm.bcast(misfit, root=0)
+        payload = comm.bcast(payload, root=0)
+    if isinstance(payload, _CoilFailure):
+        raise CoilBracketError(payload.message)
 
-    return optimal_current, iso, converged, misfit
+    return payload
 
 
 def physics_precondition_offsets(config, n_iso_levers=1):

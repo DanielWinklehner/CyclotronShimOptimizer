@@ -19,8 +19,8 @@ with co.Session(CONFIG) as s:
     model = s.build()
     model.solve()
 
-    model.save_median_plane_field("output/midplane_field.comsol")
-    # model.save_bore_field("output/bore_field.comsol")
+    # model.save_median_plane_field("output/uCyclo_v3_midplane_res0.5mm_xy700mm.comsol")
+    model.save_bore_field("output/uCyclo_v3_bore_field.comsol")
 
     if s.is_root:
         print("\nExported output/midplane_field.comsol and output/bore_field.comsol")

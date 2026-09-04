@@ -310,12 +310,28 @@ class OptimizationProgressPlotter:
 
 
     def finalize(self, savepath=None):
-        """Write the final progress frame to disk (used for headless/batch runs)."""
-        if self.fig is not None and savepath:
+        """Write the final progress frame to disk, then CLOSE the window.
+
+        The close is not cosmetic: a TkAgg figure still open at interpreter
+        shutdown is destroyed from the GC with a NULL thread state -> "Fatal
+        Python error: PyEval_RestoreThread: ... GIL ..." on Python 3.12 +
+        Windows, crashing every run at exit. Closing here, on the main thread,
+        while the interpreter is healthy, is the fix; the PNG keeps the frame.
+        """
+        if self.fig is None:
+            return
+        if savepath:
             try:
                 self.fig.savefig(savepath, dpi=120)
             except Exception:
                 pass
+        try:
+            plt.close(self.fig)
+            if not is_headless():
+                plt.pause(0.05)   # let Tk process the destroy events NOW
+        except Exception:
+            pass
+        self.fig = None
 
 
 class DFOLSProgressPlotter:
@@ -476,8 +492,23 @@ class DFOLSProgressPlotter:
             plt.pause(0.001)
 
     def finalize(self, savepath=None):
-        if self.fig is not None and savepath:
+        if self.fig is None:
+            return
+        if savepath:
             try:
                 self.fig.savefig(savepath, dpi=120)
             except Exception:
                 pass
+        # Close the window DETERMINISTICALLY, on the main thread, while the
+        # interpreter is still healthy. A TkAgg figure left open (show(block=
+        # False)) is torn down by the GC during interpreter shutdown, where
+        # tkinter's __del__ hits a NULL thread state -> "Fatal Python error:
+        # PyEval_RestoreThread: ... GIL ..." on Python 3.12 + Windows, crashing
+        # EVERY run at exit. The final frame lives on in the saved PNG.
+        try:
+            plt.close(self.fig)
+            if not is_headless():
+                plt.pause(0.05)   # let Tk process the destroy events NOW
+        except Exception:
+            pass
+        self.fig = None

@@ -3,7 +3,7 @@
 A library-first framework for compact-cyclotron magnet design: GPU-accelerated
 [RadiaCUDA](https://github.com/DanielWinklehner/RadiaCUDA) magnetostatics,
 component-based geometry (gmsh-OCC / STP tet meshing), symmetry-exploiting
-field evaluation, isochronism analysis (circle / Gordon / SEO tracking), and
+field evaluation, isochronism analysis (circle / Gordon closed orbits / analytic Gordon formulas / SEO tracking), and
 DFO-LS shim optimization.
 
 Written for the [IsoDAR](https://www.nevis.columbia.edu/isodar/) project.
@@ -27,7 +27,7 @@ import cyclotron_optimizer as co
 with co.Session("examples/config_muon_smaller.yml") as s:
     model = s.build()                 # defaults (shims, radii, current) from config
     model.solve()                     # mesh + assemble + relax (GPU)
-    iso = model.isochronism()         # circle / gordon / seo per config
+    iso = model.isochronism()         # circle / gordon / gordon_analytic / seo per config
     fmap = model.median_plane_field(resolution_mm=2.0, gpu_precision="single")
     if s.is_root:
         print(f"mean f = {iso['mean_freq_mhz']:.4f} MHz "

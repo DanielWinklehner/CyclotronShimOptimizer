@@ -417,6 +417,28 @@ def test_solver_reuses_static_iron_across_pole_rebuilds():
         solver_mix.build("shape1", 1000.0, query=False, reuse_static_iron=False)
         assert [c[3] for c in stub.calls if c[0] == "RlxPre"][-1] is False
         assert [c[4] for c in stub.calls if c[0] == "RlxAuto"][-1] == 9
+
+        # solve=False: GEOMETRY ONLY -- no coils, no RlxPre, no relaxation.
+        # The regression this guards: every optimizer evaluation / sensitivity
+        # probe used to run ``build(pole, I)`` (fused solve) followed by
+        # ``resolve_at_current(I)`` -- the SAME state solved twice back to back
+        # (caught by the user as identical misfits in the matrix-probe log).
+        n_rlx = sum(c[0] == "RlxAuto" for c in stub.calls)
+        n_coils = calls["coils"]
+        solver_geo = fc.ReusableCyclotronSolver(config, [100.0], verbosity=0)
+        r_g, bz_g, conv_g, mis_g = solver_geo.build(
+            "shapeG", 1000.0, reuse_static_iron=False, solve=False)
+        assert bz_g is None and conv_g is None and mis_g is None
+        assert sum(c[0] == "RlxAuto" for c in stub.calls) == n_rlx   # no solve
+        assert calls["coils"] == n_coils                             # no coils
+        assert solver_geo._iron_subs is not None                     # geometry IS built
+        # ...and the deferred solve happens exactly ONCE in resolve_at_current,
+        # cold (ZeroM->True), since any retained M belongs to the old pole.
+        _, _, conv2, mis2 = solver_geo.resolve_at_current(1000.0, query=False)
+        assert conv2 and mis2 == 0.5e-4
+        assert sum(c[0] == "RlxAuto" for c in stub.calls) == n_rlx + 1
+        assert calls["coils"] == n_coils + 1
+        assert "ZeroM->True" in [c[5] for c in stub.calls if c[0] == "RlxAuto"][-1]
     finally:
         fc.build_static_iron_parts, fc.build_pole_part, fc.build_coils = real
         _restore()

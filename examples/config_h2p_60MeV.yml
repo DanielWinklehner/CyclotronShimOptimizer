@@ -42,32 +42,32 @@ components:
     file: "../resources/HCHC-60_FullYoke.stp"
     material: iron
     symmetry: cyclotron_8fold
-    mesh: {max_size: 80}
+    mesh: {max_size: 120}
     mesh_group: iron
-    structure:
-      type: polar_grid
-      dr_mm: 200
-      dz_mm: 200
-      dtheta_deg: 5
+#    structure:
+#      type: polar_grid
+#      dr_mm: 200
+#      dz_mm: 200
+#      dtheta_deg: 5
 
   - name: pole
     kind: stp
     file: "../resources/HCHC-60_FullPole.stp"
     material: iron
     symmetry: cyclotron_8fold
-    mesh: {min_size: 10, max_size: 70}
+    mesh: {min_size: 10, max_size: 60}
     mesh_group: iron
-    structure:
-      type: polar_grid
-      dr_mm: 120
-      dz_mm: 120
-      dtheta_deg: 2.5
-      core_clip: { z_max: -140 }
-      skin_margin_deg: 5
+#    structure:
+#      type: polar_grid
+#      dr_mm: 120
+#      dz_mm: 120
+#      dtheta_deg: 2.5
+#      core_clip: { z_max: -140 }
+#      skin_margin_deg: 5
 
   - name: extract_channel
     kind: wedge
-    enabled: true
+    enabled: false
     material: iron
     symmetry: median_z               # median plane mirror
     perturbative: true               # solved in the frozen machine field (stage 1)
@@ -85,11 +85,11 @@ components:
     symmetry: cyclotron_8fold        # declared field symmetry (pair at +/-z)
     params:                          # names match CoilConfig (live current source)
       radius_min_mm: 2230.0
-      radius_max_mm: 2480.5
+      radius_max_mm: 2480.0
       height_mm: 240.0
       midplane_dist: 95
       current_A: 158350.0            # Amp-turns (initial; optimizer overrides)
-      num_segments: 25
+      num_segments: 50
 
 # ---------------------------------------------------------------------------
 # Shim parametrization (initial/default shape; optimizers pass their own)
@@ -122,7 +122,7 @@ field_evaluation:
   median_plane_limit_mm: 2500
   n_eval_pts: 12
   use_symmetry: true
-  iso_method: "gordon"                    # "circle" | "gordon" | "seo"
+  iso_method: "gordon"                    # "circle" | "gordon" (closed orbits) | "gordon_analytic" | "seo"
 
 simulation:
   precision: 0.00001
@@ -133,7 +133,7 @@ simulation:
   #                       # can stall above the plain floor on fine tet meshes)
   # perturb_iterations: 0 # perturbative-component back-reaction cycles
   # perturb_tol: 0.0      # early-exit tolerance [T] for those cycles
-  # gpu_fallback: break   # what radia does when the interaction matrix does
+  gpu_fallback: gpu_streaming  # what radia does when the interaction matrix does
   #                       # NOT fit in GPU memory. 'cpu' (default) falls back to
   #                       # the CPU, which is correct but can turn a seconds-long
   #                       # solve into an hours-long one; 'break' raises instead,

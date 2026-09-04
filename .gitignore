@@ -8,3 +8,4 @@ __pycache__/
 *.py[cod]
 /scripts/
 /cyclotron_optimizer.egg-info/
+/temp/

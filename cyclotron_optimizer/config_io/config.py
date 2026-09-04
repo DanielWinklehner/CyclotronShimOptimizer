@@ -33,6 +33,35 @@ def _from_dict(cls, d):
     d = d or {}
     valid = {f.name for f in _dc_fields(cls)}
     return cls(**{k: v for k, v in d.items() if k in valid})
+
+
+def _coerce_numeric_fields(section_obj, section_name: str) -> None:
+    """Coerce string values in numeric-annotated fields; raise CLEARLY if bogus.
+
+    YAML turns several innocent-looking values into STRINGS -- quoted numbers,
+    exponent floats without a decimal point ('1e-1' is a string in YAML 1.1),
+    or editing accidents like pasting the dataclass syntax into the yml
+    ('bore_xy_limit_mm: float = 200.0'). Those used to survive loading and
+    blow up arbitrarily late -- e.g. a TypeError in the bore-field export
+    AFTER the ~100 s solve. Coercing at load time makes an honest numeric
+    string work and a bogus one fail immediately, naming the yml key.
+    """
+    for f in _dc_fields(section_obj):
+        value = getattr(section_obj, f.name, None)
+        if not isinstance(value, str):
+            continue
+        ann = str(f.type)
+        if 'float' not in ann and 'int' not in ann:
+            continue   # str/bool/list-typed fields keep their strings
+        try:
+            coerced = float(value) if 'float' in ann else int(value)
+        except ValueError:
+            raise ValueError(
+                f"config value {section_name}.{f.name} = {value!r} is not a "
+                f"number (annotated {ann}). Common causes: pasted Python "
+                f"syntax ('key: float = 1.0' -> write 'key: 1.0'), or a YAML "
+                f"exponent float without a decimal point ('1e-1' -> '1.0e-1').")
+        setattr(section_obj, f.name, coerced)
 from typing import Dict, Any, List, Optional
 
 
@@ -119,15 +148,41 @@ class FieldEvaluationConfig:
     radius_max_mm: float
     n_eval_pts: int
     use_symmetry: bool = True
+    # 'circle' | 'gordon' (closed orbits; tunes) | 'gordon_analytic' (first-order
+    # scalloping formulas; tunes) | 'seo' (tracked orbits) -- see core.isochronicity
     iso_method: Optional[str] = "circle"
     # Median-plane map extent/resolution (seo isochronism input + midplane save)
     median_plane_limit_mm: float = 400.0
     median_plane_resolution_mm: float = 1.0
+    # Closed-orbit ('gordon') method: dense polar grid radial step and the
+    # margin (fraction) beyond [radius_min, radius_max] it must cover (the
+    # scalloped orbit reaches ~ +7 % / -6 % of its mean radius), and the RK4
+    # steps per turn of the Gordon integrator (1800 = 0.2 deg; converged to
+    # 1e-10 in f_rev on the smooth radia grids, halve the cost of 3600).
+    eo_radial_step_mm: float = 2.0
+    eo_radial_margin: float = 0.15
+    eo_steps_per_turn: int = 1800
+    # angular density of the dense grid (full-circle-equivalent count; 360 =
+    # 1 deg reproduces 720 to 0.01 kHz at half the radia query cost). The
+    # spline needs a smooth field, so it is a separate knob from
+    # num_points_circle, which the analytic/circle averages use.
+    eo_num_points_circle: int = 360
     # 3D bore-field map domain (x, y in [-limit, limit], z in [z_min, z_max])
     bore_xy_limit_mm: float = 50.0
     bore_z_min_mm: float = -100.0
     bore_z_max_mm: float = 25.0
     bore_resolution_mm: float = 0.5
+
+    ISO_METHODS = ('circle', 'gordon', 'gordon_analytic', 'seo')
+
+    def __post_init__(self):
+        if self.iso_method is not None:
+            method = str(self.iso_method).strip().lower()
+            if method not in self.ISO_METHODS:
+                raise ValueError(
+                    f"field_evaluation.iso_method '{self.iso_method}' is not one of "
+                    f"{list(self.ISO_METHODS)}")
+            self.iso_method = method
 
 @dataclass
 class YokeConfig:
@@ -317,6 +372,45 @@ class OptimizationConfig:
     smoothness_weight: Optional[float] = 0.0
     smoothness_weight_side: Optional[float] = None
     smoothness_weight_top: Optional[float] = None
+    # FIELD-BASIS smoothness (replaces the per-block weights above when either
+    # of these is set AND both blocks are optimized). Side and top are BOTH
+    # first-order levers on <B>(r) while isochronism constrains only that one
+    # function, so the pair has a field-neutral null direction -- measured on
+    # the muon design as corr(D2(side), D2(top)) = -0.94, i.e. a dip in one
+    # profile cancelled by a bulge in the other. Per-block D2 cannot see that
+    # mode apart from legitimate curvature. These weights split the pair into
+    #   neutral = (side_norm - rho*top_norm)/sqrt(1+rho^2)   <B>-invariant
+    #   active  = (rho*side_norm + top_norm)/sqrt(1+rho^2)   carries <B>(r)
+    # so the neutral (wasted) roughness can be penalized hard and the active
+    # (needed) curvature left nearly free. rho = d<B>/d(side_norm) over
+    # d<B>/d(top_norm); ~1 when the two bound ranges have comparable field
+    # authority -- measure with examples/measure_shim_exchange_ratio.py.
+    # Equal weights reduce EXACTLY to the per-block penalty (orthonormal
+    # rotation). Both None (default) -> per-block behavior, bit for bit.
+    smoothness_weight_neutral: Optional[float] = None
+    smoothness_weight_active: Optional[float] = None
+    smoothness_exchange_ratio: Optional[float] = 1.0
+    # BETATRON-RESONANCE BARRIERS (all OPT-IN: weight 0 = off = prior behavior).
+    # One-sided hinges added to the residual, zero while the design stays inside
+    # the safe band, so they cost nothing until they bind. Measured motivation:
+    # the muon optimum ran nu_z up to 0.4804 at r = 294 mm -- 0.020 from the
+    # nu_z = 1/2 half-integer and 0.064 from Walkinshaw (nu_r = 2 nu_z) -- with
+    # NOTHING in the objective watching. Vertical focusing is abundant here, so
+    # these are ceilings; a "maximize nu_z" reward would push INTO the
+    # resonances. Requires iso_method: gordon or gordon_analytic (the methods
+    # producing tunes).
+    #   ceiling      w * max(0, nu_z - nu_z_max)
+    #   walkinshaw   w * max(0, walkinshaw_min_distance - (nu_r - 2 nu_z))
+    #   floor        w * max(0, nu_z_sq_min - nu_z_sq)   (on nu_z^2, stays finite)
+    # Isochronism pins nu_r = gamma, so the walkinshaw term is really a
+    # radius-dependent nu_z ceiling at (gamma(r) - delta)/2 and overlaps the flat
+    # one -- weight ONE as primary. See objective_function.tune_barriers.
+    nu_z_ceiling_weight: Optional[float] = 0.0
+    nu_z_max: Optional[float] = 0.42
+    walkinshaw_weight: Optional[float] = 0.0
+    walkinshaw_min_distance: Optional[float] = 0.15
+    nu_z_floor_weight: Optional[float] = 0.0
+    nu_z_sq_min: Optional[float] = 0.0
     precondition: Optional[bool] = False
     # Seed the optimizer's starting point (x0) from the config's saved shim
     # offsets (side_offsets_deg / top_offsets_mm) instead of the physics
@@ -345,6 +439,47 @@ class OptimizationConfig:
     dfols_maxfun: Optional[int] = None  # None -> max(max_iterations, n_params + 2)
     dfols_objfun_has_noise: Optional[bool] = False   # enables (soft) restarts + gentler termination
     dfols_seek_global_minimum: Optional[bool] = False  # hard restarts via user_params (global search)
+    # RESPONSE-MATRIX shimming modes (optimizer: 'matrix-full' | 'matrix-reduced').
+    # Probe the sensitivity matrix M = d f_rev(r_i) / d x_j ONCE around x0 at
+    # FIXED coil current (full: one column per station; reduced: one column per
+    # smooth basis vector -- the gap low-passes station-scale structure, so M is
+    # effectively low-rank and ~basis_size columns capture the field authority),
+    # then iterate: regularized linear step -> one coil-matched FE evaluation.
+    # The step minimizes the SAME weighted residual as DFO-LS (flatness +
+    # smoothness from the shared builder), so the two paths agree on what good
+    # means; the DFO-LS path itself is untouched.
+    matrix_broyden: Optional[bool] = False      # secant-update M from iteration solves
+    matrix_basis_size: Optional[int] = 8        # smooth modes per block (reduced mode)
+    matrix_probe_delta: Optional[float] = 0.05  # probe step [normalized units]
+    matrix_relaxation: Optional[float] = 0.7    # alpha applied to each step (spec 7.2)
+    matrix_max_outer: Optional[int] = 10        # max linear-step iterations
+    matrix_ftol_rel: Optional[float] = 0.01     # stop when objective improves less
+
+
+@dataclass
+class RFConfig:
+    """RF / longitudinal-dynamics description for phase-slip reporting.
+
+    These are STATED INPUTS (isochronism_reporting_spec.md section 6.1): a phase
+    slip number without them is uninterpretable. All optional -- with
+    ``harmonic_h`` or ``de0_kev_per_turn`` unset the phase-slip report is
+    disabled and nothing changes for existing configs.
+
+    ``f_rf_mhz`` defaults to harmonic_h * optimization.target_frequency_mhz.
+    ``de0_kev_per_turn`` is the nominal energy gain per turn AT CREST (the
+    cos(phi) feedback is applied by the phase-slip integral itself).
+    ``phi0_deg`` is the RF phase at the exit of the central region -- carried
+    explicitly so the central bump's contribution is visible, not assumed zero.
+    ``phi_budget_deg`` is a design CHOICE (typical 10 tight .. 30 accepted;
+    hard physical limit 90, where the beam decelerates).
+    """
+    harmonic_h: Optional[int] = None
+    f_rf_mhz: Optional[float] = None
+    de0_kev_per_turn: Optional[float] = None
+    phi0_deg: Optional[float] = 0.0
+    phi_budget_deg: Optional[float] = 10.0
+    e_inj_mev: Optional[float] = None
+    e_final_mev: Optional[float] = None
 
 
 @dataclass
@@ -381,12 +516,19 @@ class CyclotronConfig:
     simulation: SimulationConfig
     optimization: OptimizationConfig
     visualization: VisualizationConfig
+    rf: RFConfig = field(default_factory=RFConfig)
     # Generic machine description (single source for the geometry builders).
     # Populated by BOTH schemas: parsed directly from component-based YAMLs,
     # synthesized by the legacy adapter otherwise.
     components: List[ComponentSpec] = field(default_factory=list)
     materials_def: Dict[str, dict] = field(default_factory=dict)
     symmetries_def: Dict[str, list] = field(default_factory=dict)
+    # Optional local mesh refinement for conforming mesh groups: a list of
+    # axis-aligned boxes {x_min, x_max, y_min, y_max, z_min, z_max, size_mm,
+    # thickness_mm} (gmsh Box size fields; inside a box the mesh size is the
+    # minimum of size_mm and the per-component caps). Used e.g. to grade the
+    # gap-facing 100 mm of a pole finer than its base.
+    mesh_refinement: Optional[List[dict]] = None
 
     # ------------------------------------------------------------------
     # Component accessors
@@ -444,7 +586,9 @@ class CyclotronConfig:
         _resolve('visualization', 'comsol_filename')
 
         if 'components' in data:
-            return cls._from_component_yaml(data, _resolve_path)
+            config = cls._from_component_yaml(data, _resolve_path)
+            config.mesh_refinement = data.get('mesh_refinement')
+            return config
 
         for part in ('yoke', 'lid_lower', 'lid_upper', 'pole', 'extract_channel'):
             _resolve(part, 'stp_filename')
@@ -469,10 +613,12 @@ class CyclotronConfig:
                 simulation=SimulationConfig(**data['simulation']),
                 optimization=OptimizationConfig(**data['optimization']),
                 visualization=VisualizationConfig(**data['visualization']),
+                rf=_from_dict(RFConfig, data.get('rf')),
             )
         except KeyError as e:
             raise ValueError(f"Missing required config key: {e}")
 
+        config._validate_numeric_types()
         config._adapt_legacy_to_components()
         return config
 
@@ -660,13 +806,26 @@ class CyclotronConfig:
                 simulation=SimulationConfig(**data['simulation']),
                 optimization=OptimizationConfig(**data['optimization']),
                 visualization=VisualizationConfig(**data['visualization']),
+                rf=_from_dict(RFConfig, data.get('rf')),
                 components=specs,
                 materials_def=materials_def,
                 symmetries_def=symmetries_def,
             )
         except KeyError as e:
             raise ValueError(f"Missing required config key: {e}")
+        config._validate_numeric_types()
         return config
+
+    def _validate_numeric_types(self) -> None:
+        """Load-time guard: numeric fields carrying YAML strings are coerced or
+        rejected with the yml key named (see _coerce_numeric_fields)."""
+        for name in ('geometry', 'field_evaluation', 'yoke', 'lid_lower',
+                     'lid_upper', 'extract_channel', 'pole', 'coil', 'material',
+                     'side_shim', 'top_shim', 'simulation', 'optimization',
+                     'visualization', 'rf'):
+            section = getattr(self, name, None)
+            if section is not None:
+                _coerce_numeric_fields(section, name)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert configuration to dictionary."""
@@ -689,6 +848,10 @@ class CyclotronConfig:
                 'iso_method': self.field_evaluation.iso_method,
                 'median_plane_limit_mm': self.field_evaluation.median_plane_limit_mm,
                 'median_plane_resolution_mm': self.field_evaluation.median_plane_resolution_mm,
+                'eo_radial_step_mm': self.field_evaluation.eo_radial_step_mm,
+                'eo_radial_margin': self.field_evaluation.eo_radial_margin,
+                'eo_steps_per_turn': self.field_evaluation.eo_steps_per_turn,
+                'eo_num_points_circle': self.field_evaluation.eo_num_points_circle,
                 'bore_xy_limit_mm': self.field_evaluation.bore_xy_limit_mm,
                 'bore_z_min_mm': self.field_evaluation.bore_z_min_mm,
                 'bore_z_max_mm': self.field_evaluation.bore_z_max_mm,
@@ -798,6 +961,15 @@ class CyclotronConfig:
                 'smoothness_weight': self.optimization.smoothness_weight,
                 'smoothness_weight_side': self.optimization.smoothness_weight_side,
                 'smoothness_weight_top': self.optimization.smoothness_weight_top,
+                'smoothness_weight_neutral': self.optimization.smoothness_weight_neutral,
+                'smoothness_weight_active': self.optimization.smoothness_weight_active,
+                'smoothness_exchange_ratio': self.optimization.smoothness_exchange_ratio,
+                'nu_z_ceiling_weight': self.optimization.nu_z_ceiling_weight,
+                'nu_z_max': self.optimization.nu_z_max,
+                'walkinshaw_weight': self.optimization.walkinshaw_weight,
+                'walkinshaw_min_distance': self.optimization.walkinshaw_min_distance,
+                'nu_z_floor_weight': self.optimization.nu_z_floor_weight,
+                'nu_z_sq_min': self.optimization.nu_z_sq_min,
                 'precondition': self.optimization.precondition,
                 'x0_from_config': self.optimization.x0_from_config,
                 'opt_shim_radius_min_mm': self.optimization.opt_shim_radius_min_mm,
@@ -808,6 +980,12 @@ class CyclotronConfig:
                 'dfols_maxfun': self.optimization.dfols_maxfun,
                 'dfols_objfun_has_noise': self.optimization.dfols_objfun_has_noise,
                 'dfols_seek_global_minimum': self.optimization.dfols_seek_global_minimum,
+                'matrix_broyden': self.optimization.matrix_broyden,
+                'matrix_basis_size': self.optimization.matrix_basis_size,
+                'matrix_probe_delta': self.optimization.matrix_probe_delta,
+                'matrix_relaxation': self.optimization.matrix_relaxation,
+                'matrix_max_outer': self.optimization.matrix_max_outer,
+                'matrix_ftol_rel': self.optimization.matrix_ftol_rel,
                 'side_shim_min_deg': self.optimization.side_shim_min_deg,
                 'side_shim_max_deg': self.optimization.side_shim_max_deg,
                 'top_shim_min_mm': self.optimization.top_shim_min_mm,
@@ -819,5 +997,14 @@ class CyclotronConfig:
                 'live_plot': self.visualization.live_plot,
                 'show_median_plane_field': self.visualization.show_median_plane_field,
                 'field_map_resolution_mm': self.visualization.field_map_resolution_mm,
+            },
+            'rf': {
+                'harmonic_h': self.rf.harmonic_h,
+                'f_rf_mhz': self.rf.f_rf_mhz,
+                'de0_kev_per_turn': self.rf.de0_kev_per_turn,
+                'phi0_deg': self.rf.phi0_deg,
+                'phi_budget_deg': self.rf.phi_budget_deg,
+                'e_inj_mev': self.rf.e_inj_mev,
+                'e_final_mev': self.rf.e_final_mev,
             },
         }

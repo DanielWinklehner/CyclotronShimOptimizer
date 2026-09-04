@@ -13,7 +13,7 @@ from cyclotron_optimizer.geometry.pole_shape import PoleShape
 from cyclotron_optimizer.optimization.optimizer import CyclotronOptimizer
 
 CONFIG = (sys.argv[1] if len(sys.argv) > 1 else
-          os.path.join(os.path.dirname(__file__), "config_h2p_60MeV.yml"))
+          os.path.join(os.path.dirname(__file__), "config_muon_smaller.yml"))
 
 with co.Session(CONFIG) as s:
     radii_mm = s.default_radii_mm().tolist()
@@ -24,7 +24,23 @@ with co.Session(CONFIG) as s:
 
     print(result['best_side_shims'])
     print(result['best_top_shims'])
+
+    print("Best Coil:")
     print(result['optimal_coil'])
+
+    mystr = "["
+    for val in result['best_side_shims'][:-1]:
+        mystr += f"{val}, "
+    mystr += f"{result['best_side_shims'][-1]}]"
+    print("Side Shims:")
+    print(mystr)
+
+    mystr = "["
+    for val in result['best_top_shims'][:-1]:
+        mystr += f"{val}, "
+    mystr += f"{result['best_top_shims'][-1]}]"
+    print("Top Shims:")
+    print(mystr)
 
     best_shape = PoleShape(s.config.side_shim.num_rad_segments,
                            side_offsets=result['best_side_shims'],

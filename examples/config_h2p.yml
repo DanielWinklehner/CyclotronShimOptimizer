@@ -135,7 +135,7 @@ field_evaluation:
   radius_max_mm: 350.0
   n_eval_pts: 12
   use_symmetry: true
-  iso_method: "seo"                    # "circle" | "gordon" | "seo"
+  iso_method: "seo"                    # "circle" | "gordon" (closed orbits) | "gordon_analytic" | "seo"
 
 simulation:
   precision: 0.0001

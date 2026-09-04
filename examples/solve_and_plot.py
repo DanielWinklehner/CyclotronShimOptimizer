@@ -11,7 +11,7 @@ import sys
 import cyclotron_optimizer as co
 
 CONFIG = (sys.argv[1] if len(sys.argv) > 1 else
-          os.path.join(os.path.dirname(__file__), "config_h2p_60MeV.yml"))
+          os.path.join(os.path.dirname(__file__), "config_muon_smaller.yml"))
 
 with co.Session(CONFIG) as s:
     # use_gpu: bool for all stages, or per-stage control, e.g.
